@@ -35,6 +35,33 @@ npm install
 npm link
 ```
 
+## Schnellstart
+
+Normal starten:
+
+```powershell
+blun-codex
+```
+
+Telegram aktivieren:
+
+```powershell
+blun-codex telegram-plugin
+```
+
+Wenn Telegram noch nicht eingerichtet ist, startet automatisch ein kurzer Setup-Flow und fragt:
+
+- Telegram Bot Token
+- erlaubte Chat ID(s)
+
+Die Werte werden automatisch lokal an die richtige Stelle geschrieben. Du musst keine `.env`-Datei suchen.
+
+Pruefen:
+
+```powershell
+blun-codex telegram-doctor
+```
+
 ## Commands
 
 Normal startup:
@@ -55,6 +82,12 @@ Telegram mode:
 blun-codex telegram-plugin
 ```
 
+Manual setup:
+
+```powershell
+blun-codex telegram-setup
+```
+
 Legacy equivalent:
 
 ```powershell
@@ -73,10 +106,34 @@ Doctor:
 blun-codex telegram-doctor
 ```
 
+JSON doctor output:
+
+```powershell
+blun-codex telegram-doctor --json
+```
+
 Dry run:
 
 ```powershell
 blun-codex telegram-plugin --print-only
+```
+
+## Eigene Profile
+
+Der normale Start braucht kein eigenes Profil.
+
+Wenn du nur einen Slot auf deinem Rechner brauchst, reicht:
+
+```powershell
+blun-codex telegram-plugin
+```
+
+Ein eigenes Profil brauchst du nur fuer Fortgeschrittene oder Parallelbetrieb, zum Beispiel wenn mehrere Operatoren auf demselben Rechner laufen.
+
+Beispiel:
+
+```powershell
+blun-codex --profile alfred telegram-plugin
 ```
 
 ## Private internal profiles
@@ -142,6 +199,17 @@ The bundled plugin lives under `telegram-plugin/` and contains:
 - Node.js 20+
 - a working local `codex` command in `PATH`
 - a Telegram bot token when Telegram mode is enabled
+
+## First-run behavior
+
+`blun-codex telegram-plugin` now behaves like a guided setup for normal users:
+
+1. check whether Telegram is already configured
+2. ask for missing Bot Token or allowed Chat ID(s)
+3. save everything automatically into the local Telegram state folder
+4. continue into Telegram mode
+
+If something is missing later, `blun-codex telegram-doctor` tells you exactly what is missing and what to run next.
 
 ## Notes
 

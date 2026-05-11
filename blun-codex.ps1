@@ -6,6 +6,7 @@ $telegramMode = "inherit"
 $workspace = ""
 $remoteControl = $false
 $printOnly = $false
+$skipTelegramSetup = $false
 $promptParts = @()
 $parsedArgs = @($args)
 
@@ -25,6 +26,14 @@ if ($parsedArgs.Count -gt 0) {
         $commandArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
       }
       & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-doctor.ps1") @commandArgs
+      exit $LASTEXITCODE
+    }
+    "telegram-setup" {
+      $commandArgs = @()
+      if ($parsedArgs.Count -gt 1) {
+        $commandArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
+      }
+      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-setup.ps1") @commandArgs
       exit $LASTEXITCODE
     }
     "doctor" {
@@ -75,6 +84,10 @@ for ($i = 0; $i -lt $parsedArgs.Count; $i++) {
       $printOnly = $true
       continue
     }
+    "--skip-telegram-setup" {
+      $skipTelegramSetup = $true
+      continue
+    }
     "telegram-plugin" {
       $telegramMode = "plugin"
       continue
@@ -82,6 +95,19 @@ for ($i = 0; $i -lt $parsedArgs.Count; $i++) {
     default {
       $promptParts += $arg
     }
+  }
+}
+
+if ($telegramMode -eq "plugin" -and -not $skipTelegramSetup -and -not $printOnly) {
+  $setupArgs = @(
+    "-ExecutionPolicy", "Bypass",
+    "-File", (Join-Path $runtimeRoot "telegram-setup.ps1"),
+    "-Profile", $profile,
+    "-EnsureConfigured"
+  )
+  & powershell @setupArgs
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
   }
 }
 

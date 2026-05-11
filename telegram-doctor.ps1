@@ -1,5 +1,6 @@
 param(
-  [string]$Profile = "default"
+  [string]$Profile = "default",
+  [switch]$Json
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +33,106 @@ function Add-Check {
   }) | Out-Null
 }
 
+function Test-TelegramTokenFormat {
+  param([string]$Value)
+  if (-not $Value) { return $false }
+  return $Value -match '^\d{6,}:[A-Za-z0-9_-]{20,}$'
+}
+
+function Test-AllowedChatIdsFormat {
+  param([string]$Value)
+  if (-not $Value) { return $false }
+  $parts = @($Value -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($parts.Count -eq 0) { return $false }
+  foreach ($part in $parts) {
+    if ($part -notmatch '^-?\d+$') {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Get-OverallStatus {
+  param([System.Collections.Generic.List[object]]$Checks)
+  if (@($Checks | Where-Object { $_.status -eq "fail" }).Count -gt 0) {
+    return "fail"
+  }
+  if (@($Checks | Where-Object { $_.status -eq "warn" }).Count -gt 0) {
+    return "warn"
+  }
+  return "ok"
+}
+
+function Write-DoctorReport {
+  param(
+    [object]$Result,
+    [string]$TokenSource,
+    [string]$AllowedChatSource
+  )
+
+  $emoji = switch ($Result.overall) {
+    "ok" { "[OK]" }
+    "warn" { "[WARN]" }
+    default { "[FAIL]" }
+  }
+
+  Write-Host ""
+  Write-Host "CodexLink Telegram Doctor $emoji" -ForegroundColor Cyan
+  Write-Host "Profil: $($Result.profile)"
+  Write-Host "State-Ordner: $($Result.state_dir)"
+  Write-Host ""
+
+  foreach ($check in $Result.checks) {
+    $prefix = switch ($check.status) {
+      "ok" { "[OK]" }
+      "warn" { "[WARN]" }
+      default { "[FAIL]" }
+    }
+    $color = switch ($check.status) {
+      "ok" { "Green" }
+      "warn" { "Yellow" }
+      default { "Red" }
+    }
+    Write-Host "$prefix $($check.name): $($check.detail)" -ForegroundColor $color
+  }
+
+  Write-Host ""
+  if ($TokenSource) {
+    Write-Host "Bot-Token gefunden aus: $TokenSource" -ForegroundColor DarkGray
+  }
+  if ($AllowedChatSource) {
+    Write-Host "Erlaubte Chat-ID(s) gefunden aus: $AllowedChatSource" -ForegroundColor DarkGray
+  }
+
+  $failed = @($Result.checks | Where-Object { $_.status -eq "fail" })
+  if ($failed.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Was jetzt fehlt:" -ForegroundColor Yellow
+    foreach ($item in $failed) {
+      switch ($item.name) {
+        "bot_token" { Write-Host "  - Telegram Bot Token fehlt. Starte: blun-codex --profile $($Result.profile) telegram-setup" }
+        "allowed_chat_ids" { Write-Host "  - Erlaubte Chat-ID(s) fehlen. Starte: blun-codex --profile $($Result.profile) telegram-setup" }
+        "state_dir" { Write-Host "  - Der lokale Telegram-State-Ordner fehlt noch. Ein Setup-Lauf legt ihn automatisch an." }
+        "profile_file" { Write-Host "  - Das angegebene Profil existiert nicht." }
+        "node" { Write-Host "  - Node.js fehlt in PATH." }
+        "codex" { Write-Host "  - Der lokale codex-Befehl fehlt in PATH." }
+        "telegram_plugin_root" { Write-Host "  - Der Telegram-Plugin-Ordner konnte nicht gefunden werden." }
+        default { Write-Host "  - $($item.detail)" }
+      }
+    }
+  }
+
+  if ($Result.overall -eq "ok") {
+    Write-Host ""
+    Write-Host "Telegram ist sauber eingerichtet." -ForegroundColor Green
+    Write-Host "Starten: blun-codex --profile $($Result.profile) telegram-plugin"
+  } elseif ($Result.overall -eq "warn") {
+    Write-Host ""
+    Write-Host "Die Grundkonfiguration steht, aber es gibt noch Laufzeit-Hinweise." -ForegroundColor Yellow
+    Write-Host "Das ist oft normal, wenn Telegram noch nicht aktiv gestartet wurde oder noch keine Nachricht durchlief."
+  }
+}
+
 $runtimeRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $profilePath = Join-Path $runtimeRoot ("profiles\" + $Profile.ToLower() + ".json")
 $checks = New-Object 'System.Collections.Generic.List[object]'
@@ -62,16 +163,32 @@ if ($status.state_dir -and (Test-Path $status.state_dir)) {
   Add-Check -List $checks -Name "state_dir" -Status "fail" -Detail ("Missing state dir: " + $status.state_dir)
 }
 
-$activeEnv = Read-DotEnvFile -Path (Join-Path $status.state_dir ".env")
-$legacyEnv = Read-DotEnvFile -Path (Join-Path $env:USERPROFILE ".codex\channels\codexlink-telegram\.env")
-$tokenSource = if ($activeEnv["BLUN_TELEGRAM_BOT_TOKEN"]) {
-  "active_state_env"
-} elseif ($legacyEnv["BLUN_TELEGRAM_BOT_TOKEN"]) {
-  "legacy_env_fallback"
-} else {
-  ""
+$activeEnvPath = Join-Path $status.state_dir ".env"
+$activeEnv = Read-DotEnvFile -Path $activeEnvPath
+$legacyEnvPath = Join-Path $env:USERPROFILE ".codex\channels\codexlink-telegram\.env"
+$legacyEnv = Read-DotEnvFile -Path $legacyEnvPath
+
+$tokenValue = ""
+$tokenSource = ""
+if (Test-TelegramTokenFormat -Value $activeEnv["BLUN_TELEGRAM_BOT_TOKEN"]) {
+  $tokenValue = [string]$activeEnv["BLUN_TELEGRAM_BOT_TOKEN"]
+  $tokenSource = "state env"
+} elseif (Test-TelegramTokenFormat -Value $legacyEnv["BLUN_TELEGRAM_BOT_TOKEN"]) {
+  $tokenValue = [string]$legacyEnv["BLUN_TELEGRAM_BOT_TOKEN"]
+  $tokenSource = "legacy env fallback"
 }
-Add-Check -List $checks -Name "bot_token" -Status $(if ($tokenSource) { "ok" } else { "fail" }) -Detail $(if ($tokenSource) { $tokenSource } else { "No BLUN_TELEGRAM_BOT_TOKEN found in active or legacy env files." })
+Add-Check -List $checks -Name "bot_token" -Status $(if ($tokenValue) { "ok" } else { "fail" }) -Detail $(if ($tokenValue) { $tokenSource } else { "No valid BLUN_TELEGRAM_BOT_TOKEN found." })
+
+$allowedChatIds = ""
+$allowedChatSource = ""
+if (Test-AllowedChatIdsFormat -Value $activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]) {
+  $allowedChatIds = [string]$activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
+  $allowedChatSource = "state env"
+} elseif (Test-AllowedChatIdsFormat -Value $legacyEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]) {
+  $allowedChatIds = [string]$legacyEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
+  $allowedChatSource = "legacy env fallback"
+}
+Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "fail" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No valid BLUN_TELEGRAM_ALLOWED_CHAT_ID found." })
 
 Add-Check -List $checks -Name "app_server_ws" -Status $(if ($status.active_ws) { "ok" } else { "warn" }) -Detail $(if ($status.active_ws) { $status.active_ws } else { "No active websocket recorded." })
 Add-Check -List $checks -Name "bound_thread" -Status $(if ($status.active_thread_id) { "ok" } else { "warn" }) -Detail $(if ($status.active_thread_id) { $status.active_thread_id } else { "No active thread bound yet." })
@@ -107,19 +224,19 @@ if ($status.last_outbound) {
 
 Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth)
 
-$overall = "ok"
-if (@($checks | Where-Object { $_.status -eq "fail" }).Count -gt 0) {
-  $overall = "fail"
-} elseif (@($checks | Where-Object { $_.status -eq "warn" }).Count -gt 0) {
-  $overall = "warn"
-}
-
-[ordered]@{
+$result = [ordered]@{
   profile = $status.profile
-  overall = $overall
+  overall = Get-OverallStatus -Checks $checks
   runtime_root = $runtimeRoot
   state_dir = $status.state_dir
   plugin_root = $status.plugin_root
   checks = $checks
   status = $status
-} | ConvertTo-Json -Depth 8
+}
+
+if ($Json) {
+  $result | ConvertTo-Json -Depth 8
+  exit 0
+}
+
+Write-DoctorReport -Result $result -TokenSource $tokenSource -AllowedChatSource $allowedChatSource

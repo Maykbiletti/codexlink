@@ -400,6 +400,16 @@ if (-not $telegramStateDir) {
   $telegramStateDir = Resolve-ConfiguredPath -Value $telegramStateDir
 }
 
+$telegramExistingEnv = @{}
+if ($telegramStateDir) {
+  Ensure-Dir -Path $telegramStateDir
+  $telegramExistingEnv = Read-DotEnvFile -Path (Join-Path $telegramStateDir ".env")
+}
+
+if (-not $telegramAllowedChatId -and $telegramExistingEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]) {
+  $telegramAllowedChatId = [string]$telegramExistingEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
+}
+
 if ($telegramEnabled) {
   Set-EnvVar "BLUN_TELEGRAM_AGENT_NAME" $profile.agent_name
   Set-EnvVar "BLUN_TELEGRAM_STATE_DIR" $telegramStateDir
@@ -485,12 +495,13 @@ if ($useRemoteAppServer) {
     $codexArgs += "--remote"
     $codexArgs += $telegramAppServerWsUrl
   } else {
-    Ensure-Dir -Path $telegramStateDir
     $envFilePath = Join-Path $telegramStateDir ".env"
     $stateEnv = Read-DotEnvFile -Path $envFilePath
     $stateEnv["BLUN_TELEGRAM_AGENT_NAME"] = $profile.agent_name
     $stateEnv["BLUN_TELEGRAM_STATE_DIR"] = $telegramStateDir
-    $stateEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"] = $telegramAllowedChatId
+    if ($telegramAllowedChatId) {
+      $stateEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"] = $telegramAllowedChatId
+    }
     $stateEnv["BLUN_TELEGRAM_PLUGIN_MODE"] = $TelegramMode
     $stateEnv["BLUN_TELEGRAM_APP_SERVER_WS_URL"] = $telegramAppServerWsUrl
     $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = ""
