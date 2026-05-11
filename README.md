@@ -167,6 +167,24 @@ For internal/private profiles:
 - give it its own Telegram state directory
 - do not ship internal agent profiles in the public package
 
+Local private profiles are loaded from:
+
+```text
+%USERPROFILE%\.codex\profiles\codexlink\<name>.json
+```
+
+Example:
+
+```powershell
+blun-codex --profile frida telegram-plugin
+```
+
+looks for:
+
+```text
+%USERPROFILE%\.codex\profiles\codexlink\frida.json
+```
+
 ## What it does
 
 - starts one consistent local CLI runtime

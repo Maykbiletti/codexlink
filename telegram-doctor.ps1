@@ -133,8 +133,33 @@ function Write-DoctorReport {
   }
 }
 
+function Get-ProfilePath {
+  param(
+    [string]$RuntimeRoot,
+    [string]$ProfileName
+  )
+
+  $normalized = [string]$ProfileName
+  if (-not $normalized) { $normalized = "" }
+  $normalized = $normalized.ToLower()
+  $candidates = @()
+  if ($env:BLUN_CODEX_PROFILE_ROOT) {
+    $candidates += (Join-Path $env:BLUN_CODEX_PROFILE_ROOT ($normalized + ".json"))
+  }
+  $candidates += (Join-Path $env:USERPROFILE (".codex\\profiles\\codexlink\\" + $normalized + ".json"))
+  $candidates += (Join-Path $RuntimeRoot ("profiles\\" + $normalized + ".json"))
+
+  foreach ($candidate in $candidates) {
+    if ($candidate -and (Test-Path $candidate)) {
+      return $candidate
+    }
+  }
+
+  return $candidates[-1]
+}
+
 $runtimeRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$profilePath = Join-Path $runtimeRoot ("profiles\" + $Profile.ToLower() + ".json")
+$profilePath = Get-ProfilePath -RuntimeRoot $runtimeRoot -ProfileName $Profile
 $checks = New-Object 'System.Collections.Generic.List[object]'
 
 if (Test-Path $profilePath) {
