@@ -1,13 +1,17 @@
+<div align="center">
+
 # CodexLink
+
+**Your agent in your pocket.**
+
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Powered by BLUN](https://img.shields.io/badge/Powered%20by-BLUN-22D3EE.svg)](https://blun.ai)
+
+</div>
 
 CodexLink is the BLUN launcher for one visible CLI session with optional Telegram delivery.
 
-The package is Windows-first today and bundles:
-
-- a global launcher
-- a Telegram plugin folder
-- startup diagnostics
-- one default public profile
+It keeps transport and queueing around the operator, without spinning up a hidden second session.
 
 ## Install
 
@@ -74,7 +78,7 @@ blun-codex telegram-plugin --print-only
 - starts one consistent local CLI runtime
 - writes a launch record into `.codex/runtimes/default/`
 - keeps Telegram queue state under `.codex/channels/telegram-default/`
-- can attach Telegram delivery to the same visible session
+- attaches Telegram delivery to the same visible session
 - keeps poller, dispatcher, and reply relay separate from the foreground operator
 
 ## What it does not do
