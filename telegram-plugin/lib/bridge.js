@@ -22,6 +22,52 @@ function pendingReplyKey(entry) {
   return entry.turnId || `${entry.threadId || ""}:${entry.chatId}:${entry.messageId}`;
 }
 
+function containsToken(text, token) {
+  const value = String(token || "").trim();
+  if (!value) {
+    return false;
+  }
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, "i").test(String(text || ""));
+}
+
+function looksLikeEscalation(text) {
+  const value = String(text || "");
+  return [
+    "eskalation",
+    "escalation",
+    "urgent",
+    "emergency",
+    "sofort",
+    "prio 0",
+    "p0",
+    "blocker"
+  ].some((token) => containsToken(value, token));
+}
+
+function classifyInboundRelevance(config, inbound) {
+  if (looksLikeEscalation(inbound.text)) {
+    return "escalation";
+  }
+
+  if (String(inbound.chatType || "") === "private") {
+    return "direct";
+  }
+
+  const text = String(inbound.text || "");
+  const agentName = String(config.agentName || "").trim();
+  if (agentName && agentName.toLowerCase() !== "default" && containsToken(text, agentName)) {
+    return "direct";
+  }
+
+  const lane = String(config.lane || "").trim();
+  if (lane && lane.toLowerCase() !== "general" && containsToken(text, lane)) {
+    return "lane";
+  }
+
+  return "ambient";
+}
+
 function statusWeight(status) {
   switch (status) {
     case "delivered":
@@ -96,7 +142,7 @@ function mergeQueueEntry(current, incoming) {
   merged.deliveredAt = pickIsoLater(current.deliveredAt, incoming.deliveredAt);
   merged.ts = pickIsoLater(current.ts, incoming.ts);
 
-  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot"]) {
+  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance"]) {
     if (!merged[field]) {
       merged[field] = current[field] || incoming[field] || null;
     }
@@ -300,6 +346,7 @@ function normalizeInbound(message) {
     userId: message.from?.id ? String(message.from.id) : "",
     text,
     ts: nowIso(),
+    relevance: "ambient",
     status: "queued",
     attempts: 0,
     lastAttemptAt: null
@@ -407,6 +454,28 @@ async function resolveThreadSessionPath(config, threadId) {
     }
   }
   return findRolloutFile(config.paths.sessionsDir, threadId) || "";
+}
+
+function countOpenPendingReplies(state) {
+  return (state.pendingReplies || []).filter((entry) => !entry.sentAt && !["error", "ignored_bot", "superseded"].includes(String(entry.status || ""))).length;
+}
+
+async function resolveSessionActivity(config, threadId) {
+  const sessionPath = await resolveThreadSessionPath(config, threadId);
+  if (!sessionPath || !existsSync(sessionPath)) {
+    return {
+      sessionPath,
+      quietMs: Number.POSITIVE_INFINITY,
+      active: false
+    };
+  }
+
+  const quietMs = Math.max(0, Date.now() - statSync(sessionPath).mtimeMs);
+  return {
+    sessionPath,
+    quietMs,
+    active: quietMs < Number(config.idleCooldownMs || 0)
+  };
 }
 
 function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionOffset) {
@@ -592,12 +661,16 @@ export function bridgeStatus() {
   const state = loadState(config);
   const queued = state.queue.filter((item) => item.status === "queued");
   const submitted = state.queue.filter((item) => item.status === "submitted");
+  const ambient = queued.filter((item) => item.relevance === "ambient");
   const pendingReplies = (state.pendingReplies || []).filter((item) => !item.sentAt && item.status !== "error");
   return {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
     boundThreadId: config.currentThreadId || state.currentThreadId || null,
+    dispatchMode: config.dispatchMode,
+    idleCooldownMs: config.idleCooldownMs,
     queueDepth: queued.length,
+    ambientQueueDepth: ambient.length,
     submittedDepth: submitted.length,
     pendingReplyDepth: pendingReplies.length,
     lastInbound: state.lastInbound,
@@ -605,7 +678,7 @@ export function bridgeStatus() {
     lastPollAt: state.lastPollAt,
     lastInjectAt: state.lastInjectAt,
     stateDir: config.paths.root,
-    note: "No autonomous shadow bot. Telegram is queued here and only injected into a real Codex thread on demand."
+    note: "Telegram first lands in queue. Automatic delivery waits for an idle session, skips ambient group noise, and still lets escalations through."
   };
 }
 
@@ -700,10 +773,11 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED_EMPTY chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    inbound.relevance = classifyInboundRelevance(config, inbound);
     state.queue.push(inbound);
     state.lastInbound = inbound;
     appendJsonl(config.paths.inboxFile, inbound);
-    appendLog(config.paths.activityFile, `IN chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+    appendLog(config.paths.activityFile, `IN chat=${inbound.chatId} message=${inbound.messageId} relevance=${inbound.relevance} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
     captured += 1;
   }
 
@@ -725,9 +799,10 @@ export function listQueue(limit = 10) {
   return state.queue.slice(-Math.max(1, limit));
 }
 
-export async function injectNext(threadId) {
+export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
+  const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
   const preferredThreadId = (
     threadId
@@ -740,6 +815,53 @@ export async function injectNext(threadId) {
     throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
   }
 
+  let next = null;
+  if (auto && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
+    next = state.queue.find((item) => {
+      if (item.status !== "queued") {
+        return false;
+      }
+      if (String(item.chatType || "") === "private") {
+        return true;
+      }
+      return ["direct", "lane", "escalation"].includes(String(item.relevance || ""));
+    });
+  } else {
+    next = state.queue.find((item) => item.status === "queued");
+  }
+
+  if (!next) {
+    return {
+      ok: true,
+      status: auto ? "deferred" : "empty",
+      reason: auto ? "no_eligible_message" : undefined
+    };
+  }
+
+  const bypassDeferredGate = auto && next.relevance === "escalation";
+  if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
+    const openPendingReplies = countOpenPendingReplies(state);
+    if (openPendingReplies > 0) {
+      return {
+        ok: false,
+        status: "deferred",
+        reason: "pending_reply",
+        pendingReplies: openPendingReplies
+      };
+    }
+
+    const sessionActivity = await resolveSessionActivity(config, resolvedThreadId);
+    if (sessionActivity.active) {
+      return {
+        ok: false,
+        status: "deferred",
+        reason: "session_active",
+        quietMs: sessionActivity.quietMs,
+        readyInMs: Math.max(0, Number(config.idleCooldownMs || 0) - Number(sessionActivity.quietMs || 0))
+      };
+    }
+  }
+
   let promoted = 0;
   if (!useAppServer) {
     for (const entry of state.queue) {
@@ -750,14 +872,6 @@ export async function injectNext(threadId) {
   }
   if (promoted > 0) {
     saveStateForConfig(config, state);
-  }
-
-  const next = state.queue.find((item) => item.status === "queued");
-  if (!next) {
-    return {
-      ok: true,
-      status: promoted > 0 ? "submitted" : "empty"
-    };
   }
 
   next.attempts = Number(next.attempts || 0) + 1;
@@ -811,6 +925,7 @@ export async function injectNext(threadId) {
     }
   }
   state.lastInjectAt = nowIso();
+  state.lastAutoDispatchAt = auto ? state.lastInjectAt : state.lastAutoDispatchAt;
   const latestState = loadState(config);
   saveStateForConfig(config, mergeStateSnapshots(latestState, state));
   appendLog(config.paths.activityFile, `INJECT_${result.ok ? "OK" : "ERROR"} thread=${resolvedThreadId} message=${next.messageId}`);

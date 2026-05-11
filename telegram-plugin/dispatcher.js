@@ -19,8 +19,8 @@ process.on("SIGTERM", () => {
 async function main() {
   while (!stopping) {
     try {
-      const result = await injectNext("");
-      if (result.status !== "empty") {
+      const result = await injectNext("", { auto: true });
+      if (!["empty", "deferred"].includes(result.status)) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), kind: "inject", result }));
       }
     } catch (error) {

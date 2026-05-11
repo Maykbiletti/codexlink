@@ -47,6 +47,8 @@ export function loadConfig() {
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
     resumeTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_RESUME_TIMEOUT_MS || "15000", 10) || 15000,
+    idleCooldownMs: Number.parseInt(env.BLUN_TELEGRAM_IDLE_COOLDOWN_MS || "15000", 10) || 15000,
+    dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",

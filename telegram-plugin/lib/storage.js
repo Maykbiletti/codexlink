@@ -44,6 +44,7 @@ export function defaultState() {
     lastInbound: null,
     lastOutbound: null,
     lastPollAt: null,
-    lastInjectAt: null
+    lastInjectAt: null,
+    lastAutoDispatchAt: null
   };
 }

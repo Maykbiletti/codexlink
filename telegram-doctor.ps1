@@ -191,6 +191,7 @@ if (Test-AllowedChatIdsFormat -Value $activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
 Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "fail" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No valid BLUN_TELEGRAM_ALLOWED_CHAT_ID found." })
 
 Add-Check -List $checks -Name "app_server_ws" -Status $(if ($status.active_ws) { "ok" } else { "warn" }) -Detail $(if ($status.active_ws) { $status.active_ws } else { "No active websocket recorded." })
+Add-Check -List $checks -Name "dispatch_mode" -Status $(if ($status.dispatch_mode -eq "deferred") { "ok" } else { "warn" }) -Detail ("mode=" + [string]$status.dispatch_mode + " cooldown_ms=" + [string]$status.idle_cooldown_ms)
 Add-Check -List $checks -Name "bound_thread" -Status $(if ($status.active_thread_id) { "ok" } else { "warn" }) -Detail $(if ($status.active_thread_id) { $status.active_thread_id } else { "No active thread bound yet." })
 Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.poller_pid + " alive=" + [string]$status.poller_alive)
 Add-Check -List $checks -Name "dispatcher" -Status $(if ($status.dispatcher_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.dispatcher_pid + " alive=" + [string]$status.dispatcher_alive)
@@ -222,7 +223,7 @@ if ($status.last_outbound) {
   Add-Check -List $checks -Name "last_outbound" -Status "warn" -Detail "No outbound Telegram message recorded yet."
 }
 
-Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth)
+Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " ambient=" + $status.ambient_queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth)
 
 $result = [ordered]@{
   profile = $status.profile

@@ -13,6 +13,14 @@ CodexLink is the BLUN launcher for one visible CLI session with optional Telegra
 
 It keeps transport and queueing around the operator, without spinning up a hidden second session.
 
+Telegram delivery is serial by default:
+
+- inbound messages land in queue first
+- active work is not interrupted immediately
+- direct messages wait until the visible session is quiet
+- ambient group noise stays queued until it is relevant or manually drained
+- escalation-style messages can still jump the line
+
 ## Install
 
 From GitHub:
@@ -165,6 +173,7 @@ For internal/private profiles:
 - writes a launch record into `.codex/runtimes/default/`
 - keeps Telegram queue state under `.codex/channels/telegram-default/`
 - attaches Telegram delivery to the same visible session
+- defers automatic Telegram delivery until the foreground session is idle
 - keeps poller, dispatcher, and reply relay separate from the foreground operator
 
 ## What it does not do
