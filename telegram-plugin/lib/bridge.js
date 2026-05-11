@@ -114,6 +114,43 @@ function pickLatestRecord(current, incoming) {
   return incomingId >= currentId ? { ...incoming } : { ...current };
 }
 
+function isoAgeMs(isoString) {
+  const millis = Date.parse(isoString || "");
+  if (Number.isNaN(millis)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(0, Date.now() - millis);
+}
+
+function isNonTerminalPendingReply(entry) {
+  return Boolean(entry)
+    && !entry.sentAt
+    && !["error", "ignored_bot", "superseded", "expired"].includes(String(entry.status || ""));
+}
+
+function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
+  const replies = Array.isArray(pendingReplies) ? pendingReplies : [];
+  const timeoutMs = Math.max(Number(config.pendingReplyTimeoutMs || 0), 0);
+  if (timeoutMs <= 0) {
+    return 0;
+  }
+
+  let expired = 0;
+  for (const entry of replies) {
+    if (!isNonTerminalPendingReply(entry)) {
+      continue;
+    }
+    if (isoAgeMs(entry.createdAt) < timeoutMs) {
+      continue;
+    }
+    entry.status = "expired";
+    entry.sentAt = nowIso();
+    entry.responsePreview = entry.responsePreview || `[pending reply expired after ${timeoutMs}ms]`;
+    expired += 1;
+  }
+  return expired;
+}
+
 function mergeQueueEntry(current, incoming) {
   if (!current && !incoming) {
     return null;
@@ -456,8 +493,17 @@ async function resolveThreadSessionPath(config, threadId) {
   return findRolloutFile(config.paths.sessionsDir, threadId) || "";
 }
 
-function countOpenPendingReplies(state) {
-  return (state.pendingReplies || []).filter((entry) => !entry.sentAt && !["error", "ignored_bot", "superseded"].includes(String(entry.status || ""))).length;
+function countOpenPendingReplies(state, config) {
+  const timeoutMs = Math.max(Number(config.pendingReplyTimeoutMs || 0), 0);
+  return (state.pendingReplies || []).filter((entry) => {
+    if (!isNonTerminalPendingReply(entry)) {
+      return false;
+    }
+    if (timeoutMs > 0 && isoAgeMs(entry.createdAt) >= timeoutMs) {
+      return false;
+    }
+    return true;
+  }).length;
 }
 
 async function resolveSessionActivity(config, threadId) {
@@ -659,20 +705,28 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
 export function bridgeStatus() {
   const config = loadConfig();
   const state = loadState(config);
+  state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
+  if (expiredPendingReplies > 0) {
+    saveStateForConfig(config, state);
+  }
   const queued = state.queue.filter((item) => item.status === "queued");
   const submitted = state.queue.filter((item) => item.status === "submitted");
   const ambient = queued.filter((item) => item.relevance === "ambient");
-  const pendingReplies = (state.pendingReplies || []).filter((item) => !item.sentAt && item.status !== "error");
+  const pendingReplies = (state.pendingReplies || []).filter((item) => isNonTerminalPendingReply(item));
+  const expiredReplies = (state.pendingReplies || []).filter((item) => String(item.status || "") === "expired");
   return {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
     boundThreadId: config.currentThreadId || state.currentThreadId || null,
     dispatchMode: config.dispatchMode,
     idleCooldownMs: config.idleCooldownMs,
+    pendingReplyTimeoutMs: config.pendingReplyTimeoutMs,
     queueDepth: queued.length,
     ambientQueueDepth: ambient.length,
     submittedDepth: submitted.length,
     pendingReplyDepth: pendingReplies.length,
+    expiredPendingReplyDepth: expiredReplies.length,
     lastInbound: state.lastInbound,
     lastOutbound: state.lastOutbound,
     lastPollAt: state.lastPollAt,
@@ -802,6 +856,12 @@ export function listQueue(limit = 10) {
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
+  state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
+  if (expiredPendingReplies > 0) {
+    appendLog(config.paths.activityFile, `PENDING_REPLY_EXPIRED count=${expiredPendingReplies}`);
+    saveStateForConfig(config, state);
+  }
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
   const preferredThreadId = (
@@ -840,7 +900,7 @@ export async function injectNext(threadId, options = {}) {
 
   const bypassDeferredGate = auto && next.relevance === "escalation";
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
-    const openPendingReplies = countOpenPendingReplies(state);
+    const openPendingReplies = countOpenPendingReplies(state, config);
     if (openPendingReplies > 0) {
       return {
         ok: false,
@@ -943,6 +1003,7 @@ export async function relayRepliesOnce() {
   const config = loadConfig();
   const state = loadState(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
 
   for (const entry of state.pendingReplies || []) {
     if (entry.sentAt || entry.status === "error") {
@@ -956,7 +1017,7 @@ export async function relayRepliesOnce() {
     entry.responsePreview = entry.responsePreview || "[ignored bot message]";
   }
 
-  const pendingReplies = (state.pendingReplies || []).filter((entry) => !entry.sentAt && entry.status !== "error");
+  const pendingReplies = (state.pendingReplies || []).filter((entry) => isNonTerminalPendingReply(entry));
   if (pendingReplies.length === 0) {
     saveStateForConfig(config, state);
     return { ok: true, status: "empty", delivered: 0 };
@@ -1036,7 +1097,7 @@ export async function relayRepliesOnce() {
     ok: true,
     status: delivered > 0 ? "sent" : "pending",
     delivered,
-    pending: (state.pendingReplies || []).filter((entry) => !entry.sentAt && entry.status !== "error").length
+    pending: (state.pendingReplies || []).filter((entry) => isNonTerminalPendingReply(entry)).length
   };
 }
 

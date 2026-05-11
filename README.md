@@ -20,6 +20,7 @@ Telegram delivery is serial by default:
 - direct messages wait until the visible session is quiet
 - ambient group noise stays queued until it is relevant or manually drained
 - escalation-style messages can still jump the line
+- stale pending replies time out automatically, so the queue cannot block forever
 
 ## Install
 

@@ -51,6 +51,7 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `BLUN_TELEGRAM_THREAD_ID`
 - `BLUN_TELEGRAM_RESUME_TIMEOUT_MS`
 - `BLUN_TELEGRAM_IDLE_COOLDOWN_MS`
+- `BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS`
 - `BLUN_TELEGRAM_DISPATCH_MODE` (`deferred` by default, `legacy` to restore eager dispatch)
 
 ## Tools
