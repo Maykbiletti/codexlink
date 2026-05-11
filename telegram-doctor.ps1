@@ -230,6 +230,8 @@ Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) 
 Add-Check -List $checks -Name "app_server_ws" -Status $(if ($status.active_ws) { "ok" } else { "warn" }) -Detail $(if ($status.active_ws) { $status.active_ws } else { "No active websocket recorded." })
 Add-Check -List $checks -Name "dispatch_mode" -Status $(if ($status.dispatch_mode -eq "deferred") { "ok" } else { "warn" }) -Detail ("mode=" + [string]$status.dispatch_mode + " cooldown_ms=" + [string]$status.idle_cooldown_ms + " pending_reply_timeout_ms=" + [string]$status.pending_reply_timeout_ms)
 Add-Check -List $checks -Name "bound_thread" -Status $(if ($status.active_thread_id) { "ok" } else { "warn" }) -Detail $(if ($status.active_thread_id) { $status.active_thread_id } else { "No active thread bound yet." })
+Add-Check -List $checks -Name "frontend_owner" -Status $(if ($status.frontend_owner_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.frontend_owner_pid + " alive=" + [string]$status.frontend_owner_alive)
+Add-Check -List $checks -Name "queue_notifier" -Status $(if (($null -eq $status.queue_notifier_pid) -or ($status.queue_notifier_alive)) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.queue_notifier_pid + " alive=" + [string]$status.queue_notifier_alive)
 Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.poller_pid + " alive=" + [string]$status.poller_alive)
 Add-Check -List $checks -Name "dispatcher" -Status $(if ($status.dispatcher_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.dispatcher_pid + " alive=" + [string]$status.dispatcher_alive)
 Add-Check -List $checks -Name "responder" -Status $(if ($status.responder_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.responder_pid + " alive=" + [string]$status.responder_alive)
@@ -260,7 +262,7 @@ if ($status.last_outbound) {
   Add-Check -List $checks -Name "last_outbound" -Status "warn" -Detail "No outbound Telegram message recorded yet."
 }
 
-Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " ambient=" + $status.ambient_queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth + " expired_pending_replies=" + $status.expired_pending_reply_depth)
+Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " ambient=" + $status.ambient_queue_depth + " parked=" + $status.parked_queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth + " expired_pending_replies=" + $status.expired_pending_reply_depth)
 
 $result = [ordered]@{
   profile = $status.profile

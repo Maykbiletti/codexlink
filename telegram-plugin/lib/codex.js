@@ -20,6 +20,12 @@ function buildPrompt(config, message) {
     "Treat the following as a real inbound user message for this exact existing thread.",
     "Reply naturally in-thread. Do not mention bridge transport unless relevant.",
     "If this came from a group or topic, keep the reply scoped to that exact conversation.",
+    ...(message.intent === "continue_nudge"
+      ? [
+        "Treat this as a continue/resume signal for the current work, not as a request for a conversational acknowledgment.",
+        "Continue the existing task flow. Only reply in-thread if you have a concrete result, blocker, or decision that the user needs to see now."
+      ]
+      : []),
     ...(config.lane ? [`Stay strictly inside your assigned lane (${config.lane}). Do not claim ownership or make decisions for other lanes.`] : []),
     "",
     "Message:",

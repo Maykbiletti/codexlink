@@ -9,10 +9,16 @@ export function getStateDir() {
 export function getPaths() {
   const root = getStateDir();
   const codexHome = join(homedir(), ".codex");
+  const agentName = process.env.BLUN_TELEGRAM_AGENT_NAME?.trim()
+    || process.env.TELEGRAM_AGENT_NAME?.trim()
+    || "default";
+  const runtimeDir = join(codexHome, "runtimes", agentName);
   return {
     root,
     legacyRoot: join(codexHome, "channels", "codexlink-telegram"),
     codexHome,
+    runtimeDir,
+    currentRuntimeFile: join(runtimeDir, "current-remote-runtime.json"),
     sessionsDir: join(codexHome, "sessions"),
     envFile: join(root, ".env"),
     stateFile: join(root, "state.json"),
@@ -36,7 +42,7 @@ export function getPaths() {
 
 export function ensureStateLayout() {
   const paths = getPaths();
-  for (const dir of [paths.root, paths.promptsDir, paths.responsesDir]) {
+  for (const dir of [paths.root, paths.promptsDir, paths.responsesDir, paths.runtimeDir]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }

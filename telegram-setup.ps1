@@ -152,7 +152,7 @@ $needsToken = -not (Test-TelegramTokenFormat -Value $currentToken)
 $needsChatIds = -not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)
 $changed = $false
 
-if ($EnsureConfigured -and -not $needsToken -and -not $needsChatIds) {
+if ($EnsureConfigured -and -not $needsToken) {
   $result = [ordered]@{
     ok = $true
     changed = $false
@@ -160,20 +160,25 @@ if ($EnsureConfigured -and -not $needsToken -and -not $needsChatIds) {
     state_dir = $stateDir
     env_path = $envPath
     missing = @()
+    optional = @(
+      "allowed_chat_ids"
+    )
   }
   if ($Json) {
     $result | ConvertTo-Json -Depth 6
   } else {
     Write-Host "Telegram ist bereits eingerichtet fuer Profil '$profileAgent'." -ForegroundColor Green
     Write-Host "State-Ordner: $stateDir"
+    if ($needsChatIds) {
+      Write-Host "Hinweis: keine Chat-Allowlist gesetzt. Der Bot akzeptiert aktuell alle Chats, die er sehen kann." -ForegroundColor Yellow
+    }
   }
   exit 0
 }
 
-if ($EnsureConfigured -and $Json -and ($needsToken -or $needsChatIds)) {
+if ($EnsureConfigured -and $Json -and $needsToken) {
   $missing = @()
   if ($needsToken) { $missing += "bot_token" }
-  if ($needsChatIds) { $missing += "allowed_chat_ids" }
   [ordered]@{
     ok = $false
     changed = $false
@@ -181,6 +186,9 @@ if ($EnsureConfigured -and $Json -and ($needsToken -or $needsChatIds)) {
     state_dir = $stateDir
     env_path = $envPath
     missing = $missing
+    optional = @(
+      "allowed_chat_ids"
+    )
   } | ConvertTo-Json -Depth 6
   exit 2
 }
@@ -193,6 +201,7 @@ if (-not $Json) {
   Write-Host ""
   Write-Host "Ich speichere die Telegram-Werte automatisch an die richtige lokale Stelle." -ForegroundColor DarkGray
   Write-Host "Du musst keine .env-Datei selbst suchen." -ForegroundColor DarkGray
+  Write-Host "Chat-ID-Allowlist ist optional und blockiert den Start nicht mehr." -ForegroundColor DarkGray
   Write-Host ""
 }
 
@@ -206,7 +215,7 @@ if ($needsToken) {
   $changed = $true
 }
 
-if ($needsChatIds) {
+if (-not $EnsureConfigured -and $needsChatIds) {
   $currentAllowedChatIds = Prompt-RequiredValue `
     -Prompt "Erlaubte Chat ID(s), komma-getrennt" `
     -CurrentValue $currentAllowedChatIds `

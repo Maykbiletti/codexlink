@@ -30,6 +30,27 @@ function Test-PidAlive {
   return $null -ne (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)
 }
 
+function Normalize-Preview {
+  param([string]$Value, [int]$MaxLength = 72)
+  $text = [string]$Value
+  $text = $text -replace "\s+", " "
+  $text = $text.Trim()
+  if (-not $text) { return "" }
+  if ($text.Length -le $MaxLength) { return $text }
+  return ($text.Substring(0, [Math]::Max(0, $MaxLength - 3)).TrimEnd() + "...")
+}
+
+function Get-IsoAgeMs {
+  param([string]$IsoString)
+  if (-not $IsoString) { return [double]::PositiveInfinity }
+  try {
+    $parsed = [DateTimeOffset]::Parse($IsoString)
+    return [Math]::Max(0, ([DateTimeOffset]::UtcNow - $parsed.ToUniversalTime()).TotalMilliseconds)
+  } catch {
+    return [double]::PositiveInfinity
+  }
+}
+
 function Resolve-ConfiguredPath {
   param([string]$Value, [string]$RuntimeRoot)
   if (-not $Value) { return "" }
@@ -96,9 +117,21 @@ $currentRuntime = Try-ReadJson -Path (Join-Path $runtimeDir "current-remote-runt
 $state = Try-ReadJson -Path (Join-Path $stateDir "state.json")
 $envFile = Read-DotEnvFile -Path (Join-Path $stateDir ".env")
 $loadedThreads = @()
+$ambientQueueTtlMs = if ($envFile["BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS"]) { [int]$envFile["BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS"] } else { 600000 }
 $queue = @($state.queue)
-$queued = @($queue | Where-Object { $_.status -eq "queued" })
-$ambient = @($queued | Where-Object { $_.relevance -eq "ambient" })
+$staleAmbientQueued = @($queue | Where-Object {
+  $_.status -eq "queued" -and
+  [string]$_.relevance -eq "ambient" -and
+  (Get-IsoAgeMs -IsoString ([string]$_.ts)) -ge $ambientQueueTtlMs
+})
+$queued = @($queue | Where-Object {
+  if ($_.status -ne "queued") { return $false }
+  if ([string]$_.relevance -eq "ambient" -and (Get-IsoAgeMs -IsoString ([string]$_.ts)) -ge $ambientQueueTtlMs) { return $false }
+  return $true
+})
+$directQueued = @($queued | Where-Object { @("direct", "lane") -contains [string]$_.relevance })
+$ambientQueued = @($queued | Where-Object { [string]$_.relevance -eq "ambient" })
+$escalationQueued = @($queued | Where-Object { [string]$_.relevance -eq "escalation" })
 $submitted = @($queue | Where-Object { $_.status -eq "submitted" })
 $delivered = @($queue | Where-Object { $_.status -eq "delivered" })
 $errors = @($queue | Where-Object { $_.status -eq "error" })
@@ -108,7 +141,9 @@ $pollerPid = if (Test-Path (Join-Path $stateDir "poller.pid")) { (Get-Content -R
 $dispatcherPid = if (Test-Path (Join-Path $stateDir "dispatcher.pid")) { (Get-Content -Raw (Join-Path $stateDir "dispatcher.pid")).Trim() } else { $null }
 $responderPid = if (Test-Path (Join-Path $stateDir "responder.pid")) { (Get-Content -Raw (Join-Path $stateDir "responder.pid")).Trim() } else { $null }
 $stateThreadId = if ($state.currentThreadId) { [string]$state.currentThreadId } else { "" }
+$runtimeThreadId = if ($currentRuntime -and $currentRuntime.thread_id) { [string]$currentRuntime.thread_id } else { "" }
 $telegramPluginRoot = Get-TelegramPluginRoot -RuntimeRoot $runtimeRoot
+$nextQueued = @($queued | Sort-Object @{ Expression = { [string]$_.ts } }, @{ Expression = { [int]$_.messageId } } | Select-Object -First 1)
 
 if ($currentRuntime) {
   if ($stateThreadId) {
@@ -158,14 +193,21 @@ $result = [ordered]@{
   active_ws = $envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"]
   dispatch_mode = $(if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { $envFile["BLUN_TELEGRAM_DISPATCH_MODE"] } else { "deferred" })
   idle_cooldown_ms = $(if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { $envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { "15000" })
+  ambient_queue_ttl_ms = $ambientQueueTtlMs
   pending_reply_timeout_ms = $(if ($envFile["BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS"]) { $envFile["BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS"] } else { "120000" })
   env_thread_id = $envFile["BLUN_TELEGRAM_THREAD_ID"]
+  runtime_thread_id = $runtimeThreadId
   state_thread_id = $stateThreadId
-  active_thread_id = if ($stateThreadId) { $stateThreadId } else { $envFile["BLUN_TELEGRAM_THREAD_ID"] }
+  active_thread_id = if ($runtimeThreadId) { $runtimeThreadId } elseif ($envFile["BLUN_TELEGRAM_THREAD_ID"]) { $envFile["BLUN_TELEGRAM_THREAD_ID"] } else { $stateThreadId }
+  frontend_owner_pid = $(if ($currentRuntime -and $currentRuntime.frontend_host_pid) { [string]$currentRuntime.frontend_host_pid } else { "" })
+  queue_notifier_pid = $(if ($currentRuntime -and $currentRuntime.queue_notifier_pid) { [string]$currentRuntime.queue_notifier_pid } else { "" })
   current_runtime = $currentRuntime
   loaded_threads = $loadedThreads
   queue_depth = $queued.Count
-  ambient_queue_depth = $ambient.Count
+  direct_queue_depth = $directQueued.Count
+  ambient_queue_depth = $ambientQueued.Count
+  escalation_queue_depth = $escalationQueued.Count
+  parked_queue_depth = $staleAmbientQueued.Count
   submitted_depth = $submitted.Count
   pending_reply_depth = $pendingReplies.Count
   expired_pending_reply_depth = $expiredPendingReplies.Count
@@ -177,6 +219,16 @@ $result = [ordered]@{
   poller_pid = $pollerPid
   dispatcher_pid = $dispatcherPid
   responder_pid = $responderPid
+  next_queued = if ($nextQueued.Count -gt 0) {
+    [ordered]@{
+      chat_id = $nextQueued[0].chatId
+      message_id = $nextQueued[0].messageId
+      relevance = $nextQueued[0].relevance
+      preview = Normalize-Preview -Value ([string]$nextQueued[0].text)
+    }
+  } else {
+    $null
+  }
 }
 
 if ($result.poller_pid) {
@@ -187,6 +239,12 @@ if ($result.dispatcher_pid) {
 }
 if ($result.responder_pid) {
   $result["responder_alive"] = Test-PidAlive -ProcId ([int]$result.responder_pid)
+}
+if ($result.frontend_owner_pid) {
+  $result["frontend_owner_alive"] = Test-PidAlive -ProcId ([int]$result.frontend_owner_pid)
+}
+if ($result.queue_notifier_pid) {
+  $result["queue_notifier_alive"] = Test-PidAlive -ProcId ([int]$result.queue_notifier_pid)
 }
 
 $result | ConvertTo-Json -Depth 8

@@ -45,6 +45,50 @@ function looksLikeEscalation(text) {
   ].some((token) => containsToken(value, token));
 }
 
+function looksLikeContinueNudge(text) {
+  const value = String(text || "").trim().toLowerCase();
+  if (!value) {
+    return false;
+  }
+  return [
+    "weiter",
+    "bitte weiter",
+    "mach weiter",
+    "okay weiter",
+    "ok weiter",
+    "einfach weiter",
+    "weiter machen",
+    "go on",
+    "continue",
+    "carry on"
+  ].includes(value);
+}
+
+function looksLikeAckOnly(text) {
+  const value = String(text || "").trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+  if (value.length > 220) {
+    return false;
+  }
+  return [
+    "ok",
+    "okay",
+    "ja",
+    "verstanden",
+    "alles klar",
+    "mache ich",
+    "ich arbeite weiter",
+    "ich mache weiter",
+    "ich bin dran",
+    "ich bin da",
+    "weiter",
+    "alles klar, ich mache weiter",
+    "verstanden. ich arbeite weiter."
+  ].includes(value);
+}
+
 function classifyInboundRelevance(config, inbound) {
   if (looksLikeEscalation(inbound.text)) {
     return "escalation";
@@ -75,6 +119,8 @@ function statusWeight(status) {
       return 4;
     case "submitted":
       return 2;
+    case "parked":
+      return 0;
     case "queued":
     default:
       return 1;
@@ -151,6 +197,34 @@ function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
   return expired;
 }
 
+function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
+  const entries = Array.isArray(queue) ? queue : [];
+  const ttlMs = Math.max(Number(config.ambientQueueTtlMs || 0), 0);
+  if (ttlMs <= 0) {
+    return 0;
+  }
+
+  let parked = 0;
+  for (const entry of entries) {
+    if (!entry || entry.status !== "queued") {
+      continue;
+    }
+    if (String(entry.relevance || "") !== "ambient") {
+      continue;
+    }
+    if (isoAgeMs(entry.ts) < ttlMs) {
+      continue;
+    }
+    entry.status = "parked";
+    entry.parkedAt = nowIso();
+    if (!entry.responsePreview) {
+      entry.responsePreview = `[ambient parked after ${ttlMs}ms]`;
+    }
+    parked += 1;
+  }
+  return parked;
+}
+
 function mergeQueueEntry(current, incoming) {
   if (!current && !incoming) {
     return null;
@@ -179,7 +253,7 @@ function mergeQueueEntry(current, incoming) {
   merged.deliveredAt = pickIsoLater(current.deliveredAt, incoming.deliveredAt);
   merged.ts = pickIsoLater(current.ts, incoming.ts);
 
-  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance"]) {
+  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance", "intent"]) {
     if (!merged[field]) {
       merged[field] = current[field] || incoming[field] || null;
     }
@@ -383,6 +457,7 @@ function normalizeInbound(message) {
     userId: message.from?.id ? String(message.from.id) : "",
     text,
     ts: nowIso(),
+    intent: looksLikeContinueNudge(text) ? "continue_nudge" : "message",
     relevance: "ambient",
     status: "queued",
     attempts: 0,
@@ -540,6 +615,7 @@ function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionO
     groupTitle: String(message.groupTitle || "").trim(),
     user: String(message.user || "").trim(),
     sourceText: String(message.text || ""),
+    intent: String(message.intent || "message").trim(),
     createdAt: nowIso(),
     status: "pending",
     sentAt: null,
@@ -554,6 +630,38 @@ function parseUnixSeconds(isoString) {
     return Math.floor(Date.now() / 1000);
   }
   return Math.floor(millis / 1000);
+}
+
+function isPidAlive(pid) {
+  const parsed = Number.parseInt(String(pid || "0"), 10);
+  if (!parsed || parsed <= 0) {
+    return false;
+  }
+  try {
+    process.kill(parsed, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getRuntimeOwner(config) {
+  if (!config.paths.currentRuntimeFile || !existsSync(config.paths.currentRuntimeFile)) {
+    return null;
+  }
+  const runtime = loadJson(config.paths.currentRuntimeFile, null);
+  if (!runtime) {
+    return null;
+  }
+  if (config.appServerWsUrl && runtime.ws_url && String(runtime.ws_url).trim() !== String(config.appServerWsUrl).trim()) {
+    return null;
+  }
+  const frontendHostPid = Number.parseInt(String(runtime.frontend_host_pid || "0"), 10) || 0;
+  return {
+    runtime,
+    frontendHostPid,
+    frontendAlive: isPidAlive(frontendHostPid)
+  };
 }
 
 function buildHistoryText(message) {
@@ -664,6 +772,18 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
       return fallbackThreadId;
     }
 
+    const runtimeOwner = getRuntimeOwner(config);
+    const runtimeThreadId = String(runtimeOwner?.runtime?.thread_id || "").trim();
+    const pinnedThreadId = String(preferredThreadId || config.currentThreadId || runtimeThreadId || "").trim();
+    if (pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
+      if (state.currentThreadId !== pinnedThreadId) {
+        state.currentThreadId = pinnedThreadId;
+        saveStateForConfig(config, state);
+        appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD_PINNED thread=${pinnedThreadId}`);
+      }
+      return pinnedThreadId;
+    }
+
     let bestThreadId = loadedIds[loadedIds.length - 1];
     let bestScore = Number.NEGATIVE_INFINITY;
 
@@ -705,13 +825,19 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
 export function bridgeStatus() {
   const config = loadConfig();
   const state = loadState(config);
+  const runtimeOwner = getRuntimeOwner(config);
+  const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0) {
+  if (expiredPendingReplies > 0 || parkedAmbient > 0) {
+    if (parkedAmbient > 0) {
+      appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
+    }
     saveStateForConfig(config, state);
   }
   const queued = state.queue.filter((item) => item.status === "queued");
   const submitted = state.queue.filter((item) => item.status === "submitted");
+  const parked = state.queue.filter((item) => item.status === "parked");
   const ambient = queued.filter((item) => item.relevance === "ambient");
   const pendingReplies = (state.pendingReplies || []).filter((item) => isNonTerminalPendingReply(item));
   const expiredReplies = (state.pendingReplies || []).filter((item) => String(item.status || "") === "expired");
@@ -719,11 +845,14 @@ export function bridgeStatus() {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
     boundThreadId: config.currentThreadId || state.currentThreadId || null,
+    frontendOwnerPid: runtimeOwner?.frontendHostPid || null,
+    frontendOwnerAlive: runtimeOwner?.frontendAlive ?? null,
     dispatchMode: config.dispatchMode,
     idleCooldownMs: config.idleCooldownMs,
     pendingReplyTimeoutMs: config.pendingReplyTimeoutMs,
     queueDepth: queued.length,
     ambientQueueDepth: ambient.length,
+    parkedQueueDepth: parked.length,
     submittedDepth: submitted.length,
     pendingReplyDepth: pendingReplies.length,
     expiredPendingReplyDepth: expiredReplies.length,
@@ -805,6 +934,10 @@ export function bindCurrentThread(threadId) {
 export async function pollOnce() {
   const config = loadConfig();
   const state = loadState(config);
+  const parkedAmbientAtStart = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
+  if (parkedAmbientAtStart > 0) {
+    appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbientAtStart}`);
+  }
   const startOffset = Number(state.offset || 0);
   const updates = await getUpdates(config, startOffset);
   let captured = 0;
@@ -850,20 +983,39 @@ export async function pollOnce() {
 export function listQueue(limit = 10) {
   const config = loadConfig();
   const state = loadState(config);
+  const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
+  if (parkedAmbient > 0) {
+    appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
+    saveStateForConfig(config, state);
+  }
   return state.queue.slice(-Math.max(1, limit));
 }
 
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
+  const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
+  const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0) {
+  if (expiredPendingReplies > 0 || parkedAmbient > 0) {
+    if (parkedAmbient > 0) {
+      appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
+    }
     appendLog(config.paths.activityFile, `PENDING_REPLY_EXPIRED count=${expiredPendingReplies}`);
     saveStateForConfig(config, state);
   }
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
+  if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
+    appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
+    return {
+      ok: false,
+      status: "deferred",
+      reason: "owner_offline",
+      frontendHostPid: runtimeOwner.frontendHostPid || 0
+    };
+  }
   const preferredThreadId = (
     threadId
     || (useAppServer ? config.currentThreadId : state.currentThreadId)
@@ -1002,8 +1154,12 @@ export async function injectNext(threadId, options = {}) {
 export async function relayRepliesOnce() {
   const config = loadConfig();
   const state = loadState(config);
+  const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
+  if (parkedAmbient > 0) {
+    appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
+  }
 
   for (const entry of state.pendingReplies || []) {
     if (entry.sentAt || entry.status === "error") {
@@ -1073,6 +1229,15 @@ export async function relayRepliesOnce() {
       continue;
     }
 
+    if (entry.intent === "continue_nudge" && looksLikeAckOnly(match.message)) {
+      entry.sentAt = nowIso();
+      entry.status = "suppressed_ack";
+      entry.turnId = entry.turnId || match.turnId;
+      entry.responsePreview = match.message.slice(0, 400);
+      usedTurnIds.add(match.turnId);
+      appendLog(config.paths.activityFile, `REPLY_SUPPRESSED_CONTINUE_ACK thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId}`);
+      continue;
+    }
     const outboundResult = await sendOutboundChunks(config, state, {
       chatId: entry.chatId,
       text: match.message,
