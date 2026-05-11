@@ -21,6 +21,12 @@ From GitHub:
 npm install -g github:maykbiletti/codexlink
 ```
 
+From npm:
+
+```powershell
+npm install -g @blunking/codexlink
+```
+
 Local development:
 
 ```powershell

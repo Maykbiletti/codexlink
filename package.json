@@ -1,5 +1,5 @@
 {
-  "name": "codexlink",
+  "name": "@blunking/codexlink",
   "version": "0.1.0",
   "description": "BLUN CLI launcher with Telegram channel support for one visible session.",
   "license": "MIT",
