@@ -79,6 +79,29 @@ Dry run:
 blun-codex telegram-plugin --print-only
 ```
 
+## Private internal profiles
+
+If you run more than one internal operator on the same machine, do not start all of them on the shared `default` slot.
+
+Use a dedicated private profile per operator:
+
+```powershell
+blun-codex --profile frida telegram-plugin
+```
+
+Why this matters:
+
+- `blun-codex telegram-plugin` without `--profile` uses the shared `default` runtime slot
+- starting a second operator on `default` will replace the first `default` runtime
+- a private profile gives that operator a separate runtime slot, state directory, and Mnemo binding
+
+For internal/private profiles:
+
+- keep the profile local on the machine
+- give it its own `agent_name`
+- give it its own Telegram state directory
+- do not ship internal agent profiles in the public package
+
 ## What it does
 
 - starts one consistent local CLI runtime

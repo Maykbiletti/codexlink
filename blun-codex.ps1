@@ -75,6 +75,10 @@ for ($i = 0; $i -lt $parsedArgs.Count; $i++) {
       $printOnly = $true
       continue
     }
+    "telegram-plugin" {
+      $telegramMode = "plugin"
+      continue
+    }
     default {
       $promptParts += $arg
     }
