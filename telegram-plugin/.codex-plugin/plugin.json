@@ -1,0 +1,6 @@
+{
+  "name": "codexlink-telegram",
+  "description": "BLUN Telegram bridge for one visible CLI session. Queues inbound messages, binds the live thread, and sends explicit replies without a shadow bot.",
+  "version": "0.1.0",
+  "keywords": ["blun", "telegram", "codexlink", "bridge", "mcp"]
+}

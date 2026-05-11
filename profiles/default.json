@@ -1,0 +1,20 @@
+{
+  "agent_name": "default",
+  "display_name": "CodexLink",
+  "lane": "general",
+  "workspace": "",
+  "model": "",
+  "reasoning_effort": "xhigh",
+  "sandbox": "danger-full-access",
+  "approval_policy": "never",
+  "personality": "friendly",
+  "mnemo": {
+    "inherit": true,
+    "notes": "Public default profile. Uses the host-default Mnemo binding unless a custom profile is selected."
+  },
+  "telegram": {
+    "enabled": false,
+    "state_dir": "",
+    "allowed_chat_id": ""
+  }
+}

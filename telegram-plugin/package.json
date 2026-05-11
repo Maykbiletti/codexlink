@@ -1,0 +1,10 @@
+{
+  "name": "codexlink-telegram-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": "./server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
