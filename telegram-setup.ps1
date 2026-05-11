@@ -114,7 +114,14 @@ $envPath = Join-Path $stateDir ".env"
 $envValues = Read-DotEnvFile -Path $envPath
 
 $currentToken = [string]$envValues["BLUN_TELEGRAM_BOT_TOKEN"]
+if (-not (Test-TelegramTokenFormat -Value $currentToken)) {
+  $currentToken = [string]$envValues["TELEGRAM_BOT_TOKEN"]
+}
+
 $currentAllowedChatIds = [string]$envValues["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
+if (-not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)) {
+  $currentAllowedChatIds = [string]$envValues["TELEGRAM_ALLOWED_CHAT_ID"]
+}
 
 $needsToken = -not (Test-TelegramTokenFormat -Value $currentToken)
 $needsChatIds = -not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)
