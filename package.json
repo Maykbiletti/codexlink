@@ -1,6 +1,6 @@
 {
   "name": "@blunking/codexlink",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "BLUN CLI launcher with Telegram channel support for one visible session.",
   "license": "MIT",
   "private": false,
@@ -10,7 +10,7 @@
   },
   "files": [
     "bin/",
-    "profiles/",
+    "profiles/default.json",
     "telegram-plugin/",
     "README.md",
     "LICENSE",
@@ -19,7 +19,8 @@
     "start-codex-agent.ps1",
     "start-codex.cmd",
     "telegram-status.ps1",
-    "telegram-doctor.ps1"
+    "telegram-doctor.ps1",
+    "telegram-setup.ps1"
   ],
   "keywords": [
     "blun",
