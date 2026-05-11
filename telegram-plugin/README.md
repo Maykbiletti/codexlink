@@ -44,7 +44,7 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 
 - `BLUN_TELEGRAM_AGENT_NAME`
 - `BLUN_TELEGRAM_BOT_TOKEN`
-- `BLUN_TELEGRAM_ALLOWED_CHAT_ID`
+- `BLUN_TELEGRAM_ALLOWED_CHAT_ID` (`chatId` or comma-separated list like `1605241602,-1003927574737`)
 - `BLUN_TELEGRAM_CODEX_BIN`
 - `BLUN_TELEGRAM_THREAD_ID`
 - `BLUN_TELEGRAM_RESUME_TIMEOUT_MS`

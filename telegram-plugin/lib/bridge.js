@@ -310,6 +310,14 @@ function normalizeTelegramThreadId(value) {
   return String(value || "").trim();
 }
 
+function isAllowedChat(config, chatId) {
+  const allowed = Array.isArray(config.allowedChatIds) ? config.allowedChatIds : [];
+  if (allowed.length === 0) {
+    return true;
+  }
+  return allowed.includes(String(chatId || "").trim());
+}
+
 function splitTelegramText(text, maxLength = 3500) {
   const value = String(text || "").trim();
   if (!value) {
@@ -682,7 +690,7 @@ export async function pollOnce() {
       continue;
     }
     const inbound = normalizeInbound(update.message);
-    if (config.allowedChatId && inbound.chatId !== config.allowedChatId) {
+    if (!isAllowedChat(config, inbound.chatId)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;

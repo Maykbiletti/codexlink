@@ -18,6 +18,13 @@ function readDotEnvFile(path) {
   return values;
 }
 
+function parseAllowedChatIds(rawValue) {
+  return String(rawValue || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 export function loadConfig() {
   ensureStateLayout();
   const paths = getPaths();
@@ -28,12 +35,14 @@ export function loadConfig() {
   delete fallbackEnv.BLUN_TELEGRAM_STATE_DIR;
   delete fallbackEnv.BLUN_TELEGRAM_THREAD_ID;
   const env = { ...fallbackEnv, ...fileEnv, ...process.env };
+  const allowedChatIds = parseAllowedChatIds(env.BLUN_TELEGRAM_ALLOWED_CHAT_ID || env.TELEGRAM_ALLOWED_CHAT_ID || "");
   return {
     paths,
     agentName: env.BLUN_TELEGRAM_AGENT_NAME?.trim() || env.TELEGRAM_AGENT_NAME?.trim() || "default",
     lane: env.BLUN_CODEX_LANE?.trim() || "",
     botToken: env.BLUN_TELEGRAM_BOT_TOKEN?.trim() || env.TELEGRAM_BOT_TOKEN?.trim() || "",
-    allowedChatId: env.BLUN_TELEGRAM_ALLOWED_CHAT_ID?.trim() || env.TELEGRAM_ALLOWED_CHAT_ID?.trim() || "",
+    allowedChatId: allowedChatIds[0] || "",
+    allowedChatIds,
     codexBin: env.BLUN_TELEGRAM_CODEX_BIN?.trim() || "codex",
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
