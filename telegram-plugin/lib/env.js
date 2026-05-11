@@ -34,7 +34,7 @@ export function loadConfig() {
   delete fallbackEnv.BLUN_TELEGRAM_AGENT_NAME;
   delete fallbackEnv.BLUN_TELEGRAM_STATE_DIR;
   delete fallbackEnv.BLUN_TELEGRAM_THREAD_ID;
-  const env = { ...fallbackEnv, ...fileEnv, ...process.env };
+  const env = { ...fallbackEnv, ...process.env, ...fileEnv };
   const allowedChatIds = parseAllowedChatIds(env.BLUN_TELEGRAM_ALLOWED_CHAT_ID || env.TELEGRAM_ALLOWED_CHAT_ID || "");
   return {
     paths,

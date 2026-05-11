@@ -534,7 +534,7 @@ function promoteVisibleQueuedEntry(config, state, threadId, message) {
 }
 
 async function resolveActiveThreadId(config, state, preferredThreadId) {
-  const fallbackThreadId = String(preferredThreadId || state.currentThreadId || config.currentThreadId || "").trim();
+  const fallbackThreadId = String(preferredThreadId || config.currentThreadId || state.currentThreadId || "").trim();
   if (!config.appServerWsUrl) {
     return fallbackThreadId;
   }
@@ -596,7 +596,7 @@ export function bridgeStatus() {
   return {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
-    boundThreadId: state.currentThreadId || config.currentThreadId || null,
+    boundThreadId: config.currentThreadId || state.currentThreadId || null,
     queueDepth: queued.length,
     submittedDepth: submitted.length,
     pendingReplyDepth: pendingReplies.length,
