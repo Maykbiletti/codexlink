@@ -1222,6 +1222,14 @@ function shouldSendProgressUpgrade(entry, progress) {
   return true;
 }
 
+function getProgressRelayMode(config) {
+  const mode = String(config?.progressRelayMode || "status").trim().toLowerCase();
+  if (["off", "status", "commentary"].includes(mode)) {
+    return mode;
+  }
+  return "status";
+}
+
 function getPendingReplyActivityAt(entry) {
   if (!entry || typeof entry !== "object") {
     return "";
@@ -1766,6 +1774,7 @@ export function bridgeStatus() {
     submittedDepth: submitted.length,
     pendingReplyDepth: pendingReplies.length,
     expiredPendingReplyDepth: expiredReplies.length,
+    progressRelayMode: getProgressRelayMode(config),
     lastInbound: state.lastInbound,
     lastOutbound: state.lastOutbound,
     lastPollAt: state.lastPollAt,
@@ -2358,8 +2367,9 @@ export async function relayRepliesOnce() {
     const completions = signals.completions || [];
     const finalAnswers = signals.finalAnswers || [];
     const commentaries = signals.commentaries || [];
+    const progressRelayMode = getProgressRelayMode(config);
 
-    if (!entry.progressSentAt) {
+    if (progressRelayMode === "commentary" && !entry.progressSentAt) {
       const progress = commentaries.find((item) => {
         const key = `${item.timestamp}|${item.message}`;
         return item.timestamp >= entry.createdAt && !usedProgressKeys.has(key);
@@ -2384,7 +2394,7 @@ export async function relayRepliesOnce() {
       }
     }
 
-    if (!entry.progressSentAt && shouldSendFallbackProgress(config, entry, entry.sessionPath)) {
+    if (progressRelayMode !== "off" && !entry.progressSentAt && shouldSendFallbackProgress(config, entry, entry.sessionPath)) {
       const fallbackText = buildProgressFallbackText(entry);
       const outboundProgress = await sendOutboundChunks(config, state, {
         chatId: entry.chatId,
@@ -2402,7 +2412,7 @@ export async function relayRepliesOnce() {
       appendLog(config.paths.activityFile, `REPLY_PROGRESS_FALLBACK thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId} outbound=${outboundProgress.messageIds.join(",")}`);
     }
 
-    if (entry.progressSentAt) {
+    if (progressRelayMode === "commentary" && entry.progressSentAt) {
       const upgrade = commentaries.find((item) => {
         const key = `${item.timestamp}|${item.message}`;
         return item.timestamp >= entry.createdAt

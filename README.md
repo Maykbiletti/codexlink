@@ -111,7 +111,7 @@ blun-codex telegram-status
 
 Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, bleibt die sichtbare CLI-Eingabe unberuehrt. Pending-Nachrichten bleiben im Fenstertitel/Status sichtbar, bis die Antwort raus ist oder sie wirklich ablaufen. Den Queue-Stand kannst du jederzeit mit `blun-codex telegram-status` pruefen.
 
-Der automatische Progress-Hinweis ist bewusst defensiv: er erscheint nur bei echten Arbeits-/Weiter-Signalen, nicht bei normalem Smalltalk oder wenn die sichtbare Session stillsteht.
+Der automatische Progress-Hinweis ist bewusst defensiv: standardmaessig sendet Telegram nur finale Antworten plus bei laengeren echten Arbeitslaeufen einen neutralen Status. Interne Commentary-Texte werden nicht als zweite fachliche Antwort gespiegelt. Wer das alte Verhalten will, kann `BLUN_TELEGRAM_PROGRESS_RELAY=commentary` setzen; mit `off` werden Progress-Hinweise ganz deaktiviert.
 
 Wenn mehrere Agents denselben Gruppenchat nutzen, kann ein Agent andere Agent-Namen als Fremdroute markieren. Dann werden Owner-Nachrichten wie `Frida mach weiter` nicht in Ottos Session gezogen:
 
