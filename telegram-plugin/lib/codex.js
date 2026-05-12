@@ -120,11 +120,28 @@ export function isAddressOnlyPing(config, text) {
   return names.includes(normalizedText);
 }
 
+function buildAgentRuntimeContext(config) {
+  const name = repairMojibake(String(config.displayName || config.agentName || "CodexLink")).trim() || "CodexLink";
+  const lane = repairMojibake(String(config.lane || "")).trim();
+  const customPrompt = repairMojibake(String(config.agentPrompt || "")).trim();
+  const lines = [
+    `[CodexLink Agent Context: You are ${name}.`,
+    lane ? `Assigned lane: ${lane}. Stay inside this lane unless the user explicitly redirects you.` : "Stay inside your assigned profile scope.",
+    "Treat short greetings or name-only pings as reachability checks, not translation/correction tasks.",
+    "For a greeting, reply briefly and naturally as this agent. Do not ask whether to translate, correct, or rewrite unless the user asks for that."
+  ];
+  if (customPrompt) {
+    lines.push(customPrompt);
+  }
+  lines[lines.length - 1] = `${lines[lines.length - 1]}]`;
+  return lines.join("\n");
+}
+
 function buildPrompt(config, message) {
   const compactText = compactInboundText(message);
   const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
   const label = isBriefSummary ? "" : compactInboundLabel(message);
-  const header = [];
+  const header = [buildAgentRuntimeContext(config), ""];
 
   if (label) {
     header.push(label);

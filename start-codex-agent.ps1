@@ -524,6 +524,11 @@ if ($useRemoteAppServer) {
     $stateEnv = Read-DotEnvFile -Path $envFilePath
     $stateEnv["BLUN_TELEGRAM_AGENT_NAME"] = $profile.agent_name
     $stateEnv["BLUN_TELEGRAM_STATE_DIR"] = $telegramStateDir
+    $stateEnv["BLUN_CODEX_DISPLAY_NAME"] = $profile.display_name
+    $stateEnv["BLUN_CODEX_LANE"] = $profile.lane
+    $stateEnv["BLUN_CODEX_PERSONALITY"] = $profile.personality
+    $stateEnv["BLUN_CODEX_MODEL"] = $profile.model
+    $stateEnv["BLUN_CODEX_REASONING_EFFORT"] = $profile.reasoning_effort
     if ($telegramAllowedChatId) {
       $stateEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"] = $telegramAllowedChatId
     }

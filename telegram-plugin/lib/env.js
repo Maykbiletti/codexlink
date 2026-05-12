@@ -60,7 +60,9 @@ export function loadConfig() {
   return {
     paths,
     agentName: env.BLUN_TELEGRAM_AGENT_NAME?.trim() || env.TELEGRAM_AGENT_NAME?.trim() || "default",
+    displayName: env.BLUN_CODEX_DISPLAY_NAME?.trim() || env.BLUN_TELEGRAM_AGENT_NAME?.trim() || env.TELEGRAM_AGENT_NAME?.trim() || "CodexLink",
     lane: env.BLUN_CODEX_LANE?.trim() || "",
+    agentPrompt: env.BLUN_CODEX_AGENT_PROMPT?.trim() || "",
     botToken: env.BLUN_TELEGRAM_BOT_TOKEN?.trim() || env.TELEGRAM_BOT_TOKEN?.trim() || "",
     allowedChatId: allowedChatIds[0] || "",
     allowedChatIds,
