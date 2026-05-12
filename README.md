@@ -258,6 +258,12 @@ blun-codex telegram-setup
 
 If something is missing later, `blun-codex telegram-doctor` tells you exactly what is missing and what to run next.
 
+Inbound Telegram messages are mirrored into the visible Codex console by default,
+so the operator can see that the message arrived. Queue summaries and outbound
+reply notices stay out of the console to avoid input-line spam. Set
+`BLUN_TELEGRAM_CONSOLE_UI_NOTICES=off` to disable console mirroring, or `all` to
+also mirror outbound notices for debugging.
+
 ## Notes
 
 - the package currently targets local Windows operators first

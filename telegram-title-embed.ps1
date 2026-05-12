@@ -131,11 +131,17 @@ public static class BlunEmbeddedQueueTitleWatcher
 
         try
         {
-            var enabled = Environment.GetEnvironmentVariable("BLUN_TELEGRAM_CONSOLE_UI_NOTICES");
-            if (string.Equals(enabled, "1", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(enabled, "true", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(enabled, "yes", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(enabled, "on", StringComparison.OrdinalIgnoreCase))
+            var mode = Environment.GetEnvironmentVariable("BLUN_TELEGRAM_CONSOLE_UI_NOTICES") ?? "";
+            var disabled = string.Equals(mode, "0", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "false", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "no", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "off", StringComparison.OrdinalIgnoreCase);
+            var allowAll = string.Equals(mode, "all", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "true", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "yes", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(mode, "on", StringComparison.OrdinalIgnoreCase);
+            if (!disabled && (allowAll || string.Equals(normalizedKind, "inbound", StringComparison.OrdinalIgnoreCase)))
             {
                 Console.WriteLine("");
                 Console.WriteLine("[Telegram] " + normalized);

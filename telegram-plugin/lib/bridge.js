@@ -1906,7 +1906,7 @@ async function sendOutboundChunks(config, state, options) {
       } else if (chatType === "private" && user) {
         label = `Antwort an ${user}`;
       }
-      state.lastUiNotice = {
+      state.lastOutboundUiNotice = {
         ts: nowIso(),
         kind: "outbound",
         text: `${label}: ${preview}`

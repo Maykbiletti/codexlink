@@ -273,10 +273,11 @@ function Write-ConsoleUiNotice {
     [string]$Kind,
     [string]$Notice
   )
-  if ($env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ne "1" -and
-      $env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ine "true" -and
-      $env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ine "yes" -and
-      $env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ine "on") {
+  $mode = [string]$env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES
+  $disabled = $mode -eq "0" -or $mode -ieq "false" -or $mode -ieq "no" -or $mode -ieq "off"
+  $allowAll = $mode -ieq "all" -or $mode -eq "1" -or $mode -ieq "true" -or $mode -ieq "yes" -or $mode -ieq "on"
+  $isInbound = [string]::Equals($Kind, "inbound", [System.StringComparison]::OrdinalIgnoreCase)
+  if ($disabled -or (-not $allowAll -and -not $isInbound)) {
     return $false
   }
   try {
