@@ -131,8 +131,15 @@ public static class BlunEmbeddedQueueTitleWatcher
 
         try
         {
-            Console.WriteLine("");
-            Console.WriteLine("[Telegram] " + normalized);
+            var enabled = Environment.GetEnvironmentVariable("BLUN_TELEGRAM_CONSOLE_UI_NOTICES");
+            if (string.Equals(enabled, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(enabled, "true", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(enabled, "yes", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(enabled, "on", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("");
+                Console.WriteLine("[Telegram] " + normalized);
+            }
         }
         catch
         {

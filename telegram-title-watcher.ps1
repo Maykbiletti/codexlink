@@ -273,6 +273,12 @@ function Write-ConsoleUiNotice {
     [string]$Kind,
     [string]$Notice
   )
+  if ($env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ne "1" -and
+      $env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ine "true" -and
+      $env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ine "yes" -and
+      $env:BLUN_TELEGRAM_CONSOLE_UI_NOTICES -ine "on") {
+    return $false
+  }
   try {
     [void][CodexLink.NativeMethods]::FreeConsole()
     $targetPid = Get-EffectiveAttachPid
