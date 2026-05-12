@@ -143,7 +143,37 @@ $responderPid = if (Test-Path (Join-Path $stateDir "responder.pid")) { (Get-Cont
 $stateThreadId = if ($state.currentThreadId) { [string]$state.currentThreadId } else { "" }
 $runtimeThreadId = if ($currentRuntime -and $currentRuntime.thread_id) { [string]$currentRuntime.thread_id } else { "" }
 $telegramPluginRoot = Get-TelegramPluginRoot -RuntimeRoot $runtimeRoot
-$nextQueued = @($queued | Sort-Object @{ Expression = { [string]$_.ts } }, @{ Expression = { [int]$_.messageId } } | Select-Object -First 1)
+$dispatchMode = if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { [string]$envFile["BLUN_TELEGRAM_DISPATCH_MODE"] } else { "deferred" }
+$idleCooldownMs = if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { [int]$envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { 15000 }
+$eligibleQueued = if ($dispatchMode -eq "legacy") {
+  @($queued)
+} else {
+  @($queued | Where-Object {
+    [string]$_.chatType -eq "private" -or @("direct", "lane", "escalation") -contains [string]$_.relevance
+  })
+}
+$nextQueued = @(
+  $eligibleQueued |
+    Sort-Object `
+      @{ Expression = {
+          if ([string]$_.relevance -eq "escalation") { 0 }
+          elseif ([string]$_.chatType -eq "private" -or @("direct", "lane") -contains [string]$_.relevance) { 1 }
+          else { 2 }
+        }
+      },
+      @{ Expression = { [string]$_.ts } },
+      @{ Expression = { [int]$_.messageId } } |
+    Select-Object -First 1
+)
+$waitReason = if ($queued.Count -eq 0) {
+  $null
+} elseif ($pendingReplies.Count -gt 0) {
+  "arbeitet noch"
+} elseif ($state.lastInjectAt -and (Get-IsoAgeMs -IsoString ([string]$state.lastInjectAt)) -lt $idleCooldownMs) {
+  "wartet auf Ruhe"
+} else {
+  "wartet in Queue"
+}
 
 if ($currentRuntime) {
   if ($stateThreadId) {
@@ -191,8 +221,8 @@ $result = [ordered]@{
   state_dir = $stateDir
   plugin_root = $telegramPluginRoot
   active_ws = $envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"]
-  dispatch_mode = $(if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { $envFile["BLUN_TELEGRAM_DISPATCH_MODE"] } else { "deferred" })
-  idle_cooldown_ms = $(if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { $envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { "15000" })
+  dispatch_mode = $dispatchMode
+  idle_cooldown_ms = $idleCooldownMs
   ambient_queue_ttl_ms = $ambientQueueTtlMs
   pending_reply_timeout_ms = $(if ($envFile["BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS"]) { $envFile["BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS"] } else { "120000" })
   env_thread_id = $envFile["BLUN_TELEGRAM_THREAD_ID"]
@@ -229,6 +259,7 @@ $result = [ordered]@{
   } else {
     $null
   }
+  wait_reason = $waitReason
 }
 
 if ($result.poller_pid) {

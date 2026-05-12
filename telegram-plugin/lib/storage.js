@@ -43,6 +43,7 @@ export function defaultState() {
     replyBuffers: {},
     lastInbound: null,
     lastOutbound: null,
+    lastUiNotice: null,
     lastPollAt: null,
     lastInjectAt: null,
     lastAutoDispatchAt: null,

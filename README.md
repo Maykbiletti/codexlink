@@ -109,6 +109,8 @@ Status:
 blun-codex telegram-status
 ```
 
+Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, zeigt das Telegram-Fenster oben im Titel einen ruhigen Queue-Hinweis wie `Q:2 D:1 G:1 | ...`. So sieht man, dass etwas wartet, ohne dass der aktive Lauf unterbrochen wird.
+
 Doctor:
 
 ```powershell
@@ -233,9 +235,15 @@ The bundled plugin lives under `telegram-plugin/` and contains:
 `blun-codex telegram-plugin` now behaves like a guided setup for normal users:
 
 1. check whether Telegram is already configured
-2. ask for missing Bot Token or allowed Chat ID(s)
+2. ask only for a missing Bot Token
 3. save everything automatically into the local Telegram state folder
 4. continue into Telegram mode
+
+Allowed Chat ID(s) are optional. If you leave them unset, the bot can currently accept any chat it can see. You can tighten that later with:
+
+```powershell
+blun-codex telegram-setup
+```
 
 If something is missing later, `blun-codex telegram-doctor` tells you exactly what is missing and what to run next.
 

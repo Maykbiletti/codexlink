@@ -146,6 +146,16 @@ function Stop-ProcessTree {
   }
 }
 
+function Get-ConsoleAttachPid {
+  param([int]$FrontendPid)
+
+  if ($FrontendPid -le 0) {
+    return 0
+  }
+
+  return $FrontendPid
+}
+
 function Wait-TcpPort {
   param(
     [string]$HostName,
@@ -545,6 +555,7 @@ if ($useRemoteAppServer) {
       $oldPids = @()
       if ($previousRuntime.frontend_host_pid) { $oldPids += [int]$previousRuntime.frontend_host_pid }
       if ($previousRuntime.app_server_pid) { $oldPids += [int]$previousRuntime.app_server_pid }
+      if ($previousRuntime.queue_notifier_pid) { $oldPids += [int]$previousRuntime.queue_notifier_pid }
       if ($previousRuntime.poller_pid) { $oldPids += [int]$previousRuntime.poller_pid }
       if ($previousRuntime.dispatcher_pid) { $oldPids += [int]$previousRuntime.dispatcher_pid }
       if ($previousRuntime.responder_pid) { $oldPids += [int]$previousRuntime.responder_pid }
@@ -667,13 +678,25 @@ if ($useRemoteAppServer) {
   $codexScript = (Get-Command codex).Source
   $currentRuntimeFile = Join-Path $agentRuntimeDir "current-remote-runtime.json"
   $windowTitle = "BLUN Codex Telegram [" + $profile.agent_name + "] " + $telegramAppServerWsUrl
-  $resumeCommand = "$host.UI.RawUI.WindowTitle = " + (Quote-PowerShellLiteral $windowTitle) + "; & " + (Quote-PowerShellLiteral $codexScript) + " " + (($codexArgs | ForEach-Object { Quote-PowerShellLiteral $_ }) -join " ")
+  $titleEmbedScript = Join-Path $runtimeRoot "telegram-title-embed.ps1"
+  $titleEmbedLog = Join-Path $agentRuntimeDir "title-embed.log"
+  $resumeCommand = ""
+  if (Test-Path $titleEmbedScript) {
+    $resumeCommand += "& " + (Quote-PowerShellLiteral $titleEmbedScript)
+    $resumeCommand += " -StateFile " + (Quote-PowerShellLiteral (Join-Path $telegramStateDir "state.json"))
+    $resumeCommand += " -BaseTitle " + (Quote-PowerShellLiteral $windowTitle)
+    $resumeCommand += " -LogFile " + (Quote-PowerShellLiteral $titleEmbedLog)
+    $resumeCommand += "; "
+  }
+  $resumeCommand += "$host.UI.RawUI.WindowTitle = " + (Quote-PowerShellLiteral $windowTitle) + "; & " + (Quote-PowerShellLiteral $codexScript) + " " + (($codexArgs | ForEach-Object { Quote-PowerShellLiteral $_ }) -join " ")
   Write-DebugStage -Path $debugLogPath -Message ("FRONTEND_SPAWN command=" + $resumeCommand)
   $frontendProcess = Start-Process -FilePath "powershell" -WorkingDirectory $resolvedWorkspace -ArgumentList @(
     "-NoExit",
     "-Command",
     $resumeCommand
   ) -PassThru
+  $queueWatcherScript = Join-Path $runtimeRoot "telegram-title-watcher.ps1"
+  $queueWatcherProcess = $null
   $currentRuntime = [ordered]@{
     ws_url = $telegramAppServerWsUrl
     app_server_pid = $backendProcess.Id
@@ -683,6 +706,32 @@ if ($useRemoteAppServer) {
   }
   Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 4)
   Write-DebugStage -Path $debugLogPath -Message "FRONTEND_SPAWNED"
+  if (Test-Path $queueWatcherScript) {
+    $attachPid = Get-ConsoleAttachPid -FrontendPid $frontendProcess.Id
+    $queueWatcherLog = Join-Path $agentRuntimeDir "queue-notifier.log"
+    $queueWatcherLauncher = Join-Path $agentRuntimeDir "queue-notifier-launch.ps1"
+    $queueWatcherContent = @(
+      '$ErrorActionPreference = "Stop"'
+      "& " + (Quote-PowerShellLiteral $queueWatcherScript) +
+        " -FrontendPid " + [string]$frontendProcess.Id +
+        " -AttachPid " + [string]$attachPid +
+        " -RuntimeFile " + (Quote-PowerShellLiteral $currentRuntimeFile) +
+        " -StateFile " + (Quote-PowerShellLiteral (Join-Path $telegramStateDir "state.json")) +
+        " -BaseTitle " + (Quote-PowerShellLiteral $windowTitle) +
+        " -LogFile " + (Quote-PowerShellLiteral $queueWatcherLog)
+    ) -join "`r`n"
+    Write-TextFileWithRetry -Path $queueWatcherLauncher -Content $queueWatcherContent
+    $queueWatcherProcess = Start-Process -FilePath "powershell" -WindowStyle Hidden -ArgumentList @(
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", $queueWatcherLauncher
+    ) -PassThru
+    if ($queueWatcherProcess -and $queueWatcherProcess.Id -gt 0) {
+      $currentRuntime["queue_notifier_pid"] = $queueWatcherProcess.Id
+      Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 4)
+      Write-DebugStage -Path $debugLogPath -Message ("QUEUE_NOTIFIER_SPAWNED pid=" + $queueWatcherProcess.Id)
+    }
+  }
   if ($envFilePath -and $bootstrapScript) {
     try {
       Write-DebugStage -Path $debugLogPath -Message "LOADED_THREAD_WAIT_START"

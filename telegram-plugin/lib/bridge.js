@@ -7,11 +7,12 @@ import { getUpdates, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
 
 function loadState(config) {
-  return loadJson(config.paths.stateFile, defaultState());
+  const state = loadJson(config.paths.stateFile, defaultState());
+  return scrubIdleBriefArtifactsInPlace(state);
 }
 
 function saveStateForConfig(config, state) {
-  saveJson(config.paths.stateFile, state);
+  saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(state));
 }
 
 function queueKey(entry) {
@@ -32,36 +33,242 @@ function containsToken(text, token) {
 }
 
 function looksLikeEscalation(text) {
-  const value = String(text || "");
-  return [
+  const value = foldTriggerText(text);
+  if (!value) {
+    return false;
+  }
+  if ([
     "eskalation",
     "escalation",
     "urgent",
     "emergency",
-    "sofort",
     "prio 0",
     "p0",
     "blocker"
-  ].some((token) => containsToken(value, token));
+  ].some((token) => containsToken(value, token))) {
+    return true;
+  }
+  return containsToken(value, "sofort") && !/\bab sofort\b/u.test(value);
 }
 
-function looksLikeContinueNudge(text) {
-  const value = String(text || "").trim().toLowerCase();
-  if (!value) {
+const CONTINUE_NEGATIVE_ONLY = new Set([
+  "ok",
+  "okay",
+  "ja",
+  "yes",
+  "si",
+  "oui",
+  "passt",
+  "gut",
+  "nice",
+  "cool",
+  "danke",
+  "thanks",
+  "merci",
+  "gracias",
+  "verstanden",
+  "perfekt",
+  "super",
+  "top",
+  "alles klar",
+  "sieht gut aus",
+  "hort sich gut an",
+  "hoert sich gut an"
+]);
+
+const CONTINUE_BLOCK_PATTERNS = [
+  /\bweiter so\b/u,
+  /^status\b/u,
+  /\bexplizites go\b/u,
+  /\bohne\b[\s\S]{0,24}\bgo\b/u
+];
+
+const CONTINUE_PATTERN_GROUPS = [
+  { weight: 4, patterns: [/\bmach weiter\b/u, /\bleg los\b/u, /\blos geht'?s\b/u, /\bfeuer frei\b/u, /\bsetz(?:e)? es um\b/u, /\bfu(?:eh|h)re es aus\b/u, /\bimplementiere es\b/u, /\bfix das\b/u, /\bfix den fehler\b/u, /\bbeheb(?:e)? das\b/u, /\breparier das\b/u, /\bteste es\b/u, /\bdebugge es\b/u] },
+  { weight: 4, patterns: [/\bgo ahead\b/u, /\bcontinue\b/u, /\bkeep going\b/u, /\bexecute it\b/u, /\bimplement it\b/u, /\bfix it\b/u, /\bpatch it\b/u, /\bdebug it\b/u, /\btest it\b/u, /\brun it\b/u, /\bsend it\b/u, /\bship it\b/u, /\bkeep cooking\b/u, /\bfinish the implementation\b/u] },
+  { weight: 4, patterns: [/\bdale\b/u, /\bvas y\b/u, /\bfais le\b/u, /\bcontinua\b/u, /\bvai avanti\b/u, /\bvamos\b/u, /\bga door\b/u, /\bkontynuuj\b/u, /\bdevam et\b/u] },
+  { weight: 3, patterns: [/\bund weiter\b/u, /\barbeite weiter\b/u, /\bsetz(?:e)? fort\b/u, /\bn(?:ae|a)chster schritt\b/u, /\bmach den n(?:ae|a)chsten schritt\b/u, /\bweiter trotz fehler\b/u, /\bnicht abbrechen\b/u, /\bnochmal versuchen\b/u, /\bbrief f(?:ue|u)r dich\b/u, /\bbrief\b[\s\S]{0,30}\babruf(?:en)?\b/u, /\bbrief\b[\s\S]{0,30}\bpull\b/u] },
+  { weight: 3, patterns: [/\bgib gas\b/u, /\bhau rein\b/u, /\bzieh durch\b/u, /\bzieh komplett durch\b/u, /\bnicht quatschen machen\b/u, /\bballer weiter\b/u, /\bmach den rest\b/u, /\bmach alleine weiter\b/u, /\bfull send\b/u, /\bfuck it we ball\b/u, /\byolo\b/u] }
+];
+
+const CONTINUE_ACTION_WORDS = [
+  "mach",
+  "start",
+  "weiter",
+  "los",
+  "arbeite",
+  "setz",
+  "setze",
+  "fuhre",
+  "fuehre",
+  "implementiere",
+  "fix",
+  "teste",
+  "debugge",
+  "patch",
+  "bau",
+  "ander",
+  "aender",
+  "schreib",
+  "go",
+  "continue",
+  "deploy",
+  "ship",
+  "baller",
+  "vollgas",
+  "cook",
+  "run"
+];
+
+const WORK_CONTEXT_HINTS = [
+  "auth",
+  "middleware",
+  "datei",
+  "file",
+  "code",
+  "anderung",
+  "aenderung",
+  "brief",
+  "abruf",
+  "pull",
+  "commit",
+  "test",
+  "debug",
+  "fehler",
+  "bug",
+  "fix",
+  "patch",
+  "implement",
+  "umsetzen",
+  "refactor",
+  "deploy",
+  "ui",
+  "portal",
+  "gruppe",
+  "konsole",
+  "plugin"
+];
+
+function normalizeTriggerText(text) {
+  return String(text || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[â€™']/g, "'")
+    .replace(/[â€œâ€â€ž"]/g, "\"")
+    .replace(/[â€“â€”]/g, "-")
+    .replace(/[^\p{L}\p{N}@_"'-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function foldTriggerText(text) {
+  return normalizeTriggerText(text)
+    .normalize("NFD")
+    .replace(/\p{Diacritic}+/gu, "");
+}
+
+function tokenCount(text) {
+  if (!text) {
+    return 0;
+  }
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+function looksLikeWorkContextText(text) {
+  const normalized = foldTriggerText(text);
+  if (!normalized || CONTINUE_NEGATIVE_ONLY.has(normalized)) {
     return false;
   }
-  return [
-    "weiter",
-    "bitte weiter",
-    "mach weiter",
-    "okay weiter",
-    "ok weiter",
-    "einfach weiter",
-    "weiter machen",
-    "go on",
-    "continue",
-    "carry on"
-  ].includes(value);
+  return WORK_CONTEXT_HINTS.some((token) => containsToken(normalized, token));
+}
+
+function hasRecentWorkContext(context = {}) {
+  const currentConversationKey = String(context.conversationKey || "").trim();
+  const recentEntries = Array.isArray(context.recentEntries) ? context.recentEntries : [];
+  if (context.hasRecentWorkContext === true) {
+    return true;
+  }
+  if (context.hasPendingReplies) {
+    return true;
+  }
+  if (recentEntries.some((entry) => String(entry.intent || "").trim().toLowerCase() !== "continue_nudge")) {
+    return true;
+  }
+
+  if (currentConversationKey) {
+    const recentConversationEntries = recentEntries.filter((entry) => String(entry.conversationKey || "").trim() === currentConversationKey);
+    if (recentConversationEntries.some((entry) => looksLikeWorkContextText(entry.text || entry.sourceText || ""))) {
+      return true;
+    }
+  }
+
+  if (looksLikeWorkContextText(context.lastUserWorkText || "")) {
+    return true;
+  }
+
+  return false;
+}
+
+function getContinueTriggerScore(text, context = {}) {
+  const normalized = foldTriggerText(text);
+  if (!normalized) {
+    return 0;
+  }
+  if (CONTINUE_NEGATIVE_ONLY.has(normalized)) {
+    return 0;
+  }
+  if (looksLikeStatusBroadcast(normalized)) {
+    return 0;
+  }
+
+  const words = tokenCount(normalized);
+  let score = 0;
+
+  for (const pattern of CONTINUE_BLOCK_PATTERNS) {
+    if (pattern.test(normalized)) {
+      score -= 2;
+    }
+  }
+
+  for (const group of CONTINUE_PATTERN_GROUPS) {
+    for (const pattern of group.patterns) {
+      if (pattern.test(normalized)) {
+        score += group.weight;
+      }
+    }
+  }
+
+  for (const actionWord of CONTINUE_ACTION_WORDS) {
+    if (containsToken(normalized, actionWord)) {
+      score += 1;
+    }
+  }
+
+  if (words > 0 && words <= 4 && score > 0) {
+    score += 1;
+  }
+
+  if (hasRecentWorkContext(context) && score > 0) {
+    score += 1;
+  }
+
+  if (/[!?]/.test(String(text || "")) && score < 3) {
+    score -= 1;
+  }
+
+  if (words > 12 && score < 3) {
+    score = Math.min(score, 1);
+  }
+
+  return Math.max(0, score);
+}
+
+function looksLikeContinueNudge(text, context = {}) {
+  const score = getContinueTriggerScore(text, context);
+  if (score >= 3) {
+    return true;
+  }
+  return score >= 1 && hasRecentWorkContext(context);
 }
 
 function looksLikeAckOnly(text) {
@@ -89,6 +296,79 @@ function looksLikeAckOnly(text) {
   ].includes(value);
 }
 
+function looksLikeContextRequestOnly(text) {
+  const value = String(text || "").trim().toLowerCase();
+  if (!value || value.length > 280) {
+    return false;
+  }
+  return [
+    "mir fehlt in diesem chat gerade der konkrete arbeitskontext. schick mir bitte den letzten stand oder die aufgabe kurz hier rein, dann setze ich direkt fort.",
+    "schick mir kurz den letzten stand oder den punkt, ab dem ich anknÃ¼pfen soll.",
+    "schick mir bitte den letzten stand.",
+    "mir fehlt gerade der konkrete arbeitskontext.",
+    "welcher punkt genau?",
+    "womit genau soll ich weitermachen?"
+  ].includes(value);
+}
+
+function uniqueAgentMentionNames(config) {
+  const values = [
+    ...(Array.isArray(config.mentionNames) ? config.mentionNames : []),
+    config.agentName
+  ];
+  return Array.from(new Set(
+    values
+      .map((value) => foldTriggerText(value))
+      .filter((value) => value && value !== "default")
+  ));
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function looksLikeStatusBroadcast(text) {
+  const normalized = foldTriggerText(text);
+  return /^status(?:\s|$|[~:.-])/u.test(normalized);
+}
+
+function isAgentAddressed(config, text) {
+  const normalized = foldTriggerText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  const mentionNames = uniqueAgentMentionNames(config);
+  if (mentionNames.length === 0) {
+    return false;
+  }
+
+  for (const name of mentionNames) {
+    const mention = escapeRegExp(name);
+    const startsAddressed = new RegExp(`^@?${mention}\\b(?:\\s|\\s*[-:,]|$)`, "u").test(normalized);
+    if (startsAddressed) {
+      return true;
+    }
+
+    const routedToAgent = new RegExp(`\\b(?:fuer|fur|for|an|to)\\s+@?${mention}\\b`, "u").test(normalized);
+    if (routedToAgent) {
+      return true;
+    }
+
+    const briefDirective = new RegExp(`\\bbrief\\b[\\s\\S]{0,60}\\b@?${mention}\\b|\\b@?${mention}\\b[\\s\\S]{0,60}\\bbrief\\b`, "u").test(normalized);
+    if (briefDirective) {
+      return true;
+    }
+
+    const imperativeAfterMention = new RegExp(`\\b@?${mention}\\b\\s+(?:bitte|please|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|debugge|fix|patch|mach|setz|starte|antwort|melde)\\b`, "u").test(normalized);
+    if (imperativeAfterMention) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function classifyInboundRelevance(config, inbound) {
   if (looksLikeEscalation(inbound.text)) {
     return "escalation";
@@ -99,8 +379,12 @@ function classifyInboundRelevance(config, inbound) {
   }
 
   const text = String(inbound.text || "");
+  if (!looksLikeStatusBroadcast(text) && isAgentAddressed(config, text)) {
+    return "direct";
+  }
+
   const agentName = String(config.agentName || "").trim();
-  if (agentName && agentName.toLowerCase() !== "default" && containsToken(text, agentName)) {
+  if (agentName && agentName.toLowerCase() !== "default" && !looksLikeStatusBroadcast(text) && containsToken(text, agentName)) {
     return "direct";
   }
 
@@ -174,19 +458,120 @@ function isNonTerminalPendingReply(entry) {
     && !["error", "ignored_bot", "superseded", "expired"].includes(String(entry.status || ""));
 }
 
+function hasResponseMessageIds(entry) {
+  return Array.isArray(entry?.responseMessageIds)
+    && entry.responseMessageIds.filter(Boolean).length > 0;
+}
+
+function isReplyAwaitingOutcome(entry) {
+  if (!entry || typeof entry !== "object") {
+    return false;
+  }
+  const status = String(entry.status || "").trim().toLowerCase();
+  if (["sent", "suppressed_ack", "error", "ignored_bot", "superseded"].includes(status)) {
+    return false;
+  }
+  return !hasResponseMessageIds(entry);
+}
+
+function supersedeOlderPendingRepliesInPlace(pendingReplies) {
+  const replies = Array.isArray(pendingReplies) ? pendingReplies : [];
+  const newestByConversation = new Map();
+
+  for (const entry of replies) {
+    if (!isReplyAwaitingOutcome(entry)) {
+      continue;
+    }
+    const key = [
+      String(entry.chatId || "").trim(),
+      String(entry.conversationKey || "").trim(),
+      String(entry.telegramThreadId || "").trim()
+    ].join("|");
+    const current = newestByConversation.get(key);
+    const stamp = String(entry.createdAt || "");
+    if (!current || stamp > current.stamp) {
+      newestByConversation.set(key, { entry, stamp });
+    }
+  }
+
+  let superseded = 0;
+  for (const entry of replies) {
+    if (!isReplyAwaitingOutcome(entry)) {
+      continue;
+    }
+    const key = [
+      String(entry.chatId || "").trim(),
+      String(entry.conversationKey || "").trim(),
+      String(entry.telegramThreadId || "").trim()
+    ].join("|");
+    const newest = newestByConversation.get(key)?.entry || null;
+    if (!newest || newest === entry) {
+      continue;
+    }
+    entry.status = "superseded";
+    entry.sentAt = nowIso();
+    entry.responsePreview = entry.responsePreview || "[superseded by newer message]";
+    superseded += 1;
+  }
+
+  return superseded;
+}
+
+function isPrivateIdleBriefArtifact(entry) {
+  if (!entry) {
+    return false;
+  }
+  if (String(entry.chatType || "").toLowerCase() !== "private") {
+    return false;
+  }
+  return looksLikeMnemoIdleLoopBrief(entry.text || entry.sourceText || "");
+}
+
+function scrubIdleBriefArtifactsInPlace(state) {
+  if (!state || typeof state !== "object") {
+    return state;
+  }
+
+  const queue = Array.isArray(state.queue) ? state.queue : [];
+  state.queue = queue.filter((entry) => !isPrivateIdleBriefArtifact(entry));
+
+  const pendingReplies = Array.isArray(state.pendingReplies) ? state.pendingReplies : [];
+  state.pendingReplies = pendingReplies.filter((entry) => !isPrivateIdleBriefArtifact(entry));
+
+  if (isPrivateIdleBriefArtifact(state.lastInbound)) {
+    state.lastInbound = [...state.queue]
+      .filter((entry) => !isPrivateIdleBriefArtifact(entry))
+      .sort((left, right) => {
+        const leftStamp = String(left?.ts || left?.deliveredAt || left?.lastAttemptAt || "");
+        const rightStamp = String(right?.ts || right?.deliveredAt || right?.lastAttemptAt || "");
+        if (leftStamp !== rightStamp) {
+          return rightStamp.localeCompare(leftStamp);
+        }
+        return Number(right?.messageId || 0) - Number(left?.messageId || 0);
+      })[0] || null;
+  }
+
+  return state;
+}
+
 function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
   const replies = Array.isArray(pendingReplies) ? pendingReplies : [];
-  const timeoutMs = Math.max(Number(config.pendingReplyTimeoutMs || 0), 0);
+  const timeoutMs = getEffectivePendingReplyTimeoutMs(config);
   if (timeoutMs <= 0) {
     return 0;
   }
 
   let expired = 0;
   for (const entry of replies) {
+    if (hasResponseMessageIds(entry)) {
+      entry.status = String(entry.status || "").trim().toLowerCase() === "suppressed_ack" ? "suppressed_ack" : "sent";
+      entry.sentAt = entry.sentAt || getPendingReplyActivityAt(entry) || nowIso();
+      continue;
+    }
     if (!isNonTerminalPendingReply(entry)) {
       continue;
     }
-    if (isoAgeMs(entry.createdAt) < timeoutMs) {
+    if (isoAgeMs(getPendingReplyActivityAt(entry)) < timeoutMs) {
       continue;
     }
     entry.status = "expired";
@@ -195,6 +580,30 @@ function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
     expired += 1;
   }
   return expired;
+}
+
+function getEffectivePendingReplyTimeoutMs(config) {
+  const configuredMs = Math.max(Number(config.pendingReplyTimeoutMs || 0), 0);
+  const idleMs = Math.max(Number(config.idleCooldownMs || 0), 0);
+  if (configuredMs <= 0) {
+    return 0;
+  }
+  if (idleMs <= 0) {
+    return configuredMs;
+  }
+  return Math.min(configuredMs, Math.max(idleMs * 2, 30000));
+}
+
+function getEffectiveIdleCooldownMs(config, entry = null) {
+  const configuredMs = Math.max(Number(config.idleCooldownMs || 0), 0);
+  if (configuredMs <= 0) {
+    return 0;
+  }
+  const relevance = String(entry?.relevance || "").trim().toLowerCase();
+  const chatType = String(entry?.chatType || "").trim().toLowerCase();
+  const directLike = chatType === "private" || relevance === "direct" || relevance === "lane";
+  const capMs = directLike ? 3000 : 5000;
+  return Math.min(configuredMs, capMs);
 }
 
 function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
@@ -431,6 +840,7 @@ function mergeStateSnapshots(currentState, incomingState) {
     merged.queue
   );
   merged.lastOutbound = pickLatestRecord(currentState.lastOutbound || null, incomingState.lastOutbound || null);
+  merged.lastUiNotice = pickLatestRecord(currentState.lastUiNotice || null, incomingState.lastUiNotice || null);
   merged.lastPollAt = pickIsoLater(currentState.lastPollAt, incomingState.lastPollAt);
   merged.lastInjectAt = pickIsoLater(currentState.lastInjectAt, incomingState.lastInjectAt);
   merged.currentThreadId = incomingState.currentThreadId || currentState.currentThreadId || "";
@@ -457,12 +867,56 @@ function normalizeInbound(message) {
     userId: message.from?.id ? String(message.from.id) : "",
     text,
     ts: nowIso(),
-    intent: looksLikeContinueNudge(text) ? "continue_nudge" : "message",
+    intent: "message",
     relevance: "ambient",
     status: "queued",
     attempts: 0,
     lastAttemptAt: null
   };
+}
+
+function buildContinueContext(state, inbound) {
+  const sameConversation = (entry) => String(entry?.conversationKey || "").trim() === String(inbound?.conversationKey || "").trim();
+  const recentEntries = [
+    ...(state.queue || []),
+    ...(state.pendingReplies || [])
+  ].filter((entry) => {
+    if (!entry || entry.senderIsBot) {
+      return false;
+    }
+    if (!sameConversation(entry)) {
+      return false;
+    }
+    const ageMs = isoAgeMs(entry.ts || entry.createdAt || entry.deliveredAt || entry.lastAttemptAt || "");
+    return ageMs <= 1000 * 60 * 60 * 6;
+  });
+
+  const lastUserWorkEntry = [...recentEntries]
+    .reverse()
+    .find((entry) => String(entry.intent || "").trim().toLowerCase() !== "continue_nudge");
+
+  return {
+    conversationKey: inbound?.conversationKey || "",
+    recentEntries,
+    lastUserWorkText: lastUserWorkEntry?.text || lastUserWorkEntry?.sourceText || "",
+    hasPendingReplies: (state.pendingReplies || []).some((entry) => {
+      if (!entry || entry.senderIsBot || entry.sentAt) {
+        return false;
+      }
+      return sameConversation(entry);
+    })
+  };
+}
+
+function looksLikeMnemoIdleLoopBrief(text) {
+  const value = String(text || "").trim();
+  if (!value) {
+    return false;
+  }
+  if (/^Mnemo Idle #\d+:/i.test(value)) {
+    return true;
+  }
+  return /^---\s*BRIEF\b[\s\S]*\bfrom=mnemo-idle-loop\b[\s\S]*\[IDLE-CYCLE\]/i.test(value);
 }
 
 function normalizeTelegramThreadId(value) {
@@ -506,6 +960,234 @@ function splitTelegramText(text, maxLength = 3500) {
     chunks.push(remaining);
   }
   return chunks.filter(Boolean);
+}
+
+function shouldSendDeferredReceipt(entry, reason) {
+  if (!entry) {
+    return false;
+  }
+  if (entry.senderIsBot) {
+    return false;
+  }
+  if (entry.intent === "continue_nudge") {
+    return false;
+  }
+  if (entry.queueNoticeSentAt) {
+    return false;
+  }
+  if (!["pending_reply", "session_active"].includes(String(reason || ""))) {
+    return false;
+  }
+  const relevance = String(entry.relevance || "").toLowerCase();
+  const chatType = String(entry.chatType || "").toLowerCase();
+  return chatType === "private" || relevance === "direct" || relevance === "lane";
+}
+
+function buildDeferredReceiptText(entry) {
+  const chatType = String(entry?.chatType || "").toLowerCase();
+  const user = String(entry?.user || "").trim();
+  if (chatType === "private") {
+    return "Ich habe deine Nachricht. Ich ziehe sie nach dem aktuellen Lauf.";
+  }
+  if (user) {
+    return `Alles klar ${user}, ich habe deine Nachricht. Ich ziehe sie nach dem aktuellen Lauf.`;
+  }
+  return "Ich habe die Nachricht. Ich ziehe sie nach dem aktuellen Lauf.";
+}
+
+function buildProgressFallbackText(entry) {
+  const chatType = String(entry?.chatType || "").toLowerCase();
+  const user = String(entry?.user || "").trim();
+  if (chatType === "private") {
+    return "Ich bin dran. Ich schreibe dir hier, sobald ich den naechsten konkreten Stand habe.";
+  }
+  if (user) {
+    return `Alles klar ${user}, ich bin dran und schreibe hier den naechsten konkreten Stand.`;
+  }
+  return "Ich bin dran und schreibe hier den naechsten konkreten Stand.";
+}
+
+function shouldSendProgressUpgrade(entry, progress) {
+  if (!entry || !progress) {
+    return false;
+  }
+  if (String(entry.progressMode || "").trim().toLowerCase() !== "fallback") {
+    return false;
+  }
+  if (entry.progressUpgradeSentAt) {
+    return false;
+  }
+  const progressText = normalizeWhitespace(repairMojibake(progress.message || ""));
+  if (!progressText) {
+    return false;
+  }
+  const fallbackText = normalizeWhitespace(repairMojibake(entry.progressPreview || ""));
+  if (!fallbackText || progressText === fallbackText) {
+    return false;
+  }
+  if (looksLikeAckOnly(progressText) || looksLikeContextRequestOnly(progressText)) {
+    return false;
+  }
+  return true;
+}
+
+function getPendingReplyActivityAt(entry) {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  return String(
+    entry.lastSignalAt
+    || entry.progressSentAt
+    || entry.sentAt
+    || entry.createdAt
+    || ""
+  ).trim();
+}
+
+function normalizeWhitespace(text) {
+  return String(text || "")
+    .replace(/\r/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function repairMojibake(text) {
+  const value = String(text || "");
+  if (!/[ÃƒÃ¢ï¿½]/.test(value)) {
+    return value;
+  }
+
+  try {
+    const repaired = Buffer.from(value, "latin1").toString("utf8");
+    if (repaired && !/\u0000/.test(repaired)) {
+      return repaired;
+    }
+  } catch {
+    // Fall through to targeted replacements.
+  }
+
+  return value
+    .replace(/Ã¢â‚¬â€/g, "-")
+    .replace(/Ã¢â‚¬â€œ/g, "-")
+    .replace(/Ã¢â‚¬Å¾|Ã¢â‚¬Å“|Ã¢â‚¬Â/g, "\"")
+    .replace(/Ã¢â‚¬â„¢|Ã¢â‚¬Ëœ/g, "'")
+    .replace(/Ã¢â‚¬Â¦/g, "...")
+    .replace(/Ã¢â€šÂ¬/g, "EUR")
+    .replace(/Ãƒâ€ž/g, "Ã„")
+    .replace(/Ãƒâ€“/g, "Ã–")
+    .replace(/ÃƒÅ“/g, "Ãœ")
+    .replace(/ÃƒÂ¤/g, "Ã¤")
+    .replace(/ÃƒÂ¶/g, "Ã¶")
+    .replace(/ÃƒÂ¼/g, "Ã¼")
+    .replace(/ÃƒÅ¸/g, "ÃŸ");
+}
+
+function shouldPublishInboundUiNotice(entry) {
+  if (!entry) {
+    return false;
+  }
+  if (entry.senderIsBot) {
+    return false;
+  }
+  const chatType = String(entry.chatType || "").toLowerCase();
+  const relevance = String(entry.relevance || "").toLowerCase();
+  return chatType === "private" || ["direct", "lane", "escalation"].includes(relevance);
+}
+
+function formatCompactInboundUiNotice(entry) {
+  const text = normalizeWhitespace(repairMojibake(entry?.text || "")).slice(0, 180);
+  if (!text) {
+    return "";
+  }
+  if (/^(brief von|mnemo idle #)/i.test(text)) {
+    return text;
+  }
+  const user = String(entry?.user || "unknown").trim();
+  const groupTitle = String(entry?.groupTitle || "").trim();
+  const chatType = String(entry?.chatType || "").trim().toLowerCase();
+  if (chatType === "private" || !groupTitle) {
+    return `${user}: ${text}`;
+  }
+  return `${user} @ ${groupTitle}: ${text}`;
+}
+
+function findRecentOutboundForTurn(config, chatId, source, sourceTurnId, text = "") {
+  if (!config?.paths?.outboxFile || !existsSync(config.paths.outboxFile)) {
+    return null;
+  }
+  const normalizedChatId = String(chatId || "").trim();
+  const normalizedSource = String(source || "").trim();
+  const normalizedTurnId = String(sourceTurnId || "").trim();
+  const normalizedText = normalizeWhitespace(repairMojibake(text || ""));
+  if (!normalizedChatId || !normalizedSource || !normalizedTurnId) {
+    return null;
+  }
+
+  const matches = [];
+  for (const line of readTail(config.paths.outboxFile, 400).reverse()) {
+    try {
+      const item = JSON.parse(line);
+      if (String(item?.chatId || "").trim() !== normalizedChatId) {
+        continue;
+      }
+      if (String(item?.source || "").trim() !== normalizedSource) {
+        continue;
+      }
+      if (String(item?.sourceTurnId || "").trim() !== normalizedTurnId) {
+        continue;
+      }
+      if (normalizedText) {
+        const itemText = normalizeWhitespace(repairMojibake(item?.text || ""));
+        if (itemText !== normalizedText) {
+          continue;
+        }
+      }
+      matches.push(item);
+    } catch {
+      // Ignore malformed tail lines.
+    }
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  matches.sort((left, right) => String(left?.ts || "").localeCompare(String(right?.ts || "")));
+  return {
+    outbound: matches[matches.length - 1],
+    messageIds: matches.map((item) => String(item.messageId || "").trim()).filter(Boolean)
+  };
+}
+
+async function maybeSendDeferredReceipt(config, state, entry, reason) {
+  if (!shouldSendDeferredReceipt(entry, reason)) {
+    return false;
+  }
+
+  try {
+    await sendOutboundChunks(config, state, {
+      chatId: entry.chatId,
+      text: buildDeferredReceiptText(entry),
+      replyToMessageId: entry.messageId,
+      telegramThreadId: entry.telegramThreadId,
+      source: "queue_notice"
+    });
+    entry.queueNoticeSentAt = nowIso();
+    entry.queueNoticeReason = String(reason || "");
+    state.lastQueueNoticeAt = entry.queueNoticeSentAt;
+    appendLog(
+      config.paths.activityFile,
+      `QUEUE_NOTICE chat=${entry.chatId} message=${entry.messageId} reason=${entry.queueNoticeReason || "-"}`
+    );
+    return true;
+  } catch (error) {
+    appendLog(
+      config.paths.activityFile,
+      `QUEUE_NOTICE_ERROR chat=${entry.chatId} message=${entry.messageId} reason=${String(reason || "-")}: ${error}`
+    );
+    return false;
+  }
 }
 
 function readJsonlDelta(path, offset, carry = "") {
@@ -569,7 +1251,7 @@ async function resolveThreadSessionPath(config, threadId) {
 }
 
 function countOpenPendingReplies(state, config) {
-  const timeoutMs = Math.max(Number(config.pendingReplyTimeoutMs || 0), 0);
+  const timeoutMs = getEffectivePendingReplyTimeoutMs(config);
   return (state.pendingReplies || []).filter((entry) => {
     if (!isNonTerminalPendingReply(entry)) {
       return false;
@@ -581,13 +1263,15 @@ function countOpenPendingReplies(state, config) {
   }).length;
 }
 
-async function resolveSessionActivity(config, threadId) {
+async function resolveSessionActivity(config, threadId, entry = null) {
   const sessionPath = await resolveThreadSessionPath(config, threadId);
+  const cooldownMs = getEffectiveIdleCooldownMs(config, entry);
   if (!sessionPath || !existsSync(sessionPath)) {
     return {
       sessionPath,
       quietMs: Number.POSITIVE_INFINITY,
-      active: false
+      active: false,
+      cooldownMs
     };
   }
 
@@ -595,7 +1279,8 @@ async function resolveSessionActivity(config, threadId) {
   return {
     sessionPath,
     quietMs,
-    active: quietMs < Number(config.idleCooldownMs || 0)
+    active: quietMs < cooldownMs,
+    cooldownMs
   };
 }
 
@@ -622,6 +1307,16 @@ function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionO
     responsePreview: "",
     responseMessageIds: []
   };
+}
+
+function shouldTrackPendingReply(message) {
+  if (!message) {
+    return false;
+  }
+  if (looksLikeBotSender(message)) {
+    return false;
+  }
+  return String(message.intent || "message").trim().toLowerCase() !== "continue_nudge";
 }
 
 function parseUnixSeconds(isoString) {
@@ -879,9 +1574,42 @@ async function sendOutboundChunks(config, state, options) {
     throw new Error("Outbound Telegram text is empty.");
   }
 
+  if ((source === "auto" || source === "auto_progress") && sourceTurnId) {
+    const existing = findRecentOutboundForTurn(config, chatId, source, sourceTurnId, text);
+    if (existing?.outbound) {
+      state.lastOutbound = existing.outbound;
+      appendLog(
+        config.paths.activityFile,
+        `OUT_AUTO_SKIP_DUP chat=${chatId} reply_to=${replyToMessageId || "-"} turn=${sourceTurnId} outbound=${existing.messageIds.join(",")}`
+      );
+      return {
+        ok: true,
+        outbound: existing.outbound,
+        messageIds: existing.messageIds,
+        skippedDuplicate: true
+      };
+    }
+  }
+
   const chunks = splitTelegramText(text);
   const messageIds = [];
   let lastOutbound = null;
+
+  const contextEntry = [
+    ...(state.queue || []),
+    ...(state.pendingReplies || [])
+  ].find((entry) => {
+    if (String(entry.chatId || "").trim() !== chatId) {
+      return false;
+    }
+    if (replyToMessageId && String(entry.messageId || entry.replyToMessageId || "").trim() === replyToMessageId) {
+      return true;
+    }
+    if (telegramThreadId && String(entry.telegramThreadId || "").trim() === telegramThreadId) {
+      return true;
+    }
+    return false;
+  }) || null;
 
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
@@ -906,6 +1634,36 @@ async function sendOutboundChunks(config, state, options) {
     appendLog(config.paths.activityFile, `OUT_${source.toUpperCase()} chat=${chatId} reply_to=${outbound.replyToMessageId || "-"} thread=${telegramThreadId || "-"} message=${outbound.messageId}: ${chunk.replace(/\s+/g, " ").slice(0, 180)}`);
     messageIds.push(outbound.messageId);
     lastOutbound = outbound;
+  }
+
+  if (lastOutbound) {
+    try {
+      const preview = (
+        typeof normalizeWhitespace === "function"
+          ? normalizeWhitespace(repairMojibake(lastOutbound.text))
+          : String(lastOutbound.text || "")
+            .replace(/\r/g, " ")
+            .replace(/\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+      ).slice(0, 140);
+      const groupTitle = String(contextEntry?.groupTitle || "").trim();
+      const user = String(contextEntry?.user || "").trim();
+      const chatType = String(contextEntry?.chatType || "").trim().toLowerCase();
+      let label = "Antwort";
+      if (groupTitle) {
+        label = `Antwort @ ${groupTitle}`;
+      } else if (chatType === "private" && user) {
+        label = `Antwort an ${user}`;
+      }
+      state.lastUiNotice = {
+        ts: nowIso(),
+        kind: "outbound",
+        text: `${label}: ${preview}`
+      };
+    } catch (error) {
+      appendLog(config.paths.activityFile, `UI_NOTICE_ERROR chat=${chatId} reply_to=${replyToMessageId || "-"}: ${error}`);
+    }
   }
 
   return {
@@ -955,14 +1713,28 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    if (String(inbound.chatType || "") === "private" && looksLikeMnemoIdleLoopBrief(inbound.text)) {
+      ignored += 1;
+      appendLog(config.paths.activityFile, `IGNORED_IDLE_BRIEF chat=${inbound.chatId} message=${inbound.messageId}`);
+      continue;
+    }
     if (!inbound.text.trim()) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED_EMPTY chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    const continueContext = buildContinueContext(state, inbound);
+    inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
     inbound.relevance = classifyInboundRelevance(config, inbound);
     state.queue.push(inbound);
     state.lastInbound = inbound;
+    if (shouldPublishInboundUiNotice(inbound)) {
+      state.lastUiNotice = {
+        ts: nowIso(),
+        kind: "inbound",
+        text: formatCompactInboundUiNotice(inbound)
+      };
+    }
     appendJsonl(config.paths.inboxFile, inbound);
     appendLog(config.paths.activityFile, `IN chat=${inbound.chatId} message=${inbound.messageId} relevance=${inbound.relevance} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
     captured += 1;
@@ -989,6 +1761,67 @@ export function listQueue(limit = 10) {
     saveStateForConfig(config, state);
   }
   return state.queue.slice(-Math.max(1, limit));
+}
+
+function getQueuedDispatchPriority(item) {
+  if (!item || item.status !== "queued") {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  const relevance = String(item.relevance || "").toLowerCase();
+  const chatType = String(item.chatType || "").toLowerCase();
+  if (relevance === "escalation") {
+    return 0;
+  }
+  if (isFastDispatchEntry(item)) {
+    return 1;
+  }
+  if (chatType === "private" || relevance === "direct" || relevance === "lane") {
+    return 2;
+  }
+  return 3;
+}
+
+function compareQueuedDispatchOrder(left, right) {
+  const priorityDiff = getQueuedDispatchPriority(left) - getQueuedDispatchPriority(right);
+  if (priorityDiff !== 0) {
+    return priorityDiff;
+  }
+  const leftTs = String(left?.ts || "");
+  const rightTs = String(right?.ts || "");
+  if (leftTs !== rightTs) {
+    return leftTs.localeCompare(rightTs);
+  }
+  const leftMessage = Number.parseInt(String(left?.messageId || "0"), 10);
+  const rightMessage = Number.parseInt(String(right?.messageId || "0"), 10);
+  if (Number.isFinite(leftMessage) && Number.isFinite(rightMessage) && leftMessage !== rightMessage) {
+    return leftMessage - rightMessage;
+  }
+  return String(left?.messageId || "").localeCompare(String(right?.messageId || ""));
+}
+
+function selectNextQueuedEntry(queue, options = {}) {
+  const auto = Boolean(options.auto);
+  const deferredMode = String(options.dispatchMode || "deferred").toLowerCase() !== "legacy";
+  const queued = Array.isArray(queue) ? queue.filter((item) => item?.status === "queued") : [];
+  if (!auto || !deferredMode) {
+    return queued.sort(compareQueuedDispatchOrder)[0] || null;
+  }
+  const eligible = queued.filter((item) => {
+    const relevance = String(item.relevance || "").toLowerCase();
+    const chatType = String(item.chatType || "").toLowerCase();
+    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane";
+  });
+  return eligible.sort(compareQueuedDispatchOrder)[0] || null;
+}
+
+function isFastDispatchEntry(entry) {
+  if (!entry) {
+    return false;
+  }
+  if (String(entry.intent || "").trim().toLowerCase() === "continue_nudge") {
+    return true;
+  }
+  return false;
 }
 
 export async function injectNext(threadId, options = {}) {
@@ -1027,20 +1860,10 @@ export async function injectNext(threadId, options = {}) {
     throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
   }
 
-  let next = null;
-  if (auto && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
-    next = state.queue.find((item) => {
-      if (item.status !== "queued") {
-        return false;
-      }
-      if (String(item.chatType || "") === "private") {
-        return true;
-      }
-      return ["direct", "lane", "escalation"].includes(String(item.relevance || ""));
-    });
-  } else {
-    next = state.queue.find((item) => item.status === "queued");
-  }
+  const next = selectNextQueuedEntry(state.queue || [], {
+    auto,
+    dispatchMode: config.dispatchMode
+  });
 
   if (!next) {
     return {
@@ -1050,10 +1873,15 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  const bypassDeferredGate = auto && next.relevance === "escalation";
+  const bypassDeferredGate = auto && (next.relevance === "escalation" || isFastDispatchEntry(next));
+  if (bypassDeferredGate && auto && isFastDispatchEntry(next)) {
+    appendLog(config.paths.activityFile, `FAST_TRIGGER_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent}`);
+  }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
     if (openPendingReplies > 0) {
+      await maybeSendDeferredReceipt(config, state, next, "pending_reply");
+      saveStateForConfig(config, state);
       return {
         ok: false,
         status: "deferred",
@@ -1062,14 +1890,16 @@ export async function injectNext(threadId, options = {}) {
       };
     }
 
-    const sessionActivity = await resolveSessionActivity(config, resolvedThreadId);
+    const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
     if (sessionActivity.active) {
+      await maybeSendDeferredReceipt(config, state, next, "session_active");
+      saveStateForConfig(config, state);
       return {
         ok: false,
         status: "deferred",
         reason: "session_active",
         quietMs: sessionActivity.quietMs,
-        readyInMs: Math.max(0, Number(config.idleCooldownMs || 0) - Number(sessionActivity.quietMs || 0))
+        readyInMs: Math.max(0, Number(sessionActivity.cooldownMs || 0) - Number(sessionActivity.quietMs || 0))
       };
     }
   }
@@ -1128,7 +1958,9 @@ export async function injectNext(threadId, options = {}) {
   next.stderr = result.stderr.slice(0, 400);
   next.stdout = result.stdout.slice(0, 400);
   if (useAppServer && result.ok) {
-    if (looksLikeBotSender(next)) {
+    if (!shouldTrackPendingReply(next)) {
+      appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
+    } else if (looksLikeBotSender(next)) {
       appendLog(config.paths.activityFile, `REPLY_SKIP_BOT thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
     } else {
       const pendingReply = buildPendingReplyEntry(next, resolvedThreadId, next.turnId, sessionPath, sessionOffset);
@@ -1156,9 +1988,13 @@ export async function relayRepliesOnce() {
   const state = loadState(config);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  const supersededPendingReplies = supersedeOlderPendingRepliesInPlace(state.pendingReplies || []);
   closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (parkedAmbient > 0) {
+  if (parkedAmbient > 0 || supersededPendingReplies > 0) {
     appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
+    if (supersededPendingReplies > 0) {
+      appendLog(config.paths.activityFile, `PENDING_REPLY_SUPERSEDED count=${supersededPendingReplies}`);
+    }
   }
 
   for (const entry of state.pendingReplies || []) {
@@ -1173,7 +2009,7 @@ export async function relayRepliesOnce() {
     entry.responsePreview = entry.responsePreview || "[ignored bot message]";
   }
 
-  const pendingReplies = (state.pendingReplies || []).filter((entry) => isNonTerminalPendingReply(entry));
+  const pendingReplies = (state.pendingReplies || []).filter((entry) => isReplyAwaitingOutcome(entry));
   if (pendingReplies.length === 0) {
     saveStateForConfig(config, state);
     return { ok: true, status: "empty", delivered: 0 };
@@ -1181,7 +2017,8 @@ export async function relayRepliesOnce() {
 
   let delivered = 0;
   const usedTurnIds = new Set();
-  const sessionCompletions = new Map();
+  const usedProgressKeys = new Set();
+  const sessionSignals = new Map();
 
   for (const entry of pendingReplies) {
     if (!entry.sessionPath) {
@@ -1191,11 +2028,12 @@ export async function relayRepliesOnce() {
       continue;
     }
 
-    if (!sessionCompletions.has(entry.sessionPath)) {
+    if (!sessionSignals.has(entry.sessionPath)) {
       const fallbackOffset = pendingReplies
         .filter((candidate) => candidate.sessionPath === entry.sessionPath)
         .reduce((lowest, candidate) => Math.min(lowest, Number(candidate.sessionOffset || 0)), Number(entry.sessionOffset || 0));
-      const currentOffset = Number((state.replyOffsets || {})[entry.sessionPath] ?? fallbackOffset);
+      const savedOffset = Number((state.replyOffsets || {})[entry.sessionPath] ?? fallbackOffset);
+      const currentOffset = Math.min(savedOffset, fallbackOffset);
       const currentCarry = String((state.replyBuffers || {})[entry.sessionPath] || "");
       const delta = readJsonlDelta(entry.sessionPath, currentOffset, currentCarry);
       state.replyOffsets = {
@@ -1214,22 +2052,119 @@ export async function relayRepliesOnce() {
           timestamp: String(item?.timestamp || "").trim()
         }))
         .filter((item) => item.message);
-      sessionCompletions.set(entry.sessionPath, completions);
+      const finalAnswers = delta.items
+        .filter((item) => item?.type === "event_msg" && item?.payload?.type === "agent_message" && String(item?.payload?.phase || "").trim().toLowerCase() === "final_answer")
+        .map((item) => ({
+          message: String(item?.payload?.message || "").trim(),
+          timestamp: String(item?.timestamp || "").trim()
+        }))
+        .filter((item) => item.message);
+      const commentaries = delta.items
+        .filter((item) => item?.type === "event_msg" && item?.payload?.type === "agent_message" && String(item?.payload?.phase || "").trim().toLowerCase() === "commentary")
+        .map((item) => ({
+          message: String(item?.payload?.message || "").trim(),
+          timestamp: String(item?.timestamp || "").trim()
+        }))
+        .filter((item) => item.message);
+      sessionSignals.set(entry.sessionPath, { completions, finalAnswers, commentaries });
     }
 
-    const completions = sessionCompletions.get(entry.sessionPath) || [];
+    const signals = sessionSignals.get(entry.sessionPath) || { completions: [], finalAnswers: [], commentaries: [] };
+    const completions = signals.completions || [];
+    const finalAnswers = signals.finalAnswers || [];
+    const commentaries = signals.commentaries || [];
+
+    if (!entry.progressSentAt) {
+      const progress = commentaries.find((item) => {
+        const key = `${item.timestamp}|${item.message}`;
+        return item.timestamp >= entry.createdAt && !usedProgressKeys.has(key);
+      });
+      if (progress) {
+        const outboundProgress = await sendOutboundChunks(config, state, {
+          chatId: entry.chatId,
+          text: progress.message,
+          replyToMessageId: entry.replyToMessageId,
+          telegramThreadId: entry.telegramThreadId,
+          source: "auto_progress",
+          sourceTurnId: entry.turnId || null
+        });
+        entry.progressSentAt = nowIso();
+        entry.lastSignalAt = entry.progressSentAt;
+        entry.progressMode = "commentary";
+        entry.progressPreview = progress.message.slice(0, 400);
+        entry.progressMessageIds = outboundProgress.messageIds;
+        entry.progressKey = `${progress.timestamp}|${progress.message}`;
+        usedProgressKeys.add(`${progress.timestamp}|${progress.message}`);
+        appendLog(config.paths.activityFile, `REPLY_PROGRESS_SENT thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId} outbound=${outboundProgress.messageIds.join(",")}`);
+      }
+    }
+
+    if (!entry.progressSentAt && isoAgeMs(entry.createdAt) >= 8000) {
+      const fallbackText = buildProgressFallbackText(entry);
+      const outboundProgress = await sendOutboundChunks(config, state, {
+        chatId: entry.chatId,
+        text: fallbackText,
+        replyToMessageId: entry.replyToMessageId,
+        telegramThreadId: entry.telegramThreadId,
+        source: "auto_progress",
+        sourceTurnId: entry.turnId || null
+      });
+      entry.progressSentAt = nowIso();
+      entry.lastSignalAt = entry.progressSentAt;
+      entry.progressMode = "fallback";
+      entry.progressPreview = fallbackText.slice(0, 400);
+      entry.progressMessageIds = outboundProgress.messageIds;
+      appendLog(config.paths.activityFile, `REPLY_PROGRESS_FALLBACK thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId} outbound=${outboundProgress.messageIds.join(",")}`);
+    }
+
+    if (entry.progressSentAt) {
+      const upgrade = commentaries.find((item) => {
+        const key = `${item.timestamp}|${item.message}`;
+        return item.timestamp >= entry.createdAt
+          && key !== entry.progressKey
+          && !usedProgressKeys.has(key)
+          && shouldSendProgressUpgrade(entry, item);
+      });
+      if (upgrade) {
+        const outboundUpgrade = await sendOutboundChunks(config, state, {
+          chatId: entry.chatId,
+          text: upgrade.message,
+          replyToMessageId: entry.replyToMessageId,
+          telegramThreadId: entry.telegramThreadId,
+          source: "auto_progress",
+          sourceTurnId: entry.turnId || null
+        });
+        entry.progressUpgradeSentAt = nowIso();
+        entry.lastSignalAt = entry.progressUpgradeSentAt;
+        entry.progressUpgradePreview = upgrade.message.slice(0, 400);
+        entry.progressUpgradeMessageIds = outboundUpgrade.messageIds;
+        entry.progressUpgradeKey = `${upgrade.timestamp}|${upgrade.message}`;
+        usedProgressKeys.add(`${upgrade.timestamp}|${upgrade.message}`);
+        appendLog(config.paths.activityFile, `REPLY_PROGRESS_UPGRADE thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId} outbound=${outboundUpgrade.messageIds.join(",")}`);
+      }
+    }
 
     let match = null;
+    const finalAnswer = finalAnswers.find((item) => item.timestamp >= entry.createdAt && !usedProgressKeys.has(`final|${item.timestamp}|${item.message}`));
+    if (finalAnswer) {
+      match = {
+        turnId: entry.turnId || "",
+        message: finalAnswer.message,
+        timestamp: finalAnswer.timestamp,
+        source: "final_answer"
+      };
+      usedProgressKeys.add(`final|${finalAnswer.timestamp}|${finalAnswer.message}`);
+    }
     if (entry.turnId) {
-      match = completions.find((item) => item.turnId === entry.turnId);
+      match = match || completions.find((item) => item.turnId === entry.turnId);
     } else {
-      match = completions.find((item) => item.timestamp >= entry.createdAt && !usedTurnIds.has(item.turnId));
+      match = match || completions.find((item) => item.timestamp >= entry.createdAt && !usedTurnIds.has(item.turnId));
     }
     if (!match) {
       continue;
     }
 
-    if (entry.intent === "continue_nudge" && looksLikeAckOnly(match.message)) {
+    if (entry.intent === "continue_nudge" && (looksLikeAckOnly(match.message) || looksLikeContextRequestOnly(match.message))) {
       entry.sentAt = nowIso();
       entry.status = "suppressed_ack";
       entry.turnId = entry.turnId || match.turnId;
@@ -1249,6 +2184,7 @@ export async function relayRepliesOnce() {
     entry.sentAt = nowIso();
     entry.status = "sent";
     entry.turnId = entry.turnId || match.turnId;
+    entry.lastSignalAt = entry.sentAt;
     entry.responsePreview = match.message.slice(0, 400);
     entry.responseMessageIds = outboundResult.messageIds;
     usedTurnIds.add(match.turnId);

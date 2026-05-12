@@ -18,9 +18,11 @@
     "blun-codex.ps1",
     "start-codex-agent.ps1",
     "start-codex.cmd",
+    "telegram-title-embed.ps1",
     "telegram-status.ps1",
     "telegram-doctor.ps1",
-    "telegram-setup.ps1"
+    "telegram-setup.ps1",
+    "telegram-title-watcher.ps1"
   ],
   "keywords": [
     "blun",

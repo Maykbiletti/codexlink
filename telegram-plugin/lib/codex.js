@@ -3,34 +3,116 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { startTextTurnOverWs } from "./app-server-client.js";
 
+function repairMojibake(value) {
+  const input = String(value || "");
+  if (!input || !/[ÃÂâð]/.test(input)) {
+    return input;
+  }
+  try {
+    const repaired = Buffer.from(input, "latin1").toString("utf8");
+    if (!repaired || repaired.includes("\uFFFD")) {
+      return input;
+    }
+    return repaired;
+  } catch {
+    return input;
+  }
+}
+
+function compactInboundLabel(message) {
+  const user = repairMojibake(String(message.user || "Unbekannt")).trim() || "Unbekannt";
+  const group = repairMojibake(String(message.groupTitle || "")).trim();
+  const chatType = String(message.chatType || "").trim();
+
+  if (group || chatType === "group" || chatType === "supergroup") {
+    return `${user} @ ${group || "Gruppe"}:`;
+  }
+
+  return `${user}:`;
+}
+
+function normalizeWhitespace(text) {
+  return repairMojibake(String(text || ""))
+    .replace(/\r/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function firstMeaningfulLine(lines) {
+  for (const raw of lines) {
+    const line = String(raw || "").trim();
+    if (!line) {
+      continue;
+    }
+    if (/^---\s*BRIEF/i.test(line) || /^---\s*BRIEF END/i.test(line)) {
+      continue;
+    }
+    if (/^##\s*(Title|Project|Request|Constraints|Acceptance|Report Back)\s*$/i.test(line)) {
+      continue;
+    }
+    return line;
+  }
+  return "";
+}
+
+function summarizeBrief(text) {
+  const raw = String(text || "");
+  const lines = raw.split(/\r?\n/);
+  const briefHeader = lines.find((line) => /^---\s*BRIEF\b/i.test(String(line || "").trim())) || "";
+  const idMatch = briefHeader.match(/\bid=(\d+)/i);
+  const fromMatch = briefHeader.match(/\bfrom=([^\s]+)/i);
+  const titleIndex = lines.findIndex((line) => /^##\s*Title\s*$/i.test(String(line || "").trim()));
+  const titleLine = titleIndex >= 0 ? firstMeaningfulLine(lines.slice(titleIndex + 1, titleIndex + 4)) : "";
+  const firstLine = firstMeaningfulLine(lines);
+  let detail = titleLine || firstLine || "Neuer Brief";
+  detail = detail.replace(/^\[IDLE-CYCLE\]\s*/i, "IDLE-CYCLE: ");
+  detail = normalizeWhitespace(detail);
+  const from = fromMatch ? fromMatch[1] : "Brief";
+  const idPart = idMatch ? ` #${idMatch[1]}` : "";
+  if (from === "mnemo-idle-loop") {
+    const compactIdle = detail
+      .replace(/^IDLE-CYCLE:\s*/i, "")
+      .replace(/^Pull project_state,\s*/i, "")
+      .replace(/generate proposals via mem_propose,\s*/i, "proposals, ")
+      .replace(/ship if ship_eligible\.?/i, "ship-check")
+      .replace(/Mode:\s*autonomous\.?/i, "auto")
+      .trim();
+    return `Mnemo Idle${idPart}: ${compactIdle || "IDLE-CYCLE"}`;
+  }
+  return `Brief von ${from}${idPart}: ${detail}`;
+}
+
+function compactInboundText(message) {
+  const text = String(message.text || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (/^---\s*BRIEF\b/i.test(text)) {
+    return summarizeBrief(text);
+  }
+  return text;
+}
+
 function buildPrompt(config, message) {
-  return [
-    "[BLUN Telegram Inbound]",
-    `Agent: ${config.agentName}`,
-    ...(config.lane ? [`Lane: ${config.lane}`] : []),
-    `Chat ID: ${message.chatId}`,
-    `Message ID: ${message.messageId}`,
-    `User: ${message.user || "unknown"}`,
-    `Chat Type: ${message.chatType || "unknown"}`,
-    `Conversation Key: ${message.conversationKey || `${message.chatId}:dm`}`,
-    ...(message.groupTitle ? [`Group: ${message.groupTitle}`] : []),
-    ...(message.telegramThreadId ? [`Telegram Thread ID: ${message.telegramThreadId}`] : []),
-    `Timestamp: ${message.ts}`,
-    "",
-    "Treat the following as a real inbound user message for this exact existing thread.",
-    "Reply naturally in-thread. Do not mention bridge transport unless relevant.",
-    "If this came from a group or topic, keep the reply scoped to that exact conversation.",
-    ...(message.intent === "continue_nudge"
-      ? [
-        "Treat this as a continue/resume signal for the current work, not as a request for a conversational acknowledgment.",
-        "Continue the existing task flow. Only reply in-thread if you have a concrete result, blocker, or decision that the user needs to see now."
-      ]
-      : []),
-    ...(config.lane ? [`Stay strictly inside your assigned lane (${config.lane}). Do not claim ownership or make decisions for other lanes.`] : []),
-    "",
-    "Message:",
-    message.text
-  ].join("\n");
+  const compactText = compactInboundText(message);
+  const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
+  const label = isBriefSummary ? "" : compactInboundLabel(message);
+  const header = [];
+
+  if (label) {
+    header.push(label);
+  }
+  header.push(compactText);
+
+  if (message.intent === "continue_nudge") {
+    header.push(
+      "",
+      "[Weiter-Signal: kein bloßes Ack senden. Nur antworten, wenn jetzt ein konkretes Ergebnis, Blocker oder eine Entscheidung sichtbar gemacht werden muss.]"
+    );
+  }
+
+  return header.join("\n");
 }
 
 export async function injectIntoThread(config, message, threadId) {
