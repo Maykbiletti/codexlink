@@ -246,7 +246,7 @@ The bundled plugin lives under `telegram-plugin/` and contains:
 
 1. check whether Telegram is already configured
 2. ask only for a missing Bot Token
-3. wait for one Telegram message to the bot
+3. wait for one Telegram message to the bot when no chat is paired yet
 4. detect and store the chat/group ID automatically
 5. continue into Telegram mode
 

@@ -349,7 +349,8 @@ if ($needsToken) {
 if ($needsChatIds -and -not $Json) {
   try {
     $botInfo = Get-TelegramBotInfo -Token $currentToken
-    $shouldPair = $tokenWasPrompted -or (-not $EnsureConfigured)
+    $pairingDone = [string]$envValues["BLUN_TELEGRAM_PAIRING_DONE"]
+    $shouldPair = $tokenWasPrompted -or (-not $EnsureConfigured) -or ($pairingDone -ne "1")
     if ($shouldPair) {
       $pairedChat = Wait-TelegramPairingChat -Token $currentToken -BotInfo $botInfo -TimeoutSeconds 90
       if ($pairedChat -and $pairedChat.chat_id) {

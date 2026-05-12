@@ -111,7 +111,7 @@ function Write-DoctorReport {
     foreach ($item in $failed) {
       switch ($item.name) {
         "bot_token" { Write-Host "  - Telegram Bot Token fehlt. Starte: blun-codex --profile $($Result.profile) telegram-setup" }
-        "allowed_chat_ids" { Write-Host "  - Erlaubte Chat-ID(s) fehlen. Starte: blun-codex --profile $($Result.profile) telegram-setup" }
+        "allowed_chat_ids" { Write-Host "  - Chat-ID ist optional. Zum automatischen Koppeln: blun-codex --profile $($Result.profile) telegram-setup" }
         "state_dir" { Write-Host "  - Der lokale Telegram-State-Ordner fehlt noch. Ein Setup-Lauf legt ihn automatisch an." }
         "profile_file" { Write-Host "  - Das angegebene Profil existiert nicht." }
         "node" { Write-Host "  - Node.js fehlt in PATH." }
