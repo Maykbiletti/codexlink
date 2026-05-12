@@ -5,8 +5,8 @@
   "license": "MIT",
   "private": false,
   "bin": {
-    "blun-codex": "./bin/blun-codex.js",
-    "codexlink": "./bin/blun-codex.js"
+    "blun-codex": "bin/blun-codex.js",
+    "codexlink": "bin/blun-codex.js"
   },
   "files": [
     "bin/",
