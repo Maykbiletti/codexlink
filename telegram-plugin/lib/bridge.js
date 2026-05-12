@@ -389,7 +389,10 @@ function looksLikeStatusBroadcast(text) {
   if (/^status(?:\s|$|[~:.-])/u.test(normalized)) {
     return true;
   }
-  return /^[a-z][a-z0-9_-]{1,24}\s+\d{1,2}:\d{2}\b/u.test(normalized);
+  if (/^status\s+~?\s*\d{1,2}\s+\d{2}\b/u.test(normalized)) {
+    return true;
+  }
+  return /^[a-z][a-z0-9_-]{1,24}\s+~?\s*\d{1,2}\s+\d{2}\b/u.test(normalized);
 }
 
 function isAgentAddressed(config, text) {
@@ -415,7 +418,7 @@ function isAgentAddressed(config, text) {
       return true;
     }
 
-    const briefDirective = new RegExp(`\\bbrief\\b[\\s\\S]{0,60}\\b@?${mention}\\b|\\b@?${mention}\\b[\\s\\S]{0,60}\\bbrief\\b`, "u").test(normalized);
+    const briefDirective = new RegExp(`\\bbrief\\b(?:\\s+#?\\d+)?\\s+(?:fuer|fur|for|an|to)\\s+@?${mention}\\b|\\b@?${mention}\\b\\s*[-:,]?\\s*brief\\b`, "u").test(normalized);
     if (briefDirective) {
       return true;
     }
@@ -452,7 +455,7 @@ function isOtherAgentAddressed(config, text) {
       return true;
     }
 
-    const briefDirective = new RegExp(`\\bbrief\\b[\\s\\S]{0,60}\\b@?${mention}\\b|\\b@?${mention}\\b[\\s\\S]{0,60}\\bbrief\\b`, "u").test(normalized);
+    const briefDirective = new RegExp(`\\bbrief\\b(?:\\s+#?\\d+)?\\s+(?:fuer|fur|for|an|to)\\s+@?${mention}\\b|\\b@?${mention}\\b\\s*[-:,]?\\s*brief\\b`, "u").test(normalized);
     if (briefDirective) {
       return true;
     }
@@ -467,31 +470,27 @@ function isOtherAgentAddressed(config, text) {
 }
 
 function classifyInboundRelevance(config, inbound) {
-  if (looksLikeEscalation(inbound.text)) {
-    return "escalation";
-  }
-
   if (String(inbound.chatType || "") === "private") {
     return "direct";
   }
 
   const text = String(inbound.text || "");
-  if (!looksLikeStatusBroadcast(text) && isAgentAddressed(config, text)) {
+  const isStatusBroadcast = looksLikeStatusBroadcast(text);
+
+  if (!isStatusBroadcast && isAgentAddressed(config, text)) {
     return "direct";
   }
 
-  if (!looksLikeStatusBroadcast(text) && isOtherAgentAddressed(config, text)) {
+  if (!isStatusBroadcast && isOtherAgentAddressed(config, text)) {
     return "ambient";
   }
 
-  const allowedUserIds = Array.isArray(config.allowedChatIds) ? config.allowedChatIds : [];
-  if (!inbound.senderIsBot && allowedUserIds.includes(String(inbound.userId || ""))) {
-    return "direct";
+  if (inbound.senderIsBot || isStatusBroadcast) {
+    return "ambient";
   }
 
-  const agentName = String(config.agentName || "").trim();
-  if (agentName && agentName.toLowerCase() !== "default" && !looksLikeStatusBroadcast(text) && containsToken(text, agentName)) {
-    return "direct";
+  if (looksLikeEscalation(text)) {
+    return "escalation";
   }
 
   const lane = String(config.lane || "").trim();
@@ -757,6 +756,33 @@ function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
     parked += 1;
   }
   return parked;
+}
+
+function reclassifyQueuedEntriesInPlace(config, queue) {
+  const entries = Array.isArray(queue) ? queue : [];
+  let changed = 0;
+  let parked = 0;
+  for (const entry of entries) {
+    if (!entry || entry.status !== "queued") {
+      continue;
+    }
+    const previous = String(entry.relevance || "").trim().toLowerCase();
+    const next = classifyInboundRelevance(config, entry);
+    if (next === previous) {
+      continue;
+    }
+    const reclassifiedAt = nowIso();
+    entry.relevance = next;
+    entry.reclassifiedAt = reclassifiedAt;
+    if (next === "ambient" && String(entry.chatType || "").trim().toLowerCase() !== "private") {
+      entry.status = "parked";
+      entry.parkedAt = entry.parkedAt || reclassifiedAt;
+      entry.responsePreview = entry.responsePreview || "[reclassified ambient]";
+      parked += 1;
+    }
+    changed += 1;
+  }
+  return { changed, parked };
 }
 
 function mergeQueueEntry(current, incoming) {
@@ -2068,11 +2094,15 @@ function isFastDispatchEntry(entry) {
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
+  const reclassified = reclassifyQueuedEntriesInPlace(config, state.queue || []);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0) {
+  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0) {
+    if (reclassified.changed > 0) {
+      appendLog(config.paths.activityFile, `QUEUE_RECLASSIFIED changed=${reclassified.changed} parked=${reclassified.parked}`);
+    }
     if (parkedAmbient > 0) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
