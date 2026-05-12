@@ -113,6 +113,13 @@ Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, blei
 
 Der automatische Progress-Hinweis ist bewusst defensiv: er erscheint nur bei echten Arbeits-/Weiter-Signalen, nicht bei normalem Smalltalk oder wenn die sichtbare Session stillsteht.
 
+Wenn mehrere Agents denselben Gruppenchat nutzen, kann ein Agent andere Agent-Namen als Fremdroute markieren. Dann werden Owner-Nachrichten wie `Frida mach weiter` nicht in Ottos Session gezogen:
+
+```text
+BLUN_TELEGRAM_MENTION_NAMES=otto
+BLUN_TELEGRAM_OTHER_AGENT_NAMES=frida,angel,dieter,alfred
+```
+
 Doctor:
 
 ```powershell

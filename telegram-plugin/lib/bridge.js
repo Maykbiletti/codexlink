@@ -370,6 +370,16 @@ function uniqueAgentMentionNames(config) {
   ));
 }
 
+function uniqueOtherAgentMentionNames(config) {
+  const ownNames = new Set(uniqueAgentMentionNames(config));
+  const values = Array.isArray(config.otherAgentNames) ? config.otherAgentNames : [];
+  return Array.from(new Set(
+    values
+      .map((value) => foldTriggerText(value))
+      .filter((value) => value && value !== "default" && !ownNames.has(value))
+  ));
+}
+
 function escapeRegExp(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -419,6 +429,43 @@ function isAgentAddressed(config, text) {
   return false;
 }
 
+function isOtherAgentAddressed(config, text) {
+  const normalized = foldTriggerText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  const mentionNames = uniqueOtherAgentMentionNames(config);
+  if (mentionNames.length === 0) {
+    return false;
+  }
+
+  for (const name of mentionNames) {
+    const mention = escapeRegExp(name);
+    const startsAddressed = new RegExp(`^@?${mention}\\b(?:\\s|\\s*[-:,]|$)`, "u").test(normalized);
+    if (startsAddressed) {
+      return true;
+    }
+
+    const routedToAgent = new RegExp(`\\b(?:fuer|fur|for|an|to)\\s+@?${mention}\\b`, "u").test(normalized);
+    if (routedToAgent) {
+      return true;
+    }
+
+    const briefDirective = new RegExp(`\\bbrief\\b[\\s\\S]{0,60}\\b@?${mention}\\b|\\b@?${mention}\\b[\\s\\S]{0,60}\\bbrief\\b`, "u").test(normalized);
+    if (briefDirective) {
+      return true;
+    }
+
+    const workDirective = new RegExp(`\\b@?${mention}\\b[\\s\\S]{0,80}\\b(?:bitte|please|weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|debugge|fix|patch|setz|starte|antwort|melde|uebersetz|ubersetz|translate)\\b|\\b(?:weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|debugge|fix|patch|setz|starte|antwort|melde|uebersetz|ubersetz|translate)\\b[\\s\\S]{0,80}\\b@?${mention}\\b`, "u").test(normalized);
+    if (workDirective) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function classifyInboundRelevance(config, inbound) {
   if (looksLikeEscalation(inbound.text)) {
     return "escalation";
@@ -430,6 +477,15 @@ function classifyInboundRelevance(config, inbound) {
 
   const text = String(inbound.text || "");
   if (!looksLikeStatusBroadcast(text) && isAgentAddressed(config, text)) {
+    return "direct";
+  }
+
+  if (!looksLikeStatusBroadcast(text) && isOtherAgentAddressed(config, text)) {
+    return "ambient";
+  }
+
+  const allowedUserIds = Array.isArray(config.allowedChatIds) ? config.allowedChatIds : [];
+  if (!inbound.senderIsBot && allowedUserIds.includes(String(inbound.userId || ""))) {
     return "direct";
   }
 
@@ -1594,7 +1650,7 @@ function promoteVisibleQueuedEntry(config, state, threadId, message) {
   return true;
 }
 
-async function resolveActiveThreadId(config, state, preferredThreadId) {
+async function resolveActiveThreadId(config, state, preferredThreadId, options = {}) {
   const fallbackThreadId = String(preferredThreadId || config.currentThreadId || state.currentThreadId || "").trim();
   if (!config.appServerWsUrl) {
     return fallbackThreadId;
@@ -1613,7 +1669,7 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
     const runtimeOwner = getRuntimeOwner(config);
     const runtimeThreadId = String(runtimeOwner?.runtime?.thread_id || "").trim();
     const pinnedThreadId = String(preferredThreadId || config.currentThreadId || runtimeThreadId || "").trim();
-    if (pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
+    if (options.forcePreferred && pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
       if (state.currentThreadId !== pinnedThreadId) {
         state.currentThreadId = pinnedThreadId;
         saveStateForConfig(config, state);
@@ -2030,13 +2086,16 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
+  const explicitThreadId = String(threadId || "").trim();
   const preferredThreadId = (
     threadId
     || (useAppServer ? config.currentThreadId : state.currentThreadId)
     || (useAppServer ? state.currentThreadId : config.currentThreadId)
     || ""
   ).trim();
-  const resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId);
+  const resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId, {
+    forcePreferred: Boolean(explicitThreadId)
+  });
   if (!resolvedThreadId) {
     throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
   }

@@ -743,7 +743,31 @@ if ($useRemoteAppServer) {
       }
       if ($loadedIds.Count -gt 0) {
         $activeThreadId = [string]$loadedIds[$loadedIds.Count - 1]
-        Write-DebugStage -Path $debugLogPath -Message ("LOADED_THREAD_PICKED thread_id=" + $activeThreadId + " count=" + $loadedIds.Count)
+        $bestThreadScore = [double]::NegativeInfinity
+        foreach ($candidate in $loadedIds) {
+          $candidateThreadId = [string]$candidate
+          if ([string]::IsNullOrWhiteSpace($candidateThreadId)) {
+            continue
+          }
+          $threadScore = 0.0
+          try {
+            $candidateInfo = Invoke-NodeJsonWithRetry -NodeArgs @($bootstrapScript, "read-thread", "--ws-url", $telegramAppServerWsUrl, "--thread-id", $candidateThreadId) -Attempts 1 -DelayMs 0
+            $thread = $candidateInfo.response.result.thread
+            if ($null -ne $thread -and $null -ne $thread.createdAt) {
+              $threadScore = [double]$thread.createdAt
+              if ($threadScore -gt 0 -and $threadScore -lt 1000000000000) {
+                $threadScore = $threadScore * 1000
+              }
+            }
+          } catch {
+            $threadScore = 0.0
+          }
+          if ($threadScore -ge $bestThreadScore) {
+            $bestThreadScore = $threadScore
+            $activeThreadId = $candidateThreadId
+          }
+        }
+        Write-DebugStage -Path $debugLogPath -Message ("LOADED_THREAD_PICKED thread_id=" + $activeThreadId + " count=" + $loadedIds.Count + " score=" + $bestThreadScore)
         $stateEnv = Read-DotEnvFile -Path $envFilePath
         $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = $activeThreadId
         Write-DotEnvFile -Path $envFilePath -Values $stateEnv

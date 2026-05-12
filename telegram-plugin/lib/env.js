@@ -52,6 +52,11 @@ export function loadConfig() {
     || env.BLUN_TELEGRAM_AGENT_NAME
     || ""
   );
+  const otherAgentNames = parseMentionNames(
+    env.BLUN_TELEGRAM_OTHER_AGENT_NAMES
+    || env.BLUN_CODEX_OTHER_AGENTS
+    || ""
+  );
   return {
     paths,
     agentName: env.BLUN_TELEGRAM_AGENT_NAME?.trim() || env.TELEGRAM_AGENT_NAME?.trim() || "default",
@@ -60,6 +65,7 @@ export function loadConfig() {
     allowedChatId: allowedChatIds[0] || "",
     allowedChatIds,
     mentionNames,
+    otherAgentNames,
     codexBin: env.BLUN_TELEGRAM_CODEX_BIN?.trim() || "codex",
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
