@@ -999,12 +999,50 @@ function buildProgressFallbackText(entry) {
   const chatType = String(entry?.chatType || "").toLowerCase();
   const user = String(entry?.user || "").trim();
   if (chatType === "private") {
-    return "Ich bin dran. Ich schreibe dir hier, sobald ich den naechsten konkreten Stand habe.";
+    return "Ich arbeite noch daran und melde den naechsten konkreten Stand hier.";
   }
   if (user) {
-    return `Alles klar ${user}, ich bin dran und schreibe hier den naechsten konkreten Stand.`;
+    return `${user}, ich arbeite noch daran und melde den naechsten konkreten Stand hier.`;
   }
-  return "Ich bin dran und schreibe hier den naechsten konkreten Stand.";
+  return "Ich arbeite noch daran und melde den naechsten konkreten Stand hier.";
+}
+
+function hasRecentSessionWrite(entry, sessionPath, activeWindowMs = 15000) {
+  if (!entry?.createdAt || !sessionPath || !existsSync(sessionPath)) {
+    return false;
+  }
+  try {
+    const modifiedAt = statSync(sessionPath).mtimeMs;
+    const createdAt = Date.parse(entry.createdAt);
+    if (!Number.isFinite(createdAt) || modifiedAt < createdAt) {
+      return false;
+    }
+    return Date.now() - modifiedAt <= activeWindowMs;
+  } catch {
+    return false;
+  }
+}
+
+function shouldSendFallbackProgress(config, entry, sessionPath) {
+  if (!entry || entry.senderIsBot) {
+    return false;
+  }
+  const fallbackMs = Math.max(Number(config.progressFallbackMs || 0), 0);
+  if (fallbackMs <= 0 || isoAgeMs(entry.createdAt) < fallbackMs) {
+    return false;
+  }
+
+  const intent = String(entry.intent || "").trim().toLowerCase();
+  const relevance = String(entry.relevance || "").trim().toLowerCase();
+  const sourceText = entry.sourceText || entry.text || "";
+  const looksLikeWork = intent === "continue_nudge"
+    || relevance === "escalation"
+    || looksLikeWorkContextText(sourceText);
+  if (!looksLikeWork) {
+    return false;
+  }
+
+  return hasRecentSessionWrite(entry, sessionPath);
 }
 
 function shouldSendProgressUpgrade(entry, progress) {
@@ -2099,7 +2137,7 @@ export async function relayRepliesOnce() {
       }
     }
 
-    if (!entry.progressSentAt && isoAgeMs(entry.createdAt) >= 8000) {
+    if (!entry.progressSentAt && shouldSendFallbackProgress(config, entry, entry.sessionPath)) {
       const fallbackText = buildProgressFallbackText(entry);
       const outboundProgress = await sendOutboundChunks(config, state, {
         chatId: entry.chatId,

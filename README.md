@@ -111,6 +111,8 @@ blun-codex telegram-status
 
 Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, zeigt das Telegram-Fenster oben im Titel einen ruhigen Queue-Hinweis wie `Q:2 D:1 G:1 | ...`. So sieht man, dass etwas wartet, ohne dass der aktive Lauf unterbrochen wird.
 
+Der automatische Progress-Hinweis ist bewusst defensiv: er erscheint nur bei echten Arbeits-/Weiter-Signalen, nicht bei normalem Smalltalk oder wenn die sichtbare Session stillsteht.
+
 Doctor:
 
 ```powershell
