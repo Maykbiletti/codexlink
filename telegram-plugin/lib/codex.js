@@ -104,7 +104,7 @@ function normalizeAddressText(value) {
     .trim();
 }
 
-function isAddressOnlyPing(config, text) {
+export function isAddressOnlyPing(config, text) {
   const normalizedText = normalizeAddressText(text);
   if (!normalizedText || normalizedText.includes(" ")) {
     return false;

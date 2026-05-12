@@ -2,7 +2,7 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rea
 import { join } from "node:path";
 import { listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { loadConfig } from "./env.js";
-import { injectIntoThread } from "./codex.js";
+import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
 import { getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
 
@@ -2083,6 +2083,41 @@ export async function injectNext(threadId, options = {}) {
       ok: true,
       status: auto ? "deferred" : "empty",
       reason: auto ? "no_eligible_message" : undefined
+    };
+  }
+
+  if (isAddressOnlyPing(config, next.text) && !looksLikeBotSender(next)) {
+    next.status = "delivered";
+    next.deliveredAt = nowIso();
+    next.threadId = null;
+    next.turnId = null;
+    next.responsePreview = "plugin_ping_ack";
+    next.stderr = null;
+    next.stdout = null;
+    markMatchingQueueEntriesInPlace(state, next, {
+      status: next.status,
+      deliveredAt: next.deliveredAt,
+      threadId: next.threadId,
+      turnId: next.turnId,
+      responsePreview: next.responsePreview,
+      stderr: next.stderr,
+      stdout: next.stdout
+    });
+    appendLog(config.paths.activityFile, `PING_ACK chat=${next.chatId} message=${next.messageId}`);
+    await sendOutboundChunks(config, state, {
+      chatId: next.chatId,
+      text: "Ja, ich bin da.",
+      replyToMessageId: next.messageId,
+      telegramThreadId: next.telegramThreadId,
+      source: "ping_ack"
+    });
+    const latestState = loadState(config);
+    saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+    return {
+      ok: true,
+      status: "delivered",
+      reason: "ping_ack",
+      message: next
     };
   }
 
