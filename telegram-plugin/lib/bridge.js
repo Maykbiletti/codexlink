@@ -1494,6 +1494,14 @@ function getRuntimeOwner(config) {
   };
 }
 
+function normalizeThreadTimestampMs(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+  return numeric > 100000000000 ? numeric : numeric * 1000;
+}
+
 function buildHistoryText(message) {
   const text = String(message.text || "").trim();
   const chatType = String(message.chatType || "");
@@ -1626,9 +1634,14 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
           threadId: candidateThreadId,
           timeoutMs: 5000
         });
-        const sessionPath = String(readResult?.response?.result?.thread?.path || "").trim();
+        const thread = readResult?.response?.result?.thread || {};
+        const createdAtMs = normalizeThreadTimestampMs(thread.createdAt);
+        if (createdAtMs > 0) {
+          score = createdAtMs;
+        }
+        const sessionPath = String(thread.path || "").trim();
         if (sessionPath && existsSync(sessionPath)) {
-          score = statSync(sessionPath).mtimeMs;
+          score = Math.max(score, statSync(sessionPath).birthtimeMs || 0);
         }
       } catch {
         score = 0;
