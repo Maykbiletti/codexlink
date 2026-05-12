@@ -68,6 +68,7 @@ export function loadConfig() {
     ambientQueueTtlMs: Number.parseInt(env.BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS || "600000", 10) || 600000,
     pendingReplyTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS || "1800000", 10) || 1800000,
     progressFallbackMs: Number.parseInt(env.BLUN_TELEGRAM_PROGRESS_FALLBACK_MS || "20000", 10) || 20000,
+    queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
     model: env.BLUN_CODEX_MODEL?.trim() || "",

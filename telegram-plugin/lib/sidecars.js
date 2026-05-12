@@ -73,6 +73,7 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_RESUME_TIMEOUT_MS: String(config.resumeTimeoutMs || 15000),
     BLUN_TELEGRAM_IDLE_COOLDOWN_MS: String(config.idleCooldownMs || 15000),
     BLUN_TELEGRAM_PROGRESS_FALLBACK_MS: String(config.progressFallbackMs || 20000),
+    BLUN_TELEGRAM_QUEUE_NOTICE: config.queueNoticeEnabled ? "1" : "0",
     BLUN_TELEGRAM_DISPATCH_MODE: config.dispatchMode || "deferred",
     BLUN_TELEGRAM_PLUGIN_MODE: config.pluginMode || "plugin",
     BLUN_CODEX_MODEL: config.model || "",

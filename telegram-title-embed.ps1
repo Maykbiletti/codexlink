@@ -24,6 +24,7 @@ public static class BlunEmbeddedQueueTitleWatcher
     private static Timer _timer;
     private static string _stateFile;
     private static string _baseTitle;
+    private static string _lastTitle = "";
     private static long _ambientTtlMs = 600000;
     private static string _lastNotice = "";
     private static string _lastUiNotice = "";
@@ -37,6 +38,7 @@ public static class BlunEmbeddedQueueTitleWatcher
         {
             _stateFile = stateFile ?? "";
             _baseTitle = baseTitle ?? "";
+            _lastTitle = "";
             _ambientTtlMs = ambientTtlMs > 0 ? ambientTtlMs : 600000;
             _logFile = logFile ?? "";
             _lastNotice = "";
@@ -73,10 +75,16 @@ public static class BlunEmbeddedQueueTitleWatcher
 
     private static void TrySetTitle(string value)
     {
+        var normalizedTitle = value ?? "";
+        if (string.Equals(normalizedTitle, _lastTitle, StringComparison.Ordinal))
+        {
+            return;
+        }
         try
         {
-            Console.Title = value ?? "";
-            WriteLog("TITLE " + Normalize(value, 180));
+            Console.Title = normalizedTitle;
+            _lastTitle = normalizedTitle;
+            WriteLog("TITLE " + Normalize(normalizedTitle, 180));
         }
         catch
         {
@@ -94,17 +102,8 @@ public static class BlunEmbeddedQueueTitleWatcher
 
         try
         {
-            if (string.IsNullOrWhiteSpace(normalized))
-            {
-                if (!string.IsNullOrWhiteSpace(_lastNotice))
-                {
-                    Console.WriteLine("[CodexLink Queue] clear");
-                }
-            }
-            else
-            {
-                Console.WriteLine("[CodexLink Queue] " + normalized);
-            }
+            // Do not write background queue notices into the interactive Codex
+            // terminal. It corrupts the prompt/input area on Windows terminals.
         }
         catch
         {
@@ -132,16 +131,7 @@ public static class BlunEmbeddedQueueTitleWatcher
 
         try
         {
-            string prefix = "[CodexLink]";
-            if (string.Equals(normalizedKind, "outbound", StringComparison.Ordinal))
-            {
-                prefix = "[CodexLink Reply]";
-            }
-            else if (string.Equals(normalizedKind, "inbound", StringComparison.Ordinal))
-            {
-                prefix = "[CodexLink]";
-            }
-            Console.WriteLine(prefix + " " + normalized);
+            // Kept silent for the same reason as queue notices above.
         }
         catch
         {

@@ -1008,7 +1008,10 @@ function splitTelegramText(text, maxLength = 3500) {
   return chunks.filter(Boolean);
 }
 
-function shouldSendDeferredReceipt(entry, reason) {
+function shouldSendDeferredReceipt(config, entry, reason) {
+  if (!config?.queueNoticeEnabled) {
+    return false;
+  }
   if (!entry) {
     return false;
   }
@@ -1254,7 +1257,7 @@ function findRecentOutboundForTurn(config, chatId, source, sourceTurnId, text = 
 }
 
 async function maybeSendDeferredReceipt(config, state, entry, reason) {
-  if (!shouldSendDeferredReceipt(entry, reason)) {
+  if (!shouldSendDeferredReceipt(config, entry, reason)) {
     return false;
   }
 

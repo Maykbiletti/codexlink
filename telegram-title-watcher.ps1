@@ -233,16 +233,8 @@ function Update-ConsoleTitle {
       return $false
     }
     $updated = [CodexLink.NativeMethods]::SetConsoleTitle($Title)
-    $oscUpdated = $false
-    try {
-      [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-      [Console]::Write("`e]0;{0}`a" -f $Title)
-      $oscUpdated = $true
-    } catch {
-      $oscUpdated = $false
-    }
     [void][CodexLink.NativeMethods]::FreeConsole()
-    return ($updated -or $oscUpdated)
+    return $updated
   } catch {
     return $false
   }
@@ -250,6 +242,9 @@ function Update-ConsoleTitle {
 
 function Write-ConsoleNotice {
   param([string]$Notice)
+  if ($env:BLUN_TELEGRAM_CONSOLE_NOTICES -ne "1") {
+    return $false
+  }
   try {
     [void][CodexLink.NativeMethods]::FreeConsole()
     $targetPid = Get-EffectiveAttachPid
@@ -278,6 +273,9 @@ function Write-ConsoleUiNotice {
     [string]$Kind,
     [string]$Notice
   )
+  if ($env:BLUN_TELEGRAM_CONSOLE_NOTICES -ne "1") {
+    return $false
+  }
   try {
     [void][CodexLink.NativeMethods]::FreeConsole()
     $targetPid = Get-EffectiveAttachPid
