@@ -532,6 +532,17 @@ if ($useRemoteAppServer) {
     $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = ""
     Write-DotEnvFile -Path $envFilePath -Values $stateEnv
     Write-DebugStage -Path $debugLogPath -Message ("ENV_WRITTEN ws_url=" + $telegramAppServerWsUrl + " env_file=" + $envFilePath)
+    $telegramStateFile = Join-Path $telegramStateDir "state.json"
+    $telegramState = Try-GetJsonFile -Path $telegramStateFile
+    if ($null -ne $telegramState) {
+      if ($telegramState.PSObject.Properties.Name.Contains("currentThreadId")) {
+        $telegramState.currentThreadId = ""
+      } else {
+        $telegramState | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue ""
+      }
+      Write-TextFileWithRetry -Path $telegramStateFile -Content ($telegramState | ConvertTo-Json -Depth 10)
+      Write-DebugStage -Path $debugLogPath -Message "STATE_THREAD_CLEARED"
+    }
 
     Set-EnvVar "BLUN_TELEGRAM_APP_SERVER_WS_URL" $telegramAppServerWsUrl
 
@@ -717,6 +728,17 @@ if ($useRemoteAppServer) {
         Write-DotEnvFile -Path $envFilePath -Values $stateEnv
         Set-EnvVar "BLUN_TELEGRAM_THREAD_ID" $activeThreadId
         Write-DebugStage -Path $debugLogPath -Message "ENV_THREAD_WRITTEN"
+
+        $telegramState = Try-GetJsonFile -Path (Join-Path $telegramStateDir "state.json")
+        if ($null -ne $telegramState) {
+          if ($telegramState.PSObject.Properties.Name.Contains("currentThreadId")) {
+            $telegramState.currentThreadId = $activeThreadId
+          } else {
+            $telegramState | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue $activeThreadId
+          }
+          Write-TextFileWithRetry -Path (Join-Path $telegramStateDir "state.json") -Content ($telegramState | ConvertTo-Json -Depth 10)
+          Write-DebugStage -Path $debugLogPath -Message "STATE_THREAD_WRITTEN"
+        }
 
         $currentRuntime["thread_id"] = $activeThreadId
         Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 6)

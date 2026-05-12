@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { injectNext } from "./lib/bridge.js";
+import { isCurrentSidecarPid } from "./lib/singleton.js";
 
 const intervalMs = Number.parseInt(process.env.BLUN_TELEGRAM_INJECT_INTERVAL_MS || "1500", 10) || 1500;
 let stopping = false;
@@ -18,6 +19,9 @@ process.on("SIGTERM", () => {
 
 async function main() {
   while (!stopping) {
+    if (!isCurrentSidecarPid("dispatcher")) {
+      break;
+    }
     try {
       const result = await injectNext("", { auto: true });
       if (!["empty", "deferred"].includes(result.status)) {

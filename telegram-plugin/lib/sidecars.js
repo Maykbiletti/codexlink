@@ -1,7 +1,7 @@
 import { existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { appendLog } from "./storage.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +30,14 @@ function isPidAlive(pid) {
 function stopPid(pid) {
   if (!isPidAlive(pid)) {
     return false;
+  }
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
   }
   try {
     process.kill(pid, "SIGTERM");

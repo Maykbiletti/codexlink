@@ -124,7 +124,7 @@ function Get-OpenPendingReplies {
   if ($null -eq $State -or $null -eq $State.pendingReplies) {
     return @()
   }
-  return @($State.pendingReplies | Where-Object { -not $_.sentAt -and @("error","expired","ignored_bot","suppressed_ack","superseded","sent") -notcontains [string]$_.status })
+  return @($State.pendingReplies | Where-Object { -not $_.sentAt -and @("error","expired","ignored_bot","suppressed_ack","superseded","sent","stale_thread") -notcontains [string]$_.status })
 }
 
 function Get-IsoAgeMs {

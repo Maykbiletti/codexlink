@@ -318,7 +318,7 @@ public static class BlunEmbeddedQueueTitleWatcher
         {
             return false;
         }
-        if (status == "sent" || status == "suppressed_ack" || status == "error" || status == "ignored_bot" || status == "superseded" || status == "expired")
+        if (status == "sent" || status == "suppressed_ack" || status == "error" || status == "ignored_bot" || status == "superseded" || status == "expired" || status == "stale_thread")
         {
             return false;
         }

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { loadConfig } from "./env.js";
 import { injectIntoThread } from "./codex.js";
-import { getUpdates, sendMessage } from "./telegram.js";
+import { getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
 
 function loadState(config) {
@@ -337,7 +337,10 @@ function escapeRegExp(value) {
 
 function looksLikeStatusBroadcast(text) {
   const normalized = foldTriggerText(text);
-  return /^status(?:\s|$|[~:.-])/u.test(normalized);
+  if (/^status(?:\s|$|[~:.-])/u.test(normalized)) {
+    return true;
+  }
+  return /^[a-z][a-z0-9_-]{1,24}\s+\d{1,2}:\d{2}\b/u.test(normalized);
 }
 
 function isAgentAddressed(config, text) {
@@ -463,7 +466,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["error", "ignored_bot", "superseded", "expired"].includes(String(entry.status || ""));
+    && !["error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -476,10 +479,33 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "error", "ignored_bot", "superseded"].includes(status)) {
+  if (["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(status)) {
     return false;
   }
   return !hasResponseMessageIds(entry);
+}
+
+function closeStaleThreadPendingRepliesInPlace(pendingReplies, activeThreadId) {
+  const threadId = String(activeThreadId || "").trim();
+  if (!threadId) {
+    return 0;
+  }
+  const replies = Array.isArray(pendingReplies) ? pendingReplies : [];
+  let closed = 0;
+  for (const entry of replies) {
+    if (!isNonTerminalPendingReply(entry)) {
+      continue;
+    }
+    const entryThreadId = String(entry.threadId || "").trim();
+    if (!entryThreadId || entryThreadId === threadId) {
+      continue;
+    }
+    entry.status = "stale_thread";
+    entry.sentAt = nowIso();
+    entry.responsePreview = entry.responsePreview || `[stale pending reply from previous thread ${entryThreadId}]`;
+    closed += 1;
+  }
+  return closed;
 }
 
 function supersedeOlderPendingRepliesInPlace(pendingReplies) {
@@ -822,6 +848,22 @@ function syncRecordFromQueue(record, queue) {
   return match ? mergeQueueEntry(record, match) : record;
 }
 
+function markMatchingQueueEntriesInPlace(state, source, updates) {
+  const key = queueKey(source || {});
+  if (!key || key === ":") {
+    return 0;
+  }
+  let changed = 0;
+  for (const entry of state.queue || []) {
+    if (queueKey(entry) !== key) {
+      continue;
+    }
+    Object.assign(entry, updates);
+    changed += 1;
+  }
+  return changed;
+}
+
 function mergeStateSnapshots(currentState, incomingState) {
   const merged = {
     ...currentState,
@@ -980,6 +1022,15 @@ function shouldSendDeferredReceipt(entry, reason) {
     return false;
   }
   if (!["pending_reply", "session_active"].includes(String(reason || ""))) {
+    return false;
+  }
+  const relevance = String(entry.relevance || "").toLowerCase();
+  const chatType = String(entry.chatType || "").toLowerCase();
+  return chatType === "private" || relevance === "direct" || relevance === "lane";
+}
+
+function shouldSendTypingIndicator(entry) {
+  if (!entry || entry.senderIsBot) {
     return false;
   }
   const relevance = String(entry.relevance || "").toLowerCase();
@@ -1773,6 +1824,18 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED_DUPLICATE chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient") {
+      ignored += 1;
+      appendJsonl(config.paths.inboxFile, { ...inbound, status: "ignored_ambient" });
+      appendLog(config.paths.activityFile, `IGNORED_AMBIENT chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+      continue;
+    }
+    if (shouldSendTypingIndicator(inbound)) {
+      void sendChatAction(config, {
+        chatId: inbound.chatId,
+        telegramThreadId: inbound.telegramThreadId
+      }).catch(() => {});
+    }
     state.queue.push(inbound);
     state.lastInbound = inbound;
     if (shouldPublishInboundUiNotice(inbound)) {
@@ -1906,6 +1969,11 @@ export async function injectNext(threadId, options = {}) {
   if (!resolvedThreadId) {
     throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
   }
+  const staleThreadPendingReplies = closeStaleThreadPendingRepliesInPlace(state.pendingReplies || [], resolvedThreadId);
+  if (staleThreadPendingReplies > 0) {
+    appendLog(config.paths.activityFile, `PENDING_REPLY_STALE_THREAD count=${staleThreadPendingReplies} active_thread=${resolvedThreadId}`);
+    saveStateForConfig(config, state);
+  }
 
   const next = selectNextQueuedEntry(state.queue || [], {
     auto,
@@ -2004,6 +2072,15 @@ export async function injectNext(threadId, options = {}) {
   next.responsePreview = result.responseText.slice(0, 400);
   next.stderr = result.stderr.slice(0, 400);
   next.stdout = result.stdout.slice(0, 400);
+  markMatchingQueueEntriesInPlace(state, next, {
+    status: next.status,
+    deliveredAt: next.deliveredAt,
+    threadId: next.threadId,
+    turnId: next.turnId,
+    responsePreview: next.responsePreview,
+    stderr: next.stderr,
+    stdout: next.stdout
+  });
   if (useAppServer && result.ok) {
     if (!shouldTrackPendingReply(next)) {
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
@@ -2234,6 +2311,13 @@ export async function relayRepliesOnce() {
     entry.lastSignalAt = entry.sentAt;
     entry.responsePreview = match.message.slice(0, 400);
     entry.responseMessageIds = outboundResult.messageIds;
+    markMatchingQueueEntriesInPlace(state, entry, {
+      status: "delivered",
+      deliveredAt: entry.sentAt,
+      threadId: entry.threadId,
+      turnId: entry.turnId,
+      responsePreview: entry.responsePreview
+    });
     usedTurnIds.add(match.turnId);
     appendLog(config.paths.activityFile, `REPLY_SENT thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId} outbound=${outboundResult.messageIds.join(",")}`);
     delivered += 1;

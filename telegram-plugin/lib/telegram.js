@@ -35,3 +35,11 @@ export async function sendMessage(config, { chatId, text, replyToMessageId, tele
     ...(telegramThreadId ? { message_thread_id: Number(telegramThreadId) } : {})
   });
 }
+
+export async function sendChatAction(config, { chatId, telegramThreadId, action = "typing" }) {
+  return telegramRequest(config, "sendChatAction", {
+    chat_id: chatId,
+    action,
+    ...(telegramThreadId ? { message_thread_id: Number(telegramThreadId) } : {})
+  });
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { relayRepliesOnce } from "./lib/bridge.js";
+import { isCurrentSidecarPid } from "./lib/singleton.js";
 
 const intervalMs = Number.parseInt(process.env.BLUN_TELEGRAM_REPLY_INTERVAL_MS || "1500", 10) || 1500;
 let stopping = false;
@@ -18,6 +19,9 @@ process.on("SIGTERM", () => {
 
 async function main() {
   while (!stopping) {
+    if (!isCurrentSidecarPid("responder")) {
+      break;
+    }
     try {
       const result = await relayRepliesOnce();
       if (result.status !== "empty" && result.delivered > 0) {
