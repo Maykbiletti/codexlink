@@ -2,7 +2,7 @@
 import { injectNext } from "./lib/bridge.js";
 import { isCurrentSidecarPid } from "./lib/singleton.js";
 
-const intervalMs = Number.parseInt(process.env.BLUN_TELEGRAM_INJECT_INTERVAL_MS || "1500", 10) || 1500;
+const intervalMs = Number.parseInt(process.env.BLUN_TELEGRAM_INJECT_INTERVAL_MS || "700", 10) || 700;
 let stopping = false;
 
 function sleep(ms) {

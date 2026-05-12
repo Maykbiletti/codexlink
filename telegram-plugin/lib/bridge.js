@@ -470,10 +470,6 @@ function isOtherAgentAddressed(config, text) {
 }
 
 function classifyInboundRelevance(config, inbound) {
-  if (String(inbound.chatType || "") === "private") {
-    return "direct";
-  }
-
   const text = String(inbound.text || "");
   const isStatusBroadcast = looksLikeStatusBroadcast(text);
 
@@ -483,6 +479,10 @@ function classifyInboundRelevance(config, inbound) {
 
   if (!isStatusBroadcast && isOtherAgentAddressed(config, text)) {
     return "ambient";
+  }
+
+  if (String(inbound.chatType || "") === "private") {
+    return "direct";
   }
 
   if (inbound.senderIsBot || isStatusBroadcast) {

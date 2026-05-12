@@ -112,6 +112,8 @@ Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, blei
 
 Der automatische Progress-Hinweis ist bewusst defensiv: standardmaessig sendet Telegram nur finale Antworten plus bei laengeren echten Arbeitslaeufen einen neutralen Status. Interne Commentary-Texte werden nicht als zweite fachliche Antwort gespiegelt. Wer das alte Verhalten will, kann `BLUN_TELEGRAM_PROGRESS_RELAY=commentary` setzen; mit `off` werden Progress-Hinweise ganz deaktiviert.
 
+Wichtig bei mehreren Profilen: ein Telegram-Bot-Token darf nicht gleichzeitig von alten oder fremden Pollern abgefragt werden. Sonst meldet Telegram `Conflict: terminated by other getUpdates request`, und Nachrichten koennen verspaetet oder gar nicht in der sichtbaren CLI landen. Aktuelle Versionen pollen non-blocking und schneller; wenn trotzdem Conflicts auftauchen, alle alten `blun-codex telegram-plugin` Fenster fuer denselben Bot schliessen und genau eine aktuelle Session starten.
+
 Wenn mehrere Agents denselben Gruppenchat nutzen, kann ein Agent andere Agent-Namen als Fremdroute markieren. Dann werden Owner-Nachrichten wie `Frida mach weiter` nicht in Ottos Session gezogen:
 
 ```text

@@ -19,9 +19,10 @@ async function telegramRequest(config, method, body) {
 }
 
 export async function getUpdates(config, offset) {
+  const timeout = Math.max(Number.parseInt(process.env.BLUN_TELEGRAM_GETUPDATES_TIMEOUT || "0", 10) || 0, 0);
   return telegramRequest(config, "getUpdates", {
     offset,
-    timeout: 1,
+    timeout,
     allowed_updates: ["message"]
   });
 }
