@@ -1695,6 +1695,15 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
         if (createdAtMs > 0) {
           score = createdAtMs;
         }
+        const source = String(thread.source || "").toLowerCase();
+        const statusType = String(thread.status?.type || "").toLowerCase();
+        if (source === "cli" && statusType === "active") {
+          score += 1000000000000000;
+        } else if (statusType === "active") {
+          score += 900000000000000;
+        } else if (source === "cli") {
+          score += 800000000000000;
+        }
         const sessionPath = String(thread.path || "").trim();
         if (sessionPath && existsSync(sessionPath)) {
           score = Math.max(score, statSync(sessionPath).birthtimeMs || 0);

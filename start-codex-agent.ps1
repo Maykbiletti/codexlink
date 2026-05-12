@@ -759,6 +759,21 @@ if ($useRemoteAppServer) {
                 $threadScore = $threadScore * 1000
               }
             }
+            $threadSource = ""
+            $threadStatusType = ""
+            if ($null -ne $thread -and $null -ne $thread.source) {
+              $threadSource = ([string]$thread.source).ToLowerInvariant()
+            }
+            if ($null -ne $thread -and $null -ne $thread.status -and $null -ne $thread.status.type) {
+              $threadStatusType = ([string]$thread.status.type).ToLowerInvariant()
+            }
+            if ($threadSource -eq "cli" -and $threadStatusType -eq "active") {
+              $threadScore += 1000000000000000
+            } elseif ($threadStatusType -eq "active") {
+              $threadScore += 900000000000000
+            } elseif ($threadSource -eq "cli") {
+              $threadScore += 800000000000000
+            }
           } catch {
             $threadScore = 0.0
           }
