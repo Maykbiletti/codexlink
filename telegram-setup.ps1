@@ -72,6 +72,140 @@ function Test-AllowedChatIdsFormat {
   return $true
 }
 
+function Invoke-TelegramSetupRequest {
+  param(
+    [string]$Token,
+    [string]$Method,
+    [hashtable]$Body = @{}
+  )
+
+  $uri = "https://api.telegram.org/bot$Token/$Method"
+  try {
+    return Invoke-RestMethod -Method Post -Uri $uri -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 10) -TimeoutSec 35
+  } catch {
+    $message = $_.Exception.Message
+    if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+      $message = $_.ErrorDetails.Message
+    }
+    throw "Telegram $Method fehlgeschlagen: $message"
+  }
+}
+
+function Get-TelegramBotInfo {
+  param([string]$Token)
+  $response = Invoke-TelegramSetupRequest -Token $Token -Method "getMe"
+  if (-not $response.ok) {
+    throw "Telegram Bot Token wurde von Telegram abgelehnt."
+  }
+  return $response.result
+}
+
+function Get-TelegramUpdatesForSetup {
+  param(
+    [string]$Token,
+    [long]$Offset = 0,
+    [int]$TimeoutSeconds = 0
+  )
+
+  $body = @{
+    timeout = $TimeoutSeconds
+    limit = 20
+    allowed_updates = @("message", "edited_message", "channel_post")
+  }
+  if ($Offset -gt 0) {
+    $body["offset"] = $Offset
+  }
+  $response = Invoke-TelegramSetupRequest -Token $Token -Method "getUpdates" -Body $body
+  if (-not $response.ok) {
+    return @()
+  }
+  return @($response.result)
+}
+
+function Get-TelegramUpdateId {
+  param($Update)
+  try {
+    return [long]$Update.update_id
+  } catch {
+    return 0
+  }
+}
+
+function Get-TelegramChatFromUpdate {
+  param($Update)
+
+  $message = $null
+  if ($Update.message) {
+    $message = $Update.message
+  } elseif ($Update.edited_message) {
+    $message = $Update.edited_message
+  } elseif ($Update.channel_post) {
+    $message = $Update.channel_post
+  }
+
+  if (-not $message -or -not $message.chat -or -not $message.chat.id) {
+    return $null
+  }
+
+  $chat = $message.chat
+  $title = ""
+  if ($chat.title) {
+    $title = [string]$chat.title
+  } elseif ($chat.username) {
+    $title = "@" + [string]$chat.username
+  } elseif ($chat.first_name -or $chat.last_name) {
+    $title = ((@($chat.first_name, $chat.last_name) | Where-Object { $_ }) -join " ")
+  }
+
+  return [ordered]@{
+    chat_id = [string]$chat.id
+    chat_type = [string]$chat.type
+    title = $title
+    update_id = Get-TelegramUpdateId -Update $Update
+  }
+}
+
+function Wait-TelegramPairingChat {
+  param(
+    [string]$Token,
+    $BotInfo,
+    [int]$TimeoutSeconds = 90
+  )
+
+  $baseline = Get-TelegramUpdatesForSetup -Token $Token -TimeoutSeconds 0
+  $offset = 0
+  foreach ($update in $baseline) {
+    $offset = [Math]::Max($offset, (Get-TelegramUpdateId -Update $update) + 1)
+  }
+
+  $botName = if ($BotInfo.username) { "@" + [string]$BotInfo.username } else { "deinen Bot" }
+  Write-Host ""
+  Write-Host "Telegram Pairing" -ForegroundColor Cyan
+  Write-Host "Oeffne Telegram und sende jetzt eine neue Nachricht an $botName." -ForegroundColor White
+  Write-Host "Fuer Gruppen: Bot in die Gruppe einladen und dort kurz '$botName connect' schreiben." -ForegroundColor DarkGray
+  Write-Host "Ich erkenne die Chat-ID automatisch. Du musst keine ID suchen." -ForegroundColor DarkGray
+  Write-Host ""
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    $remaining = [Math]::Max(1, [int]([Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)))
+    $pollTimeout = [Math]::Min(10, $remaining)
+    $updates = Get-TelegramUpdatesForSetup -Token $Token -Offset $offset -TimeoutSeconds $pollTimeout
+    foreach ($update in $updates) {
+      $updateId = Get-TelegramUpdateId -Update $update
+      if ($updateId -gt 0) {
+        $offset = [Math]::Max($offset, $updateId + 1)
+      }
+      $chat = Get-TelegramChatFromUpdate -Update $update
+      if ($chat -and $chat.chat_id) {
+        return $chat
+      }
+    }
+  }
+
+  return $null
+}
+
 function Prompt-RequiredValue {
   param(
     [string]$Prompt,
@@ -151,8 +285,9 @@ if (-not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)) {
 $needsToken = -not (Test-TelegramTokenFormat -Value $currentToken)
 $needsChatIds = -not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)
 $changed = $false
+$tokenWasPrompted = $false
 
-if ($EnsureConfigured -and -not $needsToken) {
+if ($EnsureConfigured -and -not $needsToken -and -not $needsChatIds) {
   $result = [ordered]@{
     ok = $true
     changed = $false
@@ -160,18 +295,13 @@ if ($EnsureConfigured -and -not $needsToken) {
     state_dir = $stateDir
     env_path = $envPath
     missing = @()
-    optional = @(
-      "allowed_chat_ids"
-    )
+    optional = @()
   }
   if ($Json) {
     $result | ConvertTo-Json -Depth 6
   } else {
     Write-Host "Telegram ist bereits eingerichtet fuer Profil '$profileAgent'." -ForegroundColor Green
     Write-Host "State-Ordner: $stateDir"
-    if ($needsChatIds) {
-      Write-Host "Hinweis: keine Chat-Allowlist gesetzt. Der Bot akzeptiert aktuell alle Chats, die er sehen kann." -ForegroundColor Yellow
-    }
   }
   exit 0
 }
@@ -201,7 +331,7 @@ if (-not $Json) {
   Write-Host ""
   Write-Host "Ich speichere die Telegram-Werte automatisch an die richtige lokale Stelle." -ForegroundColor DarkGray
   Write-Host "Du musst keine .env-Datei selbst suchen." -ForegroundColor DarkGray
-  Write-Host "Chat-ID-Allowlist ist optional und blockiert den Start nicht mehr." -ForegroundColor DarkGray
+  Write-Host "Die Chat-ID wird automatisch erkannt. Du musst sie nicht wissen." -ForegroundColor DarkGray
   Write-Host ""
 }
 
@@ -213,16 +343,36 @@ if ($needsToken) {
     -ErrorMessage "Bitte einen gueltigen Telegram Bot Token eingeben. Beispiel: 123456789:ABC..."
   $envValues["BLUN_TELEGRAM_BOT_TOKEN"] = $currentToken
   $changed = $true
+  $tokenWasPrompted = $true
 }
 
-if (-not $EnsureConfigured -and $needsChatIds) {
-  $currentAllowedChatIds = Prompt-RequiredValue `
-    -Prompt "Erlaubte Chat ID(s), komma-getrennt" `
-    -CurrentValue $currentAllowedChatIds `
-    -Validator { param($v) Test-AllowedChatIdsFormat -Value $v } `
-    -ErrorMessage "Bitte mindestens eine numerische Chat-ID eingeben. Mehrere IDs mit Komma trennen."
-  $envValues["BLUN_TELEGRAM_ALLOWED_CHAT_ID"] = (($currentAllowedChatIds -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ",")
-  $changed = $true
+if ($needsChatIds -and -not $Json) {
+  try {
+    $botInfo = Get-TelegramBotInfo -Token $currentToken
+    $shouldPair = $tokenWasPrompted -or (-not $EnsureConfigured)
+    if ($shouldPair) {
+      $pairedChat = Wait-TelegramPairingChat -Token $currentToken -BotInfo $botInfo -TimeoutSeconds 90
+      if ($pairedChat -and $pairedChat.chat_id) {
+        $currentAllowedChatIds = [string]$pairedChat.chat_id
+        $envValues["BLUN_TELEGRAM_ALLOWED_CHAT_ID"] = $currentAllowedChatIds
+        $envValues["BLUN_TELEGRAM_PAIRING_DONE"] = "1"
+        $changed = $true
+        $label = if ($pairedChat.title) { "$($pairedChat.title) ($($pairedChat.chat_type))" } else { $pairedChat.chat_type }
+        Write-Host "Gekoppelt: $label -> $currentAllowedChatIds" -ForegroundColor Green
+      } else {
+        $envValues["BLUN_TELEGRAM_PAIRING_DONE"] = "1"
+        Write-Host "Keine Telegram-Nachricht erkannt. Ich starte ohne Allowlist; du kannst spaeter erneut `blun-codex telegram-setup` ausfuehren." -ForegroundColor Yellow
+      }
+    } else {
+      Write-Host "Hinweis: keine Chat-Allowlist gesetzt. Der Bot akzeptiert aktuell alle Chats, die er sehen kann." -ForegroundColor Yellow
+    }
+  } catch {
+    if ($tokenWasPrompted) {
+      throw
+    }
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    Write-Host "Ich starte ohne Allowlist; du kannst spaeter erneut `blun-codex telegram-setup` ausfuehren." -ForegroundColor Yellow
+  }
 }
 
 $envValues["BLUN_TELEGRAM_AGENT_NAME"] = $profileAgent
