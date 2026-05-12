@@ -25,10 +25,10 @@ function compactInboundLabel(message) {
   const chatType = String(message.chatType || "").trim();
 
   if (group || chatType === "group" || chatType === "supergroup") {
-    return `${user} @ ${group || "Gruppe"}:`;
+    return `${user} @ ${group || "Gruppe"} schrieb:`;
   }
 
-  return `${user}:`;
+  return `${user} schrieb:`;
 }
 
 function normalizeWhitespace(text) {
@@ -94,6 +94,32 @@ function compactInboundText(message) {
   return text;
 }
 
+function normalizeAddressText(value) {
+  return repairMojibake(String(value || ""))
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/^@+/, "")
+    .replace(/[^\p{L}\p{N}_-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isAddressOnlyPing(config, text) {
+  const normalizedText = normalizeAddressText(text);
+  if (!normalizedText || normalizedText.includes(" ")) {
+    return false;
+  }
+
+  const names = [
+    ...(Array.isArray(config.mentionNames) ? config.mentionNames : []),
+    config.agentName
+  ]
+    .map((value) => normalizeAddressText(value))
+    .filter((value) => value && value !== "default");
+
+  return names.includes(normalizedText);
+}
+
 function buildPrompt(config, message) {
   const compactText = compactInboundText(message);
   const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
@@ -109,6 +135,13 @@ function buildPrompt(config, message) {
     header.push(
       "",
       "[Weiter-Signal: kein bloßes Ack senden. Nur antworten, wenn jetzt ein konkretes Ergebnis, Blocker oder eine Entscheidung sichtbar gemacht werden muss.]"
+    );
+  }
+
+  if (isAddressOnlyPing(config, compactText)) {
+    header.push(
+      "",
+      "[Ping: Der User prueft nur, ob du erreichbar bist. Antworte kurz, dass du da bist. Starte keine Suche und keinen Tool-Lauf.]"
     );
   }
 
