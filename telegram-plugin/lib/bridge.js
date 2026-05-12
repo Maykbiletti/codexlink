@@ -2003,6 +2003,20 @@ export async function injectNext(threadId, options = {}) {
       frontendHostPid: runtimeOwner.frontendHostPid || 0
     };
   }
+
+  const next = selectNextQueuedEntry(state.queue || [], {
+    auto,
+    dispatchMode: config.dispatchMode
+  });
+
+  if (!next) {
+    return {
+      ok: true,
+      status: auto ? "deferred" : "empty",
+      reason: auto ? "no_eligible_message" : undefined
+    };
+  }
+
   const preferredThreadId = (
     threadId
     || (useAppServer ? config.currentThreadId : state.currentThreadId)
@@ -2017,19 +2031,6 @@ export async function injectNext(threadId, options = {}) {
   if (staleThreadPendingReplies > 0) {
     appendLog(config.paths.activityFile, `PENDING_REPLY_STALE_THREAD count=${staleThreadPendingReplies} active_thread=${resolvedThreadId}`);
     saveStateForConfig(config, state);
-  }
-
-  const next = selectNextQueuedEntry(state.queue || [], {
-    auto,
-    dispatchMode: config.dispatchMode
-  });
-
-  if (!next) {
-    return {
-      ok: true,
-      status: auto ? "deferred" : "empty",
-      reason: auto ? "no_eligible_message" : undefined
-    };
   }
 
   const bypassDeferredGate = auto && (next.relevance === "escalation" || isFastDispatchEntry(next));

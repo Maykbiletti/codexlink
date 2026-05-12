@@ -1,20 +1,59 @@
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+
+function sleepSync(ms) {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
 
 export function nowIso() {
   return new Date().toISOString();
 }
 
 export function loadJson(path, fallback) {
-  try {
-    const raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
-    return JSON.parse(raw);
-  } catch {
-    return fallback;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      const raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
+      if (!raw.trim()) {
+        throw new Error("empty json file");
+      }
+      return JSON.parse(raw);
+    } catch {
+      if (attempt < 5) {
+        sleepSync(20 * (attempt + 1));
+      }
+    }
   }
+  return fallback;
 }
 
 export function saveJson(path, value) {
-  writeFileSync(path, JSON.stringify(value, null, 2), "utf8");
+  const text = JSON.stringify(value, null, 2);
+  const dir = dirname(path);
+  const base = basename(path);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const tempPath = join(dir, `.${base}.${process.pid}.${Date.now()}.${attempt}.tmp`);
+    try {
+      writeFileSync(tempPath, text, "utf8");
+      renameSync(tempPath, path);
+      return;
+    } catch (error) {
+      lastError = error;
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // Ignore cleanup failures for temp files.
+      }
+      if (attempt < 5) {
+        sleepSync(25 * (attempt + 1));
+      }
+    }
+  }
+
+  throw lastError || new Error(`Failed to save JSON file: ${path}`);
 }
 
 export function appendJsonl(path, value) {
