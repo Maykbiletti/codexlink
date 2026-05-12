@@ -131,7 +131,8 @@ public static class BlunEmbeddedQueueTitleWatcher
 
         try
         {
-            // Kept silent for the same reason as queue notices above.
+            Console.WriteLine("");
+            Console.WriteLine("[Telegram] " + normalized);
         }
         catch
         {
