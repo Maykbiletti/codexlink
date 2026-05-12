@@ -165,10 +165,17 @@ $nextQueued = @(
       @{ Expression = { [int]$_.messageId } } |
     Select-Object -First 1
 )
-$waitReason = if ($queued.Count -eq 0) {
+$nextPendingReply = @(
+  $pendingReplies |
+    Sort-Object `
+      @{ Expression = { [string]$_.createdAt } },
+      @{ Expression = { [int]$_.messageId } } |
+    Select-Object -First 1
+)
+$waitReason = if ($pendingReplies.Count -gt 0) {
+  "wartet auf Antwort"
+} elseif ($queued.Count -eq 0) {
   $null
-} elseif ($pendingReplies.Count -gt 0) {
-  "arbeitet noch"
 } elseif ($state.lastInjectAt -and (Get-IsoAgeMs -IsoString ([string]$state.lastInjectAt)) -lt $idleCooldownMs) {
   "wartet auf Ruhe"
 } else {
@@ -234,6 +241,7 @@ $result = [ordered]@{
   current_runtime = $currentRuntime
   loaded_threads = $loadedThreads
   queue_depth = $queued.Count
+  visible_waiting_depth = ($queued.Count + $pendingReplies.Count)
   direct_queue_depth = $directQueued.Count
   ambient_queue_depth = $ambientQueued.Count
   escalation_queue_depth = $escalationQueued.Count
@@ -255,6 +263,16 @@ $result = [ordered]@{
       message_id = $nextQueued[0].messageId
       relevance = $nextQueued[0].relevance
       preview = Normalize-Preview -Value ([string]$nextQueued[0].text)
+    }
+  } else {
+    $null
+  }
+  pending_message = if ($nextPendingReply.Count -gt 0) {
+    [ordered]@{
+      chat_id = $nextPendingReply[0].chatId
+      message_id = $nextPendingReply[0].messageId
+      relevance = $nextPendingReply[0].relevance
+      preview = Normalize-Preview -Value ([string]$nextPendingReply[0].sourceText)
     }
   } else {
     $null

@@ -109,7 +109,7 @@ Status:
 blun-codex telegram-status
 ```
 
-Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, bleibt die sichtbare CLI-Eingabe unberuehrt. Den Queue-Stand kannst du jederzeit mit `blun-codex telegram-status` pruefen.
+Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, bleibt die sichtbare CLI-Eingabe unberuehrt. Pending-Nachrichten bleiben im Fenstertitel/Status sichtbar, bis die Antwort raus ist oder sie wirklich ablaufen. Den Queue-Stand kannst du jederzeit mit `blun-codex telegram-status` pruefen.
 
 Der automatische Progress-Hinweis ist bewusst defensiv: er erscheint nur bei echten Arbeits-/Weiter-Signalen, nicht bei normalem Smalltalk oder wenn die sichtbare Session stillsteht.
 

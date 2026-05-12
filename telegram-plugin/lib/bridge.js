@@ -19,6 +19,14 @@ function queueKey(entry) {
   return `${entry.chatId}:${entry.messageId}`;
 }
 
+function hasKnownInboundMessage(state, inbound) {
+  const key = queueKey(inbound);
+  return [
+    ...(state.queue || []),
+    ...(state.pendingReplies || [])
+  ].some((entry) => queueKey(entry) === key);
+}
+
 function pendingReplyKey(entry) {
   return entry.turnId || `${entry.threadId || ""}:${entry.chatId}:${entry.messageId}`;
 }
@@ -533,10 +541,10 @@ function scrubIdleBriefArtifactsInPlace(state) {
   }
 
   const queue = Array.isArray(state.queue) ? state.queue : [];
-  state.queue = queue.filter((entry) => !isPrivateIdleBriefArtifact(entry));
+  state.queue = mergeQueueLists([], queue.filter((entry) => !isPrivateIdleBriefArtifact(entry)));
 
   const pendingReplies = Array.isArray(state.pendingReplies) ? state.pendingReplies : [];
-  state.pendingReplies = pendingReplies.filter((entry) => !isPrivateIdleBriefArtifact(entry));
+  state.pendingReplies = mergePendingReplyLists([], pendingReplies.filter((entry) => !isPrivateIdleBriefArtifact(entry)));
 
   if (isPrivateIdleBriefArtifact(state.lastInbound)) {
     state.lastInbound = [...state.queue]
@@ -584,14 +592,10 @@ function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
 
 function getEffectivePendingReplyTimeoutMs(config) {
   const configuredMs = Math.max(Number(config.pendingReplyTimeoutMs || 0), 0);
-  const idleMs = Math.max(Number(config.idleCooldownMs || 0), 0);
   if (configuredMs <= 0) {
     return 0;
   }
-  if (idleMs <= 0) {
-    return configuredMs;
-  }
-  return Math.min(configuredMs, Math.max(idleMs * 2, 30000));
+  return configuredMs;
 }
 
 function getEffectiveIdleCooldownMs(config, entry = null) {
@@ -1764,6 +1768,11 @@ export async function pollOnce() {
     const continueContext = buildContinueContext(state, inbound);
     inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
     inbound.relevance = classifyInboundRelevance(config, inbound);
+    if (hasKnownInboundMessage(state, inbound)) {
+      ignored += 1;
+      appendLog(config.paths.activityFile, `IGNORED_DUPLICATE chat=${inbound.chatId} message=${inbound.messageId}`);
+      continue;
+    }
     state.queue.push(inbound);
     state.lastInbound = inbound;
     if (shouldPublishInboundUiNotice(inbound)) {

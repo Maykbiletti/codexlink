@@ -11,6 +11,7 @@ It is intentionally **not** an autonomous answer bot.
 - keeps private chats and group threads separated
 - binds a live thread id
 - injects the next queued Telegram message into that exact live thread only after the session is idle
+- keeps injected Telegram messages visible as pending until the matching answer is sent
 - sends explicit manual replies from the visible operator session
 - keeps ambient group noise queued unless it is relevant to that operator
 - lets escalation-style messages bypass the normal idle queue

@@ -104,7 +104,6 @@ public static class BlunEmbeddedQueueTitleWatcher
             else
             {
                 Console.WriteLine("[CodexLink Queue] " + normalized);
-                try { Console.Error.WriteLine("[CodexLink Queue] " + normalized); } catch {}
             }
         }
         catch
@@ -143,7 +142,6 @@ public static class BlunEmbeddedQueueTitleWatcher
                 prefix = "[CodexLink]";
             }
             Console.WriteLine(prefix + " " + normalized);
-            try { Console.Error.WriteLine(prefix + " " + normalized); } catch {}
         }
         catch
         {
@@ -189,18 +187,33 @@ public static class BlunEmbeddedQueueTitleWatcher
             }
         }
 
-        var queue = AsObjects(root["queue"]);
-        if (queue.Length == 0)
-        {
-            return;
-        }
-
         int total = 0;
+        int pending = 0;
         int direct = 0;
         int ambient = 0;
         int escalation = 0;
         string preview = "";
 
+        var pendingReplies = root.ContainsKey("pendingReplies") ? AsObjects(root["pendingReplies"]) : new object[0];
+        foreach (var item in pendingReplies)
+        {
+            var entry = item as Dictionary<string, object>;
+            if (entry == null || !IsOpenPendingReply(entry))
+            {
+                continue;
+            }
+
+            total += 1;
+            pending += 1;
+            CountRelevance(entry, ref direct, ref ambient, ref escalation);
+
+            if (string.IsNullOrWhiteSpace(preview))
+            {
+                preview = FormatPreview(entry, 44, true);
+            }
+        }
+
+        var queue = AsObjects(root["queue"]);
         foreach (var item in queue)
         {
             var entry = item as Dictionary<string, object>;
@@ -222,22 +235,11 @@ public static class BlunEmbeddedQueueTitleWatcher
             }
 
             total += 1;
-            if (string.Equals(relevance, "ambient", StringComparison.OrdinalIgnoreCase))
-            {
-                ambient += 1;
-            }
-            else if (string.Equals(relevance, "escalation", StringComparison.OrdinalIgnoreCase))
-            {
-                escalation += 1;
-            }
-            else
-            {
-                direct += 1;
-            }
+            CountRelevance(entry, ref direct, ref ambient, ref escalation);
 
             if (string.IsNullOrWhiteSpace(preview))
             {
-                preview = FormatPreview(entry, 44);
+                preview = FormatPreview(entry, 44, false);
             }
         }
 
@@ -247,6 +249,7 @@ public static class BlunEmbeddedQueueTitleWatcher
         }
 
         var parts = new List<string> { "Q:" + total.ToString() };
+        if (pending > 0) parts.Add("P:" + pending.ToString());
         if (direct > 0) parts.Add("D:" + direct.ToString());
         if (ambient > 0) parts.Add("G:" + ambient.ToString());
         if (escalation > 0) parts.Add("E:" + escalation.ToString());
@@ -254,6 +257,7 @@ public static class BlunEmbeddedQueueTitleWatcher
         var suffix = string.Join(" ", parts.ToArray());
         title = _baseTitle + " | " + suffix;
         var noticeParts = new List<string> { total.ToString() + " waiting" };
+        if (pending > 0) noticeParts.Add("pending " + pending.ToString());
         if (direct > 0) noticeParts.Add("direct " + direct.ToString());
         if (ambient > 0) noticeParts.Add("group " + ambient.ToString());
         if (escalation > 0) noticeParts.Add("escalation " + escalation.ToString());
@@ -268,11 +272,13 @@ public static class BlunEmbeddedQueueTitleWatcher
 
     private static object[] AsObjects(object value)
     {
-        if (value is object[] arr)
+        var arr = value as object[];
+        if (arr != null)
         {
             return arr;
         }
-        if (value is ArrayList list)
+        var list = value as ArrayList;
+        if (list != null)
         {
             return list.ToArray();
         }
@@ -288,24 +294,57 @@ public static class BlunEmbeddedQueueTitleWatcher
         return Convert.ToString(entry[key]) ?? "";
     }
 
-    private static string FormatPreview(Dictionary<string, object> entry, int maxLength)
+    private static void CountRelevance(Dictionary<string, object> entry, ref int direct, ref int ambient, ref int escalation)
+    {
+        var relevance = GetString(entry, "relevance");
+        if (string.Equals(relevance, "ambient", StringComparison.OrdinalIgnoreCase))
+        {
+            ambient += 1;
+        }
+        else if (string.Equals(relevance, "escalation", StringComparison.OrdinalIgnoreCase))
+        {
+            escalation += 1;
+        }
+        else
+        {
+            direct += 1;
+        }
+    }
+
+    private static bool IsOpenPendingReply(Dictionary<string, object> entry)
+    {
+        var status = GetString(entry, "status").Trim().ToLowerInvariant();
+        if (entry.ContainsKey("sentAt") && entry["sentAt"] != null && !string.IsNullOrWhiteSpace(Convert.ToString(entry["sentAt"])))
+        {
+            return false;
+        }
+        if (status == "sent" || status == "suppressed_ack" || status == "error" || status == "ignored_bot" || status == "superseded" || status == "expired")
+        {
+            return false;
+        }
+        return true;
+    }
+
+    private static string FormatPreview(Dictionary<string, object> entry, int maxLength, bool pending)
     {
         var user = GetString(entry, "user");
         var group = GetString(entry, "groupTitle");
-        var text = Normalize(GetString(entry, "text"), maxLength);
+        var rawText = pending ? GetString(entry, "sourceText") : GetString(entry, "text");
+        var text = Normalize(rawText, maxLength);
         if (string.IsNullOrWhiteSpace(text))
         {
             return "";
         }
+        var state = pending ? "pending: " : "";
         if (!string.IsNullOrWhiteSpace(group))
         {
-            return Normalize(user + "@" + group + ": " + text, maxLength);
+            return Normalize(state + user + "@" + group + ": " + text, maxLength);
         }
         if (!string.IsNullOrWhiteSpace(user))
         {
-            return Normalize(user + ": " + text, maxLength);
+            return Normalize(state + user + ": " + text, maxLength);
         }
-        return text;
+        return state + text;
     }
 
     private static string Normalize(string value, int maxLength)
