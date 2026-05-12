@@ -705,6 +705,27 @@ if ($useRemoteAppServer) {
   }
   Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 4)
   Write-DebugStage -Path $debugLogPath -Message "FRONTEND_SPAWNED"
+  $sidecarsStartedEarly = $false
+  if ($sidecarManager) {
+    try {
+      & node $sidecarManager | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        Write-DebugStage -Path $debugLogPath -Message "SIDECAR_MANAGER_EARLY_FAILED"
+      } else {
+        $sidecarsStartedEarly = $true
+        Write-DebugStage -Path $debugLogPath -Message "SIDECAR_MANAGER_EARLY_OK"
+        $pollerPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "poller.pid")
+        $dispatcherPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "dispatcher.pid")
+        $responderPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "responder.pid")
+        if ($pollerPid -gt 0) { $currentRuntime["poller_pid"] = $pollerPid }
+        if ($dispatcherPid -gt 0) { $currentRuntime["dispatcher_pid"] = $dispatcherPid }
+        if ($responderPid -gt 0) { $currentRuntime["responder_pid"] = $responderPid }
+        Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 6)
+      }
+    } catch {
+      Write-DebugStage -Path $debugLogPath -Message ("SIDECAR_MANAGER_EARLY_ERROR " + $_.Exception.Message)
+    }
+  }
   if ($envFilePath -and $bootstrapScript) {
     try {
       Write-DebugStage -Path $debugLogPath -Message "LOADED_THREAD_WAIT_START"
@@ -784,6 +805,21 @@ if ($useRemoteAppServer) {
         Write-DebugStage -Path $debugLogPath -Message "APP_SERVER_INFO_WRITTEN"
       } else {
         Write-DebugStage -Path $debugLogPath -Message "LOADED_THREAD_NONE"
+        if ($sidecarsStartedEarly) {
+          $remoteSessionInfo = [ordered]@{
+            ws_url = $telegramAppServerWsUrl
+            thread_id = ""
+            pid = $backendProcess.Id
+            started_at = (Get-Date).ToUniversalTime().ToString("o")
+            sidecars = [ordered]@{
+              poller = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "poller.pid") }
+              dispatcher = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "dispatcher.pid") }
+              responder = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "responder.pid") }
+            }
+          }
+          Write-TextFileWithRetry -Path $appServerInfoFile -Content ($remoteSessionInfo | ConvertTo-Json -Depth 6)
+          Write-DebugStage -Path $debugLogPath -Message "APP_SERVER_INFO_WRITTEN_UNBOUND"
+        }
       }
     } catch {
       Write-DebugStage -Path $debugLogPath -Message ("LOADED_THREAD_ERROR " + $_.Exception.Message)

@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { loadConfig } from "./env.js";
@@ -13,6 +13,45 @@ function loadState(config) {
 
 function saveStateForConfig(config, state) {
   saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(state));
+}
+
+function persistActiveThreadBinding(config, threadId) {
+  const value = String(threadId || "").trim();
+  if (!value) {
+    return;
+  }
+
+  try {
+    const envPath = config.paths.envFile;
+    const existing = existsSync(envPath) ? readFileSync(envPath, "utf8").split(/\r?\n/) : [];
+    let wroteThread = false;
+    const lines = existing
+      .filter((line, index, all) => index < all.length - 1 || line.trim() !== "")
+      .map((line) => {
+        if (/^\s*BLUN_TELEGRAM_THREAD_ID\s*=/.test(line)) {
+          wroteThread = true;
+          return `BLUN_TELEGRAM_THREAD_ID=${value}`;
+        }
+        return line;
+      });
+    if (!wroteThread) {
+      lines.push(`BLUN_TELEGRAM_THREAD_ID=${value}`);
+    }
+    writeFileSync(envPath, `${lines.join("\n")}\n`, "utf8");
+  } catch {
+    // Runtime binding is a self-heal path; dispatch can continue with state.
+  }
+
+  try {
+    const runtimePath = config.paths.currentRuntimeFile;
+    const runtime = loadJson(runtimePath, null);
+    if (runtime && (!config.appServerWsUrl || !runtime.ws_url || String(runtime.ws_url).trim() === String(config.appServerWsUrl).trim())) {
+      runtime.thread_id = value;
+      saveJson(runtimePath, runtime);
+    }
+  } catch {
+    // Best effort only.
+  }
 }
 
 function queueKey(entry) {
@@ -1572,6 +1611,7 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
         saveStateForConfig(config, state);
         appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD_PINNED thread=${pinnedThreadId}`);
       }
+      persistActiveThreadBinding(config, pinnedThreadId);
       return pinnedThreadId;
     }
 
@@ -1605,6 +1645,7 @@ async function resolveActiveThreadId(config, state, preferredThreadId) {
       saveStateForConfig(config, state);
       appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD thread=${bestThreadId}`);
     }
+    persistActiveThreadBinding(config, bestThreadId);
     return bestThreadId;
   } catch (error) {
     const message = String(error?.message || error).replace(/\s+/g, " ").slice(0, 180);

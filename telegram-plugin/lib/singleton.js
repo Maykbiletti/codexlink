@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { getPaths } from "./paths.js";
 
 function readPid(path) {
@@ -6,6 +6,14 @@ function readPid(path) {
     return Number.parseInt(readFileSync(path, "utf8").trim(), 10) || 0;
   } catch {
     return 0;
+  }
+}
+
+function writePid(path) {
+  try {
+    writeFileSync(path, `${process.pid}\n`, "utf8");
+  } catch {
+    // Best-effort self-heal only; the sidecar can still keep running.
   }
 }
 
@@ -34,7 +42,12 @@ export function isCurrentSidecarPid(kind) {
   }
 
   const currentPid = readPid(pidFile);
-  if (!currentPid || currentPid === process.pid) {
+  if (!currentPid) {
+    writePid(pidFile);
+    return true;
+  }
+
+  if (currentPid === process.pid) {
     return true;
   }
 
@@ -44,5 +57,10 @@ export function isCurrentSidecarPid(kind) {
     return true;
   }
 
-  return !isPidAlive(currentPid);
+  if (!isPidAlive(currentPid)) {
+    writePid(pidFile);
+    return true;
+  }
+
+  return false;
 }
