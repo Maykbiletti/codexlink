@@ -2270,6 +2270,11 @@ function isRealtimeAppServerEntry(entry) {
   return chatType === "private" || relevance === "direct" || relevance === "lane";
 }
 
+function isGroupChatEntry(entry) {
+  const chatType = String(entry?.chatType || "").trim().toLowerCase();
+  return chatType === "group" || chatType === "supergroup";
+}
+
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
@@ -2313,7 +2318,7 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  if (isAddressOnlyPing(config, next.text) && !looksLikeBotSender(next)) {
+  if (isAddressOnlyPing(config, next.text) && !looksLikeBotSender(next) && !isGroupChatEntry(next)) {
     next.status = "delivered";
     next.deliveredAt = nowIso();
     next.threadId = null;
