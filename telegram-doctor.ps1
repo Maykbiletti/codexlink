@@ -181,7 +181,8 @@ function Invoke-RuntimeFix {
       $runtime.queue_notifier_pid,
       $runtime.poller_pid,
       $runtime.dispatcher_pid,
-      $runtime.responder_pid
+      $runtime.responder_pid,
+      $runtime.team_relay_pid
     ) | Where-Object { $_ } | Select-Object -Unique
     foreach ($pidValue in $pids) {
       if (Stop-PidQuiet -PidValue $pidValue) {
@@ -336,6 +337,17 @@ Add-Check -List $checks -Name "queue_notifier" -Status $(if (($null -eq $status.
 Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.poller_pid + " alive=" + [string]$status.poller_alive)
 Add-Check -List $checks -Name "dispatcher" -Status $(if ($status.dispatcher_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.dispatcher_pid + " alive=" + [string]$status.dispatcher_alive)
 Add-Check -List $checks -Name "responder" -Status $(if ($status.responder_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.responder_pid + " alive=" + [string]$status.responder_alive)
+$teamRelayMode = ([string]$status.team_relay_mode).ToLower()
+$teamRelayConfigured = $status.team_relay_file -or $status.team_relay_url_configured
+$teamRelayShouldRun = @("consume", "both") -contains $teamRelayMode
+$teamRelayConfigStatus = if ($teamRelayMode -eq "off") { "ok" } elseif ($teamRelayConfigured) { "ok" } else { "warn" }
+$teamRelayConfigDetail = "mode=" + [string]$status.team_relay_mode + " file=" + $(if ($status.team_relay_file) { [string]$status.team_relay_file } else { "-" }) + " url=" + $(if ($status.team_relay_url_configured) { "configured" } else { "-" })
+Add-Check -List $checks -Name "team_relay_config" -Status $teamRelayConfigStatus -Detail $teamRelayConfigDetail
+if ($teamRelayShouldRun -and $teamRelayConfigured) {
+  Add-Check -List $checks -Name "team_relay_consumer" -Status $(if ($status.team_relay_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.team_relay_pid + " alive=" + [string]$status.team_relay_alive)
+} else {
+  Add-Check -List $checks -Name "team_relay_consumer" -Status "ok" -Detail "not required"
+}
 
 if ($status.last_inbound) {
   $lastInboundSummary = [string]::Format(

@@ -140,10 +140,14 @@ $expiredPendingReplies = @($state.pendingReplies | Where-Object { $_.status -eq 
 $pollerPid = if (Test-Path (Join-Path $stateDir "poller.pid")) { (Get-Content -Raw (Join-Path $stateDir "poller.pid")).Trim() } else { $null }
 $dispatcherPid = if (Test-Path (Join-Path $stateDir "dispatcher.pid")) { (Get-Content -Raw (Join-Path $stateDir "dispatcher.pid")).Trim() } else { $null }
 $responderPid = if (Test-Path (Join-Path $stateDir "responder.pid")) { (Get-Content -Raw (Join-Path $stateDir "responder.pid")).Trim() } else { $null }
+$teamRelayPid = if (Test-Path (Join-Path $stateDir "team-relay.pid")) { (Get-Content -Raw (Join-Path $stateDir "team-relay.pid")).Trim() } else { $null }
 $stateThreadId = if ($state.currentThreadId) { [string]$state.currentThreadId } else { "" }
 $runtimeThreadId = if ($currentRuntime -and $currentRuntime.thread_id) { [string]$currentRuntime.thread_id } else { "" }
 $telegramPluginRoot = Get-TelegramPluginRoot -RuntimeRoot $runtimeRoot
 $dispatchMode = if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { [string]$envFile["BLUN_TELEGRAM_DISPATCH_MODE"] } else { "deferred" }
+$teamRelayMode = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"] } else { "off" }
+$teamRelayFile = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"] } else { "" }
+$teamRelayUrl = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"] } else { "" }
 $idleCooldownMs = if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { [int]$envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { 15000 }
 $eligibleQueued = if ($dispatchMode -eq "legacy") {
   @($queued)
@@ -211,6 +215,13 @@ if ($currentRuntime) {
       $currentRuntime | Add-Member -NotePropertyName "responder_pid" -NotePropertyValue $responderPid
     }
   }
+  if ($teamRelayPid) {
+    if ($currentRuntime.PSObject.Properties.Name.Contains("team_relay_pid")) {
+      $currentRuntime.team_relay_pid = $teamRelayPid
+    } else {
+      $currentRuntime | Add-Member -NotePropertyName "team_relay_pid" -NotePropertyValue $teamRelayPid
+    }
+  }
 }
 
 if ($envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"] -and $telegramPluginRoot) {
@@ -229,6 +240,9 @@ $result = [ordered]@{
   plugin_root = $telegramPluginRoot
   active_ws = $envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"]
   dispatch_mode = $dispatchMode
+  team_relay_mode = $teamRelayMode
+  team_relay_file = $teamRelayFile
+  team_relay_url_configured = [bool]$teamRelayUrl
   idle_cooldown_ms = $idleCooldownMs
   ambient_queue_ttl_ms = $ambientQueueTtlMs
   pending_reply_timeout_ms = $(if ($envFile["BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS"]) { $envFile["BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS"] } else { "1800000" })
@@ -257,6 +271,7 @@ $result = [ordered]@{
   poller_pid = $pollerPid
   dispatcher_pid = $dispatcherPid
   responder_pid = $responderPid
+  team_relay_pid = $teamRelayPid
   next_queued = if ($nextQueued.Count -gt 0) {
     [ordered]@{
       chat_id = $nextQueued[0].chatId
@@ -288,6 +303,9 @@ if ($result.dispatcher_pid) {
 }
 if ($result.responder_pid) {
   $result["responder_alive"] = Test-PidAlive -ProcId ([int]$result.responder_pid)
+}
+if ($result.team_relay_pid) {
+  $result["team_relay_alive"] = Test-PidAlive -ProcId ([int]$result.team_relay_pid)
 }
 if ($result.frontend_owner_pid) {
   $result["frontend_owner_alive"] = Test-PidAlive -ProcId ([int]$result.frontend_owner_pid)
