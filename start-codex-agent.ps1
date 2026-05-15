@@ -527,6 +527,24 @@ if ($useRemoteAppServer) {
   } else {
     $envFilePath = Join-Path $telegramStateDir ".env"
     $stateEnv = Read-DotEnvFile -Path $envFilePath
+    $telegramStateFile = Join-Path $telegramStateDir "state.json"
+    $telegramState = Try-GetJsonFile -Path $telegramStateFile
+    $previousRuntimeSnapshot = Try-GetJsonFile -Path (Join-Path $agentRuntimeDir "current-remote-runtime.json")
+    $previousAppServerSnapshot = Try-GetJsonFile -Path (Join-Path $agentRuntimeDir "app-server.json")
+    $previousBoundThreadId = ""
+    $threadCandidates = @(
+      $stateEnv["BLUN_TELEGRAM_THREAD_ID"],
+      $(if ($null -ne $telegramState) { $telegramState.currentThreadId } else { "" }),
+      $(if ($null -ne $previousRuntimeSnapshot) { $previousRuntimeSnapshot.thread_id } else { "" }),
+      $(if ($null -ne $previousAppServerSnapshot) { $previousAppServerSnapshot.thread_id } else { "" })
+    )
+    foreach ($candidateThreadId in $threadCandidates) {
+      $candidateText = [string]$candidateThreadId
+      if (-not [string]::IsNullOrWhiteSpace($candidateText)) {
+        $previousBoundThreadId = $candidateText.Trim()
+        break
+      }
+    }
     $stateEnv["BLUN_TELEGRAM_AGENT_NAME"] = $profile.agent_name
     $stateEnv["BLUN_TELEGRAM_STATE_DIR"] = $telegramStateDir
     $stateEnv["BLUN_CODEX_DISPLAY_NAME"] = $profile.display_name
@@ -539,19 +557,21 @@ if ($useRemoteAppServer) {
     }
     $stateEnv["BLUN_TELEGRAM_PLUGIN_MODE"] = $TelegramMode
     $stateEnv["BLUN_TELEGRAM_APP_SERVER_WS_URL"] = $telegramAppServerWsUrl
-    $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = ""
+    $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = $previousBoundThreadId
     Write-DotEnvFile -Path $envFilePath -Values $stateEnv
-    Write-DebugStage -Path $debugLogPath -Message ("ENV_WRITTEN ws_url=" + $telegramAppServerWsUrl + " env_file=" + $envFilePath)
-    $telegramStateFile = Join-Path $telegramStateDir "state.json"
-    $telegramState = Try-GetJsonFile -Path $telegramStateFile
+    Write-DebugStage -Path $debugLogPath -Message ("ENV_WRITTEN ws_url=" + $telegramAppServerWsUrl + " env_file=" + $envFilePath + " previous_thread=" + $previousBoundThreadId)
     if ($null -ne $telegramState) {
       if ($telegramState.PSObject.Properties.Name.Contains("currentThreadId")) {
-        $telegramState.currentThreadId = ""
+        $telegramState.currentThreadId = $previousBoundThreadId
       } else {
-        $telegramState | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue ""
+        $telegramState | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue $previousBoundThreadId
       }
       Write-TextFileWithRetry -Path $telegramStateFile -Content ($telegramState | ConvertTo-Json -Depth 10)
-      Write-DebugStage -Path $debugLogPath -Message "STATE_THREAD_CLEARED"
+      if ($previousBoundThreadId) {
+        Write-DebugStage -Path $debugLogPath -Message "STATE_THREAD_PRESERVED"
+      } else {
+        Write-DebugStage -Path $debugLogPath -Message "STATE_THREAD_CLEARED"
+      }
     }
 
     Set-EnvVar "BLUN_TELEGRAM_APP_SERVER_WS_URL" $telegramAppServerWsUrl
@@ -713,6 +733,9 @@ if ($useRemoteAppServer) {
     profile = $profile.agent_name
     started_at = (Get-Date).ToUniversalTime().ToString("o")
   }
+  if ($previousBoundThreadId) {
+    $currentRuntime["thread_id"] = $previousBoundThreadId
+  }
   Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 4)
   Write-DebugStage -Path $debugLogPath -Message "FRONTEND_SPAWNED"
   $sidecarsStartedEarly = $false
@@ -868,7 +891,7 @@ if ($useRemoteAppServer) {
         if ($sidecarsStartedEarly) {
           $remoteSessionInfo = [ordered]@{
             ws_url = $telegramAppServerWsUrl
-            thread_id = ""
+            thread_id = $previousBoundThreadId
             pid = $backendProcess.Id
             started_at = (Get-Date).ToUniversalTime().ToString("o")
             sidecars = [ordered]@{
@@ -878,7 +901,11 @@ if ($useRemoteAppServer) {
             }
           }
           Write-TextFileWithRetry -Path $appServerInfoFile -Content ($remoteSessionInfo | ConvertTo-Json -Depth 6)
-          Write-DebugStage -Path $debugLogPath -Message "APP_SERVER_INFO_WRITTEN_UNBOUND"
+          if ($previousBoundThreadId) {
+            Write-DebugStage -Path $debugLogPath -Message "APP_SERVER_INFO_WRITTEN_FALLBACK_BOUND"
+          } else {
+            Write-DebugStage -Path $debugLogPath -Message "APP_SERVER_INFO_WRITTEN_UNBOUND"
+          }
         }
       }
     } catch {

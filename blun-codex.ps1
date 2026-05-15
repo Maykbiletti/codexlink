@@ -10,48 +10,28 @@ $skipTelegramSetup = $false
 $promptParts = @()
 $parsedArgs = @($args)
 
-if ($parsedArgs.Count -gt 0) {
-  switch ($parsedArgs[0]) {
-    "telegram-status" {
-      $commandArgs = @()
-      if ($parsedArgs.Count -gt 1) {
-        $commandArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
-      }
-      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-status.ps1") @commandArgs
-      exit $LASTEXITCODE
+$directCommands = @("telegram-status", "telegram-doctor", "telegram-setup", "doctor")
+for ($scanIndex = 0; $scanIndex -lt $parsedArgs.Count; $scanIndex++) {
+  $token = $parsedArgs[$scanIndex]
+  if ($token -in @("--profile", "--telegram", "--workspace")) {
+    $scanIndex++
+    continue
+  }
+  if ($directCommands -contains $token) {
+    $commandArgs = @()
+    if ($scanIndex -gt 0) {
+      $commandArgs += @($parsedArgs[0..($scanIndex - 1)])
     }
-    "telegram-doctor" {
-      $commandArgs = @()
-      if ($parsedArgs.Count -gt 1) {
-        $commandArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
-      }
-      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-doctor.ps1") @commandArgs
-      exit $LASTEXITCODE
+    if ($scanIndex -lt ($parsedArgs.Count - 1)) {
+      $commandArgs += @($parsedArgs[($scanIndex + 1)..($parsedArgs.Count - 1)])
     }
-    "telegram-setup" {
-      $commandArgs = @()
-      if ($parsedArgs.Count -gt 1) {
-        $commandArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
-      }
-      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-setup.ps1") @commandArgs
-      exit $LASTEXITCODE
+    $scriptName = switch ($token) {
+      "telegram-status" { "telegram-status.ps1" }
+      "telegram-setup" { "telegram-setup.ps1" }
+      default { "telegram-doctor.ps1" }
     }
-    "doctor" {
-      $commandArgs = @()
-      if ($parsedArgs.Count -gt 1) {
-        $commandArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
-      }
-      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-doctor.ps1") @commandArgs
-      exit $LASTEXITCODE
-    }
-    "telegram-plugin" {
-      $telegramMode = "plugin"
-      if ($parsedArgs.Count -gt 1) {
-        $parsedArgs = @($parsedArgs[1..($parsedArgs.Count - 1)])
-      } else {
-        $parsedArgs = @()
-      }
-    }
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot $scriptName) @commandArgs
+    exit $LASTEXITCODE
   }
 }
 

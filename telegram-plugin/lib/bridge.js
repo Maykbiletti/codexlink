@@ -1856,7 +1856,12 @@ function shouldTrackPendingReply(message) {
   if (looksLikeBotSender(message)) {
     return false;
   }
-  return String(message.intent || "message").trim().toLowerCase() !== "continue_nudge";
+  const intent = String(message.intent || "message").trim().toLowerCase();
+  if (intent !== "continue_nudge") {
+    return true;
+  }
+  const chatType = String(message.chatType || "").trim().toLowerCase();
+  return chatType === "group" || chatType === "supergroup";
 }
 
 function parseUnixSeconds(isoString) {
