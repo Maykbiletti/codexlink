@@ -16,6 +16,7 @@ It is intentionally **not** an autonomous answer bot.
 - sends explicit manual replies from the visible operator session
 - supports strict mention-only group routing when `BLUN_TELEGRAM_GROUP_DELIVERY=mentions`
 - lets escalation-style messages bypass the normal idle queue
+- can publish and consume a shared team relay so bot-to-bot group messages do not depend on Telegram raw delivery
 
 ## What it does not do
 
@@ -41,6 +42,7 @@ Files created there:
 - `poller.pid`
 - `dispatcher.pid`
 - `responder.pid`
+- `team-relay.pid`
 
 ## Env
 
@@ -57,6 +59,41 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `BLUN_TELEGRAM_PROGRESS_RELAY` (`status` by default, `commentary` to mirror commentary updates, `off` to disable progress notices)
 - `BLUN_TELEGRAM_DISPATCH_MODE` (`deferred` by default, `legacy` to restore eager dispatch)
 - `BLUN_TELEGRAM_GROUP_DELIVERY` (`all` by default for public/single-agent bridges, `mentions` for strict multi-agent routing)
+- `BLUN_TELEGRAM_TEAM_RELAY_MODE` (`off`, `publish`, `consume`, or `both`)
+- `BLUN_TELEGRAM_TEAM_RELAY_FILE` (shared JSONL relay file for one machine or mounted team state)
+- `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE` (`0` by default; private DMs are not shared)
+- `BLUN_TELEGRAM_TEAM_RELAY_START` (`tail` by default so enabling the relay does not replay old group history)
+
+## Team relay
+
+Telegram does not reliably deliver bot-to-bot group messages to every bot. CodexLink therefore supports a separate team relay:
+
+- every participating agent can publish inbound group messages it sees
+- every participating agent can publish its own outbound Telegram messages
+- every participating agent can consume the shared relay and queue only messages relevant to its profile
+- private DMs stay private unless `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=1` is explicitly set
+
+Minimal local setup for multiple agents on one machine:
+
+```text
+BLUN_TELEGRAM_TEAM_RELAY_MODE=both
+BLUN_TELEGRAM_TEAM_RELAY_FILE=%USERPROFILE%\.codex\channels\blun-team-relay.jsonl
+BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
+```
+
+For a central ingest, run one poller that publishes to the relay and let the other agents run `consume` or `both`. Agent outbound messages should still publish to the relay, because Telegram may not expose those bot messages as raw updates to other bots.
+
+## Public trigger model
+
+CodexLink keeps personal agent names, but public repos should also work without private names such as "Otto" or "Alfred".
+
+Default neutral triggers include:
+
+- slash commands: `/ai`, `/ask`, `/debug`, `/fix`, `/review`, `/explain`, `/translate`, `/summarize`, `/analyze`
+- mentions or names: `@ai`, `@assistant`, `@bot`, `assistant`, `gpt`, `codex`, `claude`, `openai`
+- common natural phrases in multiple languages for help, explanation, debugging, fixes, review, translation, summarization, analysis, improvement, and optimization
+
+Slash commands and `@` mentions are the recommended universal path because they remain clear in every language. Natural-language triggers are best-effort multilingual shortcuts, not the sole routing contract.
 
 ## Tools
 
@@ -67,6 +104,7 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `bridge_inject_next`
 - `bridge_reply`
 - `bridge_relay_once`
+- `bridge_team_relay_once`
 - `bridge_tail_activity`
 
 ## Runtime split
@@ -74,4 +112,5 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `poller.js` only fetches Telegram updates into the queue
 - `dispatcher.js` only retries queue delivery into the bound live thread after the current run is quiet
 - `responder.js` only relays finished answers back out
+- `team-relay-consumer.js` only reads the shared relay and queues relevant group messages
 - none of them are allowed to invent an answer on their own

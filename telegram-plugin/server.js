@@ -2,7 +2,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { bindCurrentThread, bridgeStatus, injectNext, listQueue, pollOnce, relayRepliesOnce, reply, tailActivity } from "./lib/bridge.js";
+import { bindCurrentThread, bridgeStatus, consumeTeamRelayOnce, injectNext, listQueue, pollOnce, relayRepliesOnce, reply, tailActivity } from "./lib/bridge.js";
 import { loadConfig } from "./lib/env.js";
 import { ensureStateLayout } from "./lib/paths.js";
 import { ensureBackgroundSidecars } from "./lib/sidecars.js";
@@ -96,6 +96,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} }
     },
     {
+      name: "bridge_team_relay_once",
+      description: "Consume the shared team relay file once and queue relevant group messages that this bot did not receive raw from Telegram.",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
       name: "bridge_tail_activity",
       description: "Read the last lines from the local BLUN Telegram bridge activity log.",
       inputSchema: {
@@ -132,6 +137,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
     case "bridge_relay_once":
       return textResult(await relayRepliesOnce());
+    case "bridge_team_relay_once":
+      return textResult(consumeTeamRelayOnce());
     case "bridge_tail_activity":
       return textResult(tailActivity(Number(args.lines || 20)));
     default:

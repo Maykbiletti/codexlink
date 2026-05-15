@@ -5,6 +5,7 @@ import { loadConfig } from "./env.js";
 import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
+import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
 
 function loadState(config) {
   const state = loadJson(config.paths.stateFile, defaultState());
@@ -684,6 +685,7 @@ function statusWeight(status) {
     case "error":
       return 4;
     case "submitted":
+    case "injecting":
       return 2;
     case "parked":
       return 0;
@@ -960,6 +962,24 @@ function reclassifyQueuedEntriesInPlace(config, queue) {
     changed += 1;
   }
   return { changed, parked };
+}
+
+function recoverStaleInjectingEntriesInPlace(entries, staleMs = 1000 * 60 * 5) {
+  let recovered = 0;
+  const now = Date.now();
+  for (const entry of entries || []) {
+    if (!entry || String(entry.status || "").trim().toLowerCase() !== "injecting") {
+      continue;
+    }
+    const startedAt = Date.parse(entry.injectStartedAt || entry.lastAttemptAt || "");
+    if (Number.isFinite(startedAt) && now - startedAt < staleMs) {
+      continue;
+    }
+    entry.status = "queued";
+    entry.injectRecoveredAt = nowIso();
+    recovered += 1;
+  }
+  return recovered;
 }
 
 function mergeQueueEntry(current, incoming) {
@@ -1347,6 +1367,95 @@ function normalizeInbound(message) {
     attempts: 0,
     lastAttemptAt: null
   };
+}
+
+function buildInboundRelayEvent(config, inbound, status = "seen") {
+  return {
+    direction: "inbound",
+    agentName: config.agentName,
+    status,
+    chatId: inbound.chatId,
+    messageId: inbound.messageId,
+    replyToMessageId: inbound.replyToMessageId || "",
+    telegramThreadId: inbound.telegramThreadId || "",
+    chatType: inbound.chatType || "",
+    conversationKey: inbound.conversationKey || "",
+    groupTitle: inbound.groupTitle || "",
+    user: inbound.user || "",
+    userId: inbound.userId || "",
+    senderIsBot: Boolean(inbound.senderIsBot),
+    relevance: inbound.relevance || "ambient",
+    intent: inbound.intent || "message",
+    text: inbound.text || "",
+    ts: inbound.ts || nowIso()
+  };
+}
+
+function buildOutboundRelayEvent(config, outbound, contextEntry = null) {
+  return {
+    direction: "outbound",
+    agentName: config.agentName,
+    status: "sent",
+    chatId: outbound.chatId,
+    messageId: outbound.messageId,
+    replyToMessageId: outbound.replyToMessageId || "",
+    telegramThreadId: outbound.telegramThreadId || "",
+    chatType: contextEntry?.chatType || (String(outbound.chatId || "").startsWith("-") ? "supergroup" : "private"),
+    conversationKey: contextEntry?.conversationKey || `${outbound.chatId}:${outbound.telegramThreadId || "root"}`,
+    groupTitle: contextEntry?.groupTitle || "",
+    user: config.displayName || config.agentName || "CodexLink",
+    userId: "",
+    senderIsBot: true,
+    source: outbound.source || "manual",
+    sourceTurnId: outbound.sourceTurnId || "",
+    text: outbound.text || "",
+    ts: outbound.ts || nowIso()
+  };
+}
+
+function normalizeTeamRelayInbound(config, state, event) {
+  const sourceAgent = String(event?.agentName || event?.publisherAgent || "").trim();
+  if (!event || sourceAgent.toLowerCase() === String(config.agentName || "").trim().toLowerCase()) {
+    return null;
+  }
+
+  const chatId = String(event.chatId || "").trim();
+  const messageId = String(event.messageId || "").trim();
+  const text = String(event.text || "").trim();
+  const chatType = String(event.chatType || "").trim().toLowerCase();
+  if (!chatId || !messageId || !text || chatType === "private") {
+    return null;
+  }
+
+  const telegramThreadId = normalizeTelegramThreadId(event.telegramThreadId || "");
+  const inbound = {
+    chatId,
+    messageId,
+    replyToMessageId: String(event.replyToMessageId || "").trim(),
+    telegramThreadId,
+    chatType: chatType || (chatId.startsWith("-") ? "supergroup" : "unknown"),
+    senderIsBot: Boolean(event.senderIsBot || String(event.direction || "").toLowerCase() === "outbound"),
+    conversationKey: String(event.conversationKey || "").trim() || `${chatId}:${telegramThreadId || "root"}`,
+    groupTitle: String(event.groupTitle || "").trim(),
+    user: String(event.user || sourceAgent || "team-relay").trim() || "team-relay",
+    userId: String(event.userId || "").trim(),
+    text,
+    ts: String(event.ts || "").trim() || nowIso(),
+    intent: "message",
+    relevance: "ambient",
+    status: "queued",
+    attempts: 0,
+    lastAttemptAt: null,
+    relay: {
+      id: String(event.id || "").trim(),
+      direction: String(event.direction || "").trim(),
+      sourceAgent
+    }
+  };
+  const continueContext = buildContinueContext(state, inbound);
+  inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
+  inbound.relevance = classifyInboundRelevance(config, inbound);
+  return inbound;
 }
 
 function buildContinueContext(state, inbound) {
@@ -2169,6 +2278,7 @@ export function bridgeStatus() {
     lastOutbound: state.lastOutbound,
     lastPollAt: state.lastPollAt,
     lastInjectAt: state.lastInjectAt,
+    teamRelay: teamRelayStatus(config),
     stateDir: config.paths.root,
     note: "Telegram first lands in queue. By default group delivery is all, so public/single-agent bridges pass group messages to the visible agent. Set BLUN_TELEGRAM_GROUP_DELIVERY=mentions for strict multi-agent routing."
   };
@@ -2248,6 +2358,7 @@ async function sendOutboundChunks(config, state, options) {
     state.lastOutbound = outbound;
     appendJsonl(config.paths.outboxFile, outbound);
     appendLog(config.paths.activityFile, `OUT_${source.toUpperCase()} chat=${chatId} reply_to=${outbound.replyToMessageId || "-"} thread=${telegramThreadId || "-"} message=${outbound.messageId}: ${chunk.replace(/\s+/g, " ").slice(0, 180)}`);
+    await publishTeamRelayEvent(config, buildOutboundRelayEvent(config, outbound, contextEntry));
     messageIds.push(outbound.messageId);
     lastOutbound = outbound;
   }
@@ -2347,6 +2458,7 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED_DUPLICATE chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    await publishTeamRelayEvent(config, buildInboundRelayEvent(config, inbound, "accepted"));
     if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient") {
       ignored += 1;
       appendJsonl(config.paths.inboxFile, { ...inbound, status: "ignored_ambient" });
@@ -2381,6 +2493,78 @@ export async function pollOnce() {
     ok: true,
     startOffset,
     nextOffset: state.offset,
+    captured,
+    ignored
+  };
+}
+
+export function consumeTeamRelayOnce() {
+  const config = loadConfig();
+  const state = loadState(config);
+  const delta = readTeamRelayDelta(config);
+  if (delta.disabled) {
+    return { ok: true, status: "disabled", captured: 0, ignored: 0 };
+  }
+  if (delta.initializedAtTail) {
+    return { ok: true, status: "tail_initialized", captured: 0, ignored: 0 };
+  }
+
+  let captured = 0;
+  let ignored = 0;
+  const consumedIds = [];
+  const seenIds = new Set(Array.isArray(delta.previousCursor?.seenIds) ? delta.previousCursor.seenIds : []);
+
+  for (const event of delta.items || []) {
+    const eventId = String(event?.id || buildTeamRelayEventId(event)).trim();
+    if (seenIds.has(eventId)) {
+      ignored += 1;
+      continue;
+    }
+    seenIds.add(eventId);
+    consumedIds.push(eventId);
+
+    const inbound = normalizeTeamRelayInbound(config, state, event);
+    if (!inbound) {
+      ignored += 1;
+      continue;
+    }
+    if (!isAllowedChat(config, inbound)) {
+      ignored += 1;
+      appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_CHAT id=${eventId} chat=${inbound.chatId} user=${inbound.userId || "-"}`);
+      continue;
+    }
+    if (hasKnownInboundMessage(state, inbound)) {
+      ignored += 1;
+      appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_DUPLICATE id=${eventId} chat=${inbound.chatId} message=${inbound.messageId}`);
+      continue;
+    }
+    if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient") {
+      ignored += 1;
+      appendJsonl(config.paths.inboxFile, { ...inbound, status: "ignored_ambient_relay" });
+      appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_AMBIENT id=${eventId} chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+      continue;
+    }
+
+    state.queue.push(inbound);
+    state.lastInbound = inbound;
+    if (shouldPublishInboundUiNotice(inbound)) {
+      state.lastUiNotice = {
+        ts: nowIso(),
+        kind: "inbound",
+        text: formatCompactInboundUiNotice(inbound)
+      };
+    }
+    appendJsonl(config.paths.inboxFile, inbound);
+    appendLog(config.paths.activityFile, `TEAM_RELAY_IN id=${eventId} chat=${inbound.chatId} message=${inbound.messageId} relevance=${inbound.relevance} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+    captured += 1;
+  }
+
+  const latestState = loadState(config);
+  saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+  saveTeamRelayCursor(config, rememberTeamRelayIds(delta.cursor, consumedIds));
+  return {
+    ok: true,
+    status: captured > 0 ? "captured" : "empty",
     captured,
     ignored
   };
@@ -2475,12 +2659,16 @@ function isGroupChatEntry(entry) {
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
+  const recoveredInjecting = recoverStaleInjectingEntriesInPlace(state.queue || []);
   const reclassified = reclassifyQueuedEntriesInPlace(config, state.queue || []);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0) {
+  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0) {
+    if (recoveredInjecting > 0) {
+      appendLog(config.paths.activityFile, `INJECT_STALE_RECOVERED count=${recoveredInjecting}`);
+    }
     if (reclassified.changed > 0) {
       appendLog(config.paths.activityFile, `QUEUE_RECLASSIFIED changed=${reclassified.changed} parked=${reclassified.parked}`);
     }
@@ -2621,6 +2809,14 @@ export async function injectNext(threadId, options = {}) {
 
   next.attempts = Number(next.attempts || 0) + 1;
   next.lastAttemptAt = nowIso();
+  next.status = "injecting";
+  next.injectStartedAt = next.lastAttemptAt;
+  markMatchingQueueEntriesInPlace(state, next, {
+    status: "injecting",
+    attempts: next.attempts,
+    lastAttemptAt: next.lastAttemptAt,
+    injectStartedAt: next.injectStartedAt
+  });
   let sessionPath = "";
   let sessionOffset = 0;
   if (useAppServer) {
@@ -2642,6 +2838,11 @@ export async function injectNext(threadId, options = {}) {
   const result = await injectIntoThread(config, next, resolvedThreadId);
   if (result.busy) {
     const promotedThisAttempt = useAppServer ? false : promoteVisibleQueuedEntry(config, state, resolvedThreadId, next);
+    next.status = promotedThisAttempt ? "submitted" : "queued";
+    markMatchingQueueEntriesInPlace(state, next, {
+      status: next.status,
+      injectFinishedAt: nowIso()
+    });
     appendLog(config.paths.activityFile, `INJECT_BUSY thread=${resolvedThreadId} message=${next.messageId}`);
     const latestState = loadState(config);
     saveStateForConfig(config, mergeStateSnapshots(latestState, state));
@@ -2667,7 +2868,8 @@ export async function injectNext(threadId, options = {}) {
     turnId: next.turnId,
     responsePreview: next.responsePreview,
     stderr: next.stderr,
-    stdout: next.stdout
+    stdout: next.stdout,
+    injectFinishedAt: next.deliveredAt
   });
   if (useAppServer && result.ok) {
     if (!shouldTrackPendingReply(next)) {

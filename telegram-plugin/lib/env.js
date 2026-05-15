@@ -89,6 +89,12 @@ export function loadConfig() {
     attachmentMaxBytes: Number.parseInt(env.BLUN_TELEGRAM_ATTACHMENT_MAX_BYTES || "52428800", 10) || 52428800,
     progressFallbackMs: Number.parseInt(env.BLUN_TELEGRAM_PROGRESS_FALLBACK_MS || "20000", 10) || 20000,
     progressRelayMode: env.BLUN_TELEGRAM_PROGRESS_RELAY?.trim().toLowerCase() || "status",
+    teamRelayMode: env.BLUN_TELEGRAM_TEAM_RELAY_MODE?.trim().toLowerCase() || "off",
+    teamRelayFile: env.BLUN_TELEGRAM_TEAM_RELAY_FILE?.trim() || "",
+    teamRelayUrl: env.BLUN_TELEGRAM_TEAM_RELAY_URL?.trim() || "",
+    teamRelaySecret: env.BLUN_TELEGRAM_TEAM_RELAY_SECRET?.trim() || "",
+    teamRelayPrivate: env.BLUN_TELEGRAM_TEAM_RELAY_PRIVATE?.trim() || "0",
+    teamRelayStart: env.BLUN_TELEGRAM_TEAM_RELAY_START?.trim().toLowerCase() || "tail",
     queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
     groupDeliveryMode: parseGroupDeliveryMode(

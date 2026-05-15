@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
 import { appendLog } from "./storage.js";
+import { teamRelayConsumes } from "./team-relay.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = join(here, "..");
@@ -80,6 +81,12 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_QUEUE_NOTICE: config.queueNoticeEnabled ? "1" : "0",
     BLUN_TELEGRAM_DISPATCH_MODE: config.dispatchMode || "deferred",
     BLUN_TELEGRAM_GROUP_DELIVERY: config.groupDeliveryMode || "all",
+    BLUN_TELEGRAM_TEAM_RELAY_MODE: config.teamRelayMode || "off",
+    BLUN_TELEGRAM_TEAM_RELAY_FILE: config.teamRelayFile || "",
+    BLUN_TELEGRAM_TEAM_RELAY_URL: config.teamRelayUrl || "",
+    BLUN_TELEGRAM_TEAM_RELAY_SECRET: config.teamRelaySecret || "",
+    BLUN_TELEGRAM_TEAM_RELAY_PRIVATE: config.teamRelayPrivate || "0",
+    BLUN_TELEGRAM_TEAM_RELAY_START: config.teamRelayStart || "tail",
     BLUN_TELEGRAM_PLUGIN_MODE: config.pluginMode || "plugin",
     BLUN_CODEX_MODEL: config.model || "",
     BLUN_CODEX_REASONING_EFFORT: config.reasoningEffort || "",
@@ -143,10 +150,20 @@ export function ensureBackgroundSidecars(config) {
     config,
     { forceRestart: true }
   );
+  const teamRelay = teamRelayConsumes(config)
+    ? ensureSidecar(
+      "team-relay-consumer.js",
+      config.paths.teamRelayPidFile,
+      config.paths.teamRelayStdoutFile,
+      config.paths.teamRelayStderrFile,
+      config,
+      { forceRestart: true }
+    )
+    : { started: false, pid: 0, reason: "disabled" };
 
   appendLog(
     config.paths.activityFile,
-    `PLUGIN_AUTOSTART poller=${poller.pid || 0}:${poller.reason} dispatcher=${dispatcher.pid || 0}:${dispatcher.reason} responder=${responder.pid || 0}:${responder.reason}`
+    `PLUGIN_AUTOSTART poller=${poller.pid || 0}:${poller.reason} dispatcher=${dispatcher.pid || 0}:${dispatcher.reason} responder=${responder.pid || 0}:${responder.reason} team_relay=${teamRelay.pid || 0}:${teamRelay.reason}`
   );
 
   return {
@@ -154,6 +171,7 @@ export function ensureBackgroundSidecars(config) {
     enabled: true,
     poller,
     dispatcher,
-    responder
+    responder,
+    teamRelay
   };
 }

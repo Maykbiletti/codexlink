@@ -34,7 +34,8 @@ export function isCurrentSidecarPid(kind) {
   const pidFiles = {
     poller: paths.pollerPidFile,
     dispatcher: paths.dispatcherPidFile,
-    responder: paths.responderPidFile
+    responder: paths.responderPidFile,
+    teamRelay: paths.teamRelayPidFile
   };
   const pidFile = pidFiles[kind];
   if (!pidFile) {

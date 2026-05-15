@@ -140,6 +140,18 @@ BLUN_TELEGRAM_MENTION_NAMES=codex
 BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
 ```
 
+Team-Relay fuer Agent-Gruppen:
+
+Telegram liefert Bot-Nachrichten in Gruppen nicht verlaesslich als raw update an andere Bots. Fuer echte Agent-zu-Agent-Kommunikation nutzt CodexLink deshalb optional einen gemeinsamen Relay-Kanal. Damit werden menschliche Gruppen-Nachrichten und Agent-Outbounds zusaetzlich als JSONL-Events abgelegt und von anderen Profilen konsumiert.
+
+```text
+BLUN_TELEGRAM_TEAM_RELAY_MODE=both
+BLUN_TELEGRAM_TEAM_RELAY_FILE=%USERPROFILE%\.codex\channels\blun-team-relay.jsonl
+BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
+```
+
+Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit expliziter Freigabe in eine Gruppe senden.
+
 Doctor:
 
 ```powershell
