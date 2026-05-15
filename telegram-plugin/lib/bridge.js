@@ -79,6 +79,10 @@ function containsToken(text, token) {
   return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, "i").test(String(text || ""));
 }
 
+function shouldAckOnlyAddressPing() {
+  return String(process.env.BLUN_TELEGRAM_PING_ACK_ONLY || "").trim() === "1";
+}
+
 function looksLikeEscalation(text) {
   const value = foldTriggerText(text);
   if (!value) {
@@ -2322,7 +2326,7 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  if (isAddressOnlyPing(config, next.text) && !looksLikeBotSender(next) && !isGroupChatEntry(next)) {
+  if (shouldAckOnlyAddressPing() && isAddressOnlyPing(config, next.text) && !looksLikeBotSender(next) && !isGroupChatEntry(next)) {
     next.status = "delivered";
     next.deliveredAt = nowIso();
     next.threadId = null;

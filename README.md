@@ -114,6 +114,8 @@ Der automatische Progress-Hinweis ist bewusst defensiv: standardmaessig sendet T
 
 CodexLink injiziert Nachrichten standardmaessig ueber den App-Server in den aktiven Thread. Der alte Windows-Tastaturmodus, der Text sichtbar ins Eingabefeld schreibt, ist absichtlich deaktiviert, weil einzelne Terminals Enter nicht zuverlaessig absenden. Wer ihn fuer Debugging trotzdem erzwingen will, muss explizit `BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force` setzen.
 
+Kurze Namens-Pings wie `Otto` oder `Alfred` werden standardmaessig ebenfalls als echte Nachricht in den aktiven Thread injiziert. Das macht Reachability-Tests sichtbar und vermeidet, dass Telegram wie ein separater Hintergrundbot wirkt. Wer den alten Ack-only-Modus fuer solche Pings braucht, kann `BLUN_TELEGRAM_PING_ACK_ONLY=1` setzen.
+
 Wichtig bei mehreren Profilen: ein Telegram-Bot-Token darf nicht gleichzeitig von alten oder fremden Pollern abgefragt werden. Sonst meldet Telegram `Conflict: terminated by other getUpdates request`, und Nachrichten koennen verspaetet oder gar nicht in der sichtbaren CLI landen. Aktuelle Versionen pollen non-blocking und schneller; wenn trotzdem Conflicts auftauchen, alle alten `blun-codex telegram-plugin` Fenster fuer denselben Bot schliessen und genau eine aktuelle Session starten.
 
 Wenn mehrere Agents denselben Gruppenchat nutzen, kann ein Agent andere Agent-Namen als Fremdroute markieren. Dann werden Owner-Nachrichten wie `Frida mach weiter` nicht in Ottos Session gezogen:
