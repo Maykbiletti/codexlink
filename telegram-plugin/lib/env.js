@@ -34,6 +34,17 @@ function parseMentionNames(rawValue) {
   ));
 }
 
+function parseGroupDeliveryMode(rawValue) {
+  const value = String(rawValue || "").trim().toLowerCase();
+  if (["mention", "mentions", "addressed", "strict"].includes(value)) {
+    return "mentions";
+  }
+  if (["ambient", "queue", "park"].includes(value)) {
+    return "ambient";
+  }
+  return "all";
+}
+
 export function loadConfig() {
   ensureStateLayout();
   const paths = getPaths();
@@ -80,6 +91,12 @@ export function loadConfig() {
     progressRelayMode: env.BLUN_TELEGRAM_PROGRESS_RELAY?.trim().toLowerCase() || "status",
     queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
+    groupDeliveryMode: parseGroupDeliveryMode(
+      env.BLUN_TELEGRAM_GROUP_DELIVERY
+      || env.TELEGRAM_GROUP_DELIVERY
+      || env.BLUN_TELEGRAM_RELEVANCE_MODE
+      || "all"
+    ),
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",

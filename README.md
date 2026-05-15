@@ -114,15 +114,30 @@ Der automatische Progress-Hinweis ist bewusst defensiv: standardmaessig sendet T
 
 CodexLink injiziert Nachrichten standardmaessig ueber den App-Server in den aktiven Thread. Der alte Windows-Tastaturmodus, der Text sichtbar ins Eingabefeld schreibt, ist absichtlich deaktiviert, weil einzelne Terminals Enter nicht zuverlaessig absenden. Wer ihn fuer Debugging trotzdem erzwingen will, muss explizit `BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force` setzen.
 
-Kurze Namens-Pings wie `Otto` oder `Alfred` werden standardmaessig ebenfalls als echte Nachricht in den aktiven Thread injiziert. Das macht Reachability-Tests sichtbar und vermeidet, dass Telegram wie ein separater Hintergrundbot wirkt. Wer den alten Ack-only-Modus fuer solche Pings braucht, kann `BLUN_TELEGRAM_PING_ACK_ONLY=1` setzen.
+Kurze Namens-Pings wie `Codex`, `Assistant` oder ein eigener Profilname werden standardmaessig ebenfalls als echte Nachricht in den aktiven Thread injiziert. Das macht Reachability-Tests sichtbar und vermeidet, dass Telegram wie ein separater Hintergrundbot wirkt. Wer den alten Ack-only-Modus fuer solche Pings braucht, kann `BLUN_TELEGRAM_PING_ACK_ONLY=1` setzen.
+
+Gruppen-Nachrichten werden standardmaessig ebenfalls an die aktive CLI geliefert. Das ist der beste Default fuer oeffentliche Setups und Single-Agent-Bots: Telegram ist nur der Transport, der sichtbare Agent entscheidet im Thread selbst, ob die Nachricht fuer ihn relevant ist. Universal-Trigger wie `/ask`, `/debug`, `@assistant`, `ai explain this`, `hilfe`, `erklaer`, `hjalp`, `ayuda`, `aide`, `aiuto`, `ajuda` oder `pomoc` werden zusaetzlich als direkte Agent-Intents erkannt.
+
+Wenn mehrere Agents denselben Gruppenchat wirklich strikt teilen, kann der alte konservative Modus aktiviert werden:
+
+```text
+BLUN_TELEGRAM_GROUP_DELIVERY=mentions
+```
+
+Dann werden Gruppen-Nachrichten nur direkt geliefert, wenn sie den Agenten adressieren, einen universellen AI-Trigger enthalten oder zur Lane passen. Nachrichten an bekannte andere Agents bleiben ambient:
+
+```text
+BLUN_TELEGRAM_MENTION_NAMES=assistant,codex
+BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
+```
 
 Wichtig bei mehreren Profilen: ein Telegram-Bot-Token darf nicht gleichzeitig von alten oder fremden Pollern abgefragt werden. Sonst meldet Telegram `Conflict: terminated by other getUpdates request`, und Nachrichten koennen verspaetet oder gar nicht in der sichtbaren CLI landen. Aktuelle Versionen pollen non-blocking und schneller; wenn trotzdem Conflicts auftauchen, alle alten `blun-codex telegram-plugin` Fenster fuer denselben Bot schliessen und genau eine aktuelle Session starten.
 
-Wenn mehrere Agents denselben Gruppenchat nutzen, kann ein Agent andere Agent-Namen als Fremdroute markieren. Dann werden Owner-Nachrichten wie `Frida mach weiter` nicht in Ottos Session gezogen:
+Beispiel mit konkreten Profilnamen:
 
 ```text
-BLUN_TELEGRAM_MENTION_NAMES=otto
-BLUN_TELEGRAM_OTHER_AGENT_NAMES=frida,angel,dieter,alfred
+BLUN_TELEGRAM_MENTION_NAMES=codex
+BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
 ```
 
 Doctor:
@@ -165,17 +180,17 @@ Ein eigenes Profil brauchst du nur fuer Fortgeschrittene oder Parallelbetrieb, z
 Beispiel:
 
 ```powershell
-blun-codex --profile alfred telegram-plugin
+blun-codex --profile reviewer telegram-plugin
 ```
 
-## Private internal profiles
+## Private local profiles
 
-If you run more than one internal operator on the same machine, do not start all of them on the shared `default` slot.
+If you run more than one operator on the same machine, do not start all of them on the shared `default` slot.
 
 Use a dedicated private profile per operator:
 
 ```powershell
-blun-codex --profile frida telegram-plugin
+blun-codex --profile reviewer telegram-plugin
 ```
 
 Why this matters:
@@ -184,7 +199,7 @@ Why this matters:
 - starting a second operator on `default` will replace the first `default` runtime
 - a private profile gives that operator a separate runtime slot, state directory, and Mnemo binding
 
-For internal/private profiles:
+For private local profiles:
 
 - keep the profile local on the machine
 - give it its own `agent_name`
@@ -200,13 +215,13 @@ Local private profiles are loaded from:
 Example:
 
 ```powershell
-blun-codex --profile frida telegram-plugin
+blun-codex --profile reviewer telegram-plugin
 ```
 
 looks for:
 
 ```text
-%USERPROFILE%\.codex\profiles\codexlink\frida.json
+%USERPROFILE%\.codex\profiles\codexlink\reviewer.json
 ```
 
 ## What it does

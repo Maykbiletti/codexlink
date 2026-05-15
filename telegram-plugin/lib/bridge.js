@@ -102,6 +102,144 @@ function looksLikeEscalation(text) {
   return containsToken(value, "sofort") && !/\bab sofort\b/u.test(value);
 }
 
+const UNIVERSAL_AGENT_COMMANDS = new Set([
+  "ai",
+  "assistant",
+  "bot",
+  "agent",
+  "helper",
+  "copilot",
+  "codex",
+  "claude",
+  "gpt",
+  "llm",
+  "ask",
+  "chat",
+  "prompt",
+  "debug",
+  "fix",
+  "review",
+  "explain",
+  "summarize",
+  "summarise",
+  "translate",
+  "analyze",
+  "analyse",
+  "optimize",
+  "optimise",
+  "refactor",
+  "test",
+  "hilfe",
+  "hilf",
+  "frage",
+  "frag",
+  "erklar",
+  "erklaer",
+  "erklare",
+  "erklaere",
+  "pruf",
+  "pruef",
+  "prufe",
+  "pruefe",
+  "reparier",
+  "repariere",
+  "behebe",
+  "korrigiere",
+  "ubersetz",
+  "uebersetz",
+  "zusammenfassen",
+  "analysiere",
+  "optimiere",
+  "teste",
+  "hjalp",
+  "fraga",
+  "forklar",
+  "oversatt",
+  "sammanfatta",
+  "analysera",
+  "granska",
+  "fixa",
+  "ayuda",
+  "pregunta",
+  "explica",
+  "traducir",
+  "traduce",
+  "resumir",
+  "resume",
+  "analiza",
+  "revisar",
+  "arregla",
+  "corrige",
+  "aide",
+  "explique",
+  "traduire",
+  "traduis",
+  "resumer",
+  "analyse",
+  "corriger",
+  "aiuto",
+  "spiega",
+  "traduci",
+  "riassumi",
+  "analizza",
+  "correggi",
+  "sistema",
+  "ajuda",
+  "explica",
+  "traduz",
+  "analisa",
+  "corrigir",
+  "uitleg",
+  "vertaal",
+  "samenvatten",
+  "analyseer",
+  "pomoc",
+  "wyjasnij",
+  "przetlumacz",
+  "podsumuj",
+  "analizuj",
+  "napraw",
+  "yardim",
+  "acikla",
+  "cevir",
+  "ozetle",
+  "analiz",
+  "duzelt"
+]);
+
+const UNIVERSAL_AGENT_PATTERNS = [
+  /\b(can someone|could someone|please|pls)\s+(explain|help|debug|review|fix|summari[sz]e|translate|analy[sz]e)\b/u,
+  /\b(help me|help with this|what does this do|fix this error|review this code|write tests|create solution)\b/u,
+  /\b(kann jemand|kannst du|bitte)\s+(helfen|erklaren|erklaeren|prufen|pruefen|fixen|reparieren|ubersetzen|uebersetzen|analysieren)\b/u,
+  /\b(hilf mir|was bedeutet das|schau dir das an|pruf das|pruef das|fix das|debug das|fass das zusammen)\b/u,
+  /\b(kan nagon|kan du)\s+(hjalpa|forklara|granska|fixa|oversatta|sammanfatta)\b/u,
+  /\b(ayudame|puedes|puede alguien)\s+(explicar|revisar|arreglar|traducir|resumir|analizar)\b/u,
+  /\b(aide moi|peux tu|quelqu un peut)\s+(expliquer|corriger|traduire|resumer|analyser)\b/u
+];
+
+function groupDeliveryMode(config) {
+  return String(config.groupDeliveryMode || "all").trim().toLowerCase();
+}
+
+function shouldDeliverAllGroupMessages(config) {
+  return groupDeliveryMode(config) === "all";
+}
+
+function looksLikeUniversalAgentIntent(text) {
+  const normalized = foldTriggerText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const first = words[0] || "";
+  if (UNIVERSAL_AGENT_COMMANDS.has(first)) {
+    return true;
+  }
+
+  return UNIVERSAL_AGENT_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 const CONTINUE_NEGATIVE_ONLY = new Set([
   "ok",
   "okay",
@@ -389,15 +527,15 @@ function escapeRegExp(value) {
 }
 
 function startsWithAgentAddress(normalized, mention) {
-  // normalizeTriggerText strips most punctuation, so this covers "Otto?",
-  // "Otto:", "/otto", "!otto", "#otto" and "[otto]" as "otto".
+  // normalizeTriggerText strips most punctuation, so this covers "Agent?",
+  // "Agent:", "/agent", "!agent", "#agent" and "[agent]" as "agent".
   return new RegExp(`^@?${mention}\\b(?:\\s|$)`, "u").test(normalized);
 }
 
 function startsWithTeamAddressList(normalized, mention) {
-  // Group chats often address multiple agents in one breath: "Angel, Otto ...".
-  // Keep this conservative: only treat it as direct if Otto is in the first
-  // small address block at the beginning, not if Otto is mentioned later.
+  // Group chats often address multiple agents in one breath:
+  // "designer, codex ...". Keep this conservative: only treat it as direct
+  // if this agent is in the first small address block at the beginning.
   return new RegExp(`^(?:@?[a-z][a-z0-9_-]{1,24}\\b\\s+){1,3}@?${mention}\\b(?:\\s|$)`, "u").test(normalized);
 }
 
@@ -498,8 +636,13 @@ function isOtherAgentAddressed(config, text) {
 function classifyInboundRelevance(config, inbound) {
   const text = String(inbound.text || "");
   const isStatusBroadcast = looksLikeStatusBroadcast(text);
+  const isGroupChat = String(inbound.chatType || "") !== "private";
 
   if (!isStatusBroadcast && isAgentAddressed(config, text)) {
+    return "direct";
+  }
+
+  if (!isStatusBroadcast && looksLikeUniversalAgentIntent(text)) {
     return "direct";
   }
 
@@ -511,7 +654,7 @@ function classifyInboundRelevance(config, inbound) {
     return "direct";
   }
 
-  if (inbound.senderIsBot || isStatusBroadcast) {
+  if (isStatusBroadcast) {
     return "ambient";
   }
 
@@ -522,6 +665,14 @@ function classifyInboundRelevance(config, inbound) {
   const lane = String(config.lane || "").trim();
   if (lane && lane.toLowerCase() !== "general" && containsToken(text, lane)) {
     return "lane";
+  }
+
+  if (isGroupChat && shouldDeliverAllGroupMessages(config)) {
+    return "direct";
+  }
+
+  if (inbound.senderIsBot) {
+    return "ambient";
   }
 
   return "ambient";
@@ -1969,6 +2120,7 @@ export function bridgeStatus() {
     frontendOwnerPid: runtimeOwner?.frontendHostPid || null,
     frontendOwnerAlive: runtimeOwner?.frontendAlive ?? null,
     dispatchMode: config.dispatchMode,
+    groupDeliveryMode: config.groupDeliveryMode,
     idleCooldownMs: config.idleCooldownMs,
     pendingReplyTimeoutMs: config.pendingReplyTimeoutMs,
     queueDepth: queued.length,
@@ -1983,7 +2135,7 @@ export function bridgeStatus() {
     lastPollAt: state.lastPollAt,
     lastInjectAt: state.lastInjectAt,
     stateDir: config.paths.root,
-    note: "Telegram first lands in queue. Direct/private/lane messages are delivered immediately in app-server mode; active turns receive them via turn/steer. Ambient group noise stays parked."
+    note: "Telegram first lands in queue. By default group delivery is all, so public/single-agent bridges pass group messages to the visible agent. Set BLUN_TELEGRAM_GROUP_DELIVERY=mentions for strict multi-agent routing."
   };
 }
 
