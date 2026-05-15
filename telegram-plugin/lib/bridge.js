@@ -445,6 +445,10 @@ function isAgentAddressed(config, text) {
     if (workDirective) {
       return true;
     }
+
+    if (containsToken(normalized, name)) {
+      return true;
+    }
   }
 
   return false;
