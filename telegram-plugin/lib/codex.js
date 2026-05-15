@@ -272,7 +272,8 @@ function getVisibleConsoleSkipReason(config, message) {
   if (!config.appServerWsUrl) {
     return "no_app_server";
   }
-  if (String(process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim() !== "1") {
+  const visibleConsoleMode = String(process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim().toLowerCase();
+  if (visibleConsoleMode !== "force") {
     return "env_disabled";
   }
   if (Array.isArray(message.attachments) && message.attachments.some((attachment) => attachment?.isImage && attachment?.localPath && !attachment.error)) {
