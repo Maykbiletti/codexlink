@@ -97,6 +97,7 @@ export function loadConfig() {
       || env.BLUN_TELEGRAM_RELEVANCE_MODE
       || "all"
     ),
+    privateDmGroupGuard: !/^(0|false|no|off)$/i.test(String(env.BLUN_TELEGRAM_PRIVATE_DM_GROUP_GUARD || "1")),
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",

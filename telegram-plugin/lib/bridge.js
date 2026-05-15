@@ -1438,6 +1438,36 @@ function splitTelegramText(text, maxLength = 3500) {
   return chunks.filter(Boolean);
 }
 
+function isPrivateChatType(chatType) {
+  return String(chatType || "").trim().toLowerCase() === "private";
+}
+
+function isExplicitTrue(value) {
+  return value === true || /^(1|true|yes|on)$/i.test(String(value || ""));
+}
+
+function assertNoPrivateDmGroupLeak(config, state, options = {}, contextEntry = null) {
+  if (!config.privateDmGroupGuard || isExplicitTrue(options.allowPrivateToGroup)) {
+    return;
+  }
+  const targetChatId = String(options.chatId || "").trim();
+  if (!targetChatId) {
+    return;
+  }
+  const source = String(options.source || "manual").trim();
+  const sourceEntry = contextEntry || (source === "manual" ? state.lastInbound : null);
+  if (!sourceEntry || !isPrivateChatType(sourceEntry.chatType)) {
+    return;
+  }
+  const sourceChatId = String(sourceEntry.chatId || "").trim();
+  if (sourceChatId && sourceChatId !== targetChatId) {
+    throw new Error(
+      `Refusing to send private DM context to a different chat (${sourceChatId} -> ${targetChatId}). ` +
+      "Use allowPrivateToGroup only after an explicit user request to inform the group."
+    );
+  }
+}
+
 function shouldSendDeferredReceipt(config, entry, reason) {
   if (!config?.queueNoticeEnabled) {
     return false;
@@ -2195,6 +2225,8 @@ async function sendOutboundChunks(config, state, options) {
     return false;
   }) || null;
 
+  assertNoPrivateDmGroupLeak(config, state, options, contextEntry);
+
   for (let index = 0; index < chunks.length; index += 1) {
     const chunk = chunks[index];
     const result = await sendMessage(config, {
@@ -2909,7 +2941,8 @@ export async function reply(text, options = {}) {
     text,
     replyToMessageId,
     telegramThreadId,
-    source: "manual"
+    source: "manual",
+    allowPrivateToGroup: options.allowPrivateToGroup
   });
   saveStateForConfig(config, state);
   return result;
