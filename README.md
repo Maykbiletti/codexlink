@@ -170,7 +170,7 @@ BLUN_TELEGRAM_TEAM_RELAY_SECRET=change-me
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 
-Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit expliziter Freigabe in eine Gruppe senden.
+Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit expliziter Gruppenbroadcast-Freigabe in eine Gruppe senden. Technisch braucht ein manueller Bridge-Reply dafuer beide Flags: `allow_private_to_group=true` und `confirm_group_broadcast=true`.
 
 Doctor:
 

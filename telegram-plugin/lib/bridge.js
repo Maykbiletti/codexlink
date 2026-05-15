@@ -1556,7 +1556,8 @@ function isExplicitTrue(value) {
 }
 
 function assertNoPrivateDmGroupLeak(config, state, options = {}, contextEntry = null) {
-  if (!config.privateDmGroupGuard || isExplicitTrue(options.allowPrivateToGroup)) {
+  const explicitGroupBroadcast = isExplicitTrue(options.allowPrivateToGroup) && isExplicitTrue(options.confirmGroupBroadcast);
+  if (!config.privateDmGroupGuard || explicitGroupBroadcast) {
     return;
   }
   const targetChatId = String(options.chatId || "").trim();
@@ -1572,7 +1573,7 @@ function assertNoPrivateDmGroupLeak(config, state, options = {}, contextEntry = 
   if (sourceChatId && sourceChatId !== targetChatId) {
     throw new Error(
       `Refusing to send private DM context to a different chat (${sourceChatId} -> ${targetChatId}). ` +
-      "Use allowPrivateToGroup only after an explicit user request to inform the group."
+      "Use allowPrivateToGroup plus confirmGroupBroadcast only after an explicit user request to inform the group."
     );
   }
 }
@@ -3144,7 +3145,8 @@ export async function reply(text, options = {}) {
     replyToMessageId,
     telegramThreadId,
     source: "manual",
-    allowPrivateToGroup: options.allowPrivateToGroup
+    allowPrivateToGroup: options.allowPrivateToGroup,
+    confirmGroupBroadcast: options.confirmGroupBroadcast
   });
   saveStateForConfig(config, state);
   return result;

@@ -85,7 +85,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: "string", description: "Optional chat id override. Defaults to the latest inbound chat." },
           reply_to_message_id: { type: "string", description: "Optional Telegram message id to reply under." },
           telegram_thread_id: { type: "string", description: "Optional Telegram topic/thread id for forum-style group topics." },
-          allow_private_to_group: { type: "boolean", description: "Explicitly allow sending a private-DM-context reply into another chat." }
+          allow_private_to_group: { type: "boolean", description: "First confirmation for sending a private-DM-context reply into another chat." },
+          confirm_group_broadcast: { type: "boolean", description: "Second confirmation that the user explicitly requested a group broadcast from private context." }
         },
         required: ["text"]
       }
@@ -132,7 +133,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           chatId: args.chat_id || "",
           replyToMessageId: args.reply_to_message_id || "",
           telegramThreadId: args.telegram_thread_id || "",
-          allowPrivateToGroup: args.allow_private_to_group === true
+          allowPrivateToGroup: args.allow_private_to_group === true,
+          confirmGroupBroadcast: args.confirm_group_broadcast === true
         })
       );
     case "bridge_relay_once":

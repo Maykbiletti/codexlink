@@ -74,6 +74,7 @@ Telegram does not reliably deliver bot-to-bot group messages to every bot. Codex
 - every participating agent can publish its own outbound Telegram messages
 - every participating agent can consume the shared relay and queue only messages relevant to its profile
 - private DMs stay private unless `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=1` is explicitly set
+- private-DM context cannot be sent into a group by accident; manual bridge replies need both `allow_private_to_group=true` and `confirm_group_broadcast=true`
 
 Minimal local setup for multiple agents on one machine:
 
