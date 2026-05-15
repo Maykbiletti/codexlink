@@ -31,7 +31,7 @@ export function teamRelayPublishes(config) {
 
 export function teamRelayConsumes(config) {
   const mode = getTeamRelayMode(config);
-  return Boolean(String(config?.teamRelayFile || "").trim()) && (mode === "consume" || mode === "both");
+  return isTeamRelayConfigured(config) && (mode === "consume" || mode === "both");
 }
 
 export function shouldSharePrivateRelay(config) {
@@ -87,6 +87,41 @@ async function publishRelayUrl(config, event) {
     throw new Error(`team relay url returned HTTP ${response.status}`);
   }
   return { ok: true, status: response.status };
+}
+
+function buildRelayUrl(config, after) {
+  const rawUrl = String(config?.teamRelayUrl || "").trim();
+  if (!rawUrl) {
+    return "";
+  }
+  const url = new URL(rawUrl);
+  url.searchParams.set("after", String(after ?? 0));
+  return url.toString();
+}
+
+async function readRelayUrlDelta(config, after) {
+  const url = buildRelayUrl(config, after);
+  if (!url) {
+    return { nextOffset: after || 0, items: [], disabled: true };
+  }
+
+  const headers = {};
+  const secret = String(config?.teamRelaySecret || "").trim();
+  if (secret) {
+    headers.authorization = `Bearer ${secret}`;
+  }
+
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`team relay url returned HTTP ${response.status}`);
+  }
+  const json = await response.json();
+  const items = Array.isArray(json) ? json : (Array.isArray(json.events) ? json.events : []);
+  const nextOffset = Number(json.offset ?? json.nextOffset ?? after ?? 0);
+  return {
+    nextOffset: Number.isFinite(nextOffset) ? nextOffset : Number(after || 0),
+    items
+  };
 }
 
 export async function publishTeamRelayEvent(config, event) {
@@ -170,37 +205,57 @@ function readJsonlDelta(path, offset, carry = "") {
   }
 }
 
-export function readTeamRelayDelta(config) {
+export async function readTeamRelayDelta(config) {
   const file = String(config?.teamRelayFile || "").trim();
+  const url = String(config?.teamRelayUrl || "").trim();
   const cursorFile = String(config?.paths?.teamRelayCursorFile || "").trim();
-  if (!teamRelayConsumes(config) || !file || !cursorFile) {
+  if (!teamRelayConsumes(config) || (!file && !url) || !cursorFile) {
     return { ok: true, disabled: true, cursor: null, items: [] };
   }
 
   const cursor = loadJson(cursorFile, null);
   if (!cursor) {
     const start = String(config?.teamRelayStart || "tail").trim().toLowerCase();
-    if (start !== "beginning" && existsSync(file)) {
-      const size = statSync(file).size;
-      const initial = { offset: size, carry: "", seenIds: [] };
+    if (start !== "beginning") {
+      const initial = { offset: 0, remoteOffset: 0, carry: "", seenIds: [] };
+      if (file && existsSync(file)) {
+        initial.offset = statSync(file).size;
+      }
+      if (url) {
+        try {
+          const remote = await readRelayUrlDelta(config, "tail");
+          initial.remoteOffset = remote.nextOffset;
+        } catch (error) {
+          appendLog(config.paths.activityFile, `TEAM_RELAY_URL_READ_ERROR: ${String(error?.message || error)}`);
+        }
+      }
       saveJson(cursorFile, initial);
       return { ok: true, cursor: initial, items: [], initializedAtTail: true };
     }
   }
 
-  const current = cursor || { offset: 0, carry: "", seenIds: [] };
-  const delta = readJsonlDelta(file, current.offset, current.carry);
+  const current = cursor || { offset: 0, remoteOffset: 0, carry: "", seenIds: [] };
+  const fileDelta = file ? readJsonlDelta(file, current.offset, current.carry) : { nextOffset: Number(current.offset || 0), carry: "", items: [] };
+  let remoteDelta = { nextOffset: Number(current.remoteOffset || 0), items: [] };
+  if (url) {
+    try {
+      remoteDelta = await readRelayUrlDelta(config, current.remoteOffset || 0);
+    } catch (error) {
+      appendLog(config.paths.activityFile, `TEAM_RELAY_URL_READ_ERROR: ${String(error?.message || error)}`);
+    }
+  }
   const seenIds = Array.isArray(current.seenIds) ? current.seenIds.slice(-400) : [];
   const nextCursor = {
-    offset: delta.nextOffset,
-    carry: delta.carry,
+    offset: fileDelta.nextOffset,
+    remoteOffset: remoteDelta.nextOffset,
+    carry: fileDelta.carry,
     seenIds
   };
   return {
     ok: true,
     cursor: nextCursor,
     previousCursor: current,
-    items: delta.items
+    items: [...fileDelta.items, ...remoteDelta.items]
   };
 }
 
@@ -232,6 +287,7 @@ export function teamRelayStatus(config) {
     file: file || null,
     url: config?.teamRelayUrl ? "[configured]" : null,
     privateShared: shouldSharePrivateRelay(config),
-    cursorOffset: cursor?.offset ?? null
+    cursorOffset: cursor?.offset ?? null,
+    cursorRemoteOffset: cursor?.remoteOffset ?? null
   };
 }

@@ -142,11 +142,31 @@ BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
 
 Team-Relay fuer Agent-Gruppen:
 
-Telegram liefert Bot-Nachrichten in Gruppen nicht verlaesslich als raw update an andere Bots. Fuer echte Agent-zu-Agent-Kommunikation nutzt CodexLink deshalb optional einen gemeinsamen Relay-Kanal. Damit werden menschliche Gruppen-Nachrichten und Agent-Outbounds zusaetzlich als JSONL-Events abgelegt und von anderen Profilen konsumiert.
+Telegram liefert Bot-Nachrichten in Gruppen nicht verlaesslich als raw update an andere Bots. Fuer echte Agent-zu-Agent-Kommunikation nutzt CodexLink deshalb optional einen gemeinsamen Relay-Kanal. Damit werden menschliche Gruppen-Nachrichten und Agent-Outbounds zusaetzlich als JSONL-Events abgelegt oder an einen zentralen Relay-Endpunkt gesendet und von anderen Profilen konsumiert.
+
+Auf einer Maschine reicht eine gemeinsame Datei:
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
 BLUN_TELEGRAM_TEAM_RELAY_FILE=%USERPROFILE%\.codex\channels\blun-team-relay.jsonl
+BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
+```
+
+Auf mehreren Maschinen reicht eine lokale Datei nicht. Dann braucht ihr einen gemeinsamen Relay-Server:
+
+```powershell
+$env:BLUN_TELEGRAM_TEAM_RELAY_HOST="0.0.0.0"
+$env:BLUN_TELEGRAM_TEAM_RELAY_PORT="28787"
+$env:BLUN_TELEGRAM_TEAM_RELAY_SECRET="change-me"
+blun-codex telegram-relay-server
+```
+
+Alle Agents zeigen danach auf denselben Endpunkt:
+
+```text
+BLUN_TELEGRAM_TEAM_RELAY_MODE=both
+BLUN_TELEGRAM_TEAM_RELAY_URL=http://SERVER-IP:28787/events
+BLUN_TELEGRAM_TEAM_RELAY_SECRET=change-me
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 

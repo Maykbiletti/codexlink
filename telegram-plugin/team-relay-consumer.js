@@ -23,7 +23,7 @@ async function main() {
       break;
     }
     try {
-      const result = consumeTeamRelayOnce();
+      const result = await consumeTeamRelayOnce();
       if (result.captured > 0 || result.ignored > 0) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), kind: "team_relay", result }));
       }

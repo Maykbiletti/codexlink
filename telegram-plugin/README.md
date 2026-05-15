@@ -61,6 +61,8 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `BLUN_TELEGRAM_GROUP_DELIVERY` (`all` by default for public/single-agent bridges, `mentions` for strict multi-agent routing)
 - `BLUN_TELEGRAM_TEAM_RELAY_MODE` (`off`, `publish`, `consume`, or `both`)
 - `BLUN_TELEGRAM_TEAM_RELAY_FILE` (shared JSONL relay file for one machine or mounted team state)
+- `BLUN_TELEGRAM_TEAM_RELAY_URL` (shared HTTP relay endpoint for multiple machines)
+- `BLUN_TELEGRAM_TEAM_RELAY_SECRET` (optional bearer secret for the shared HTTP relay)
 - `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE` (`0` by default; private DMs are not shared)
 - `BLUN_TELEGRAM_TEAM_RELAY_START` (`tail` by default so enabling the relay does not replay old group history)
 
@@ -81,7 +83,23 @@ BLUN_TELEGRAM_TEAM_RELAY_FILE=%USERPROFILE%\.codex\channels\blun-team-relay.json
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 
-For a central ingest, run one poller that publishes to the relay and let the other agents run `consume` or `both`. Agent outbound messages should still publish to the relay, because Telegram may not expose those bot messages as raw updates to other bots.
+For multiple machines, run one shared relay server and point every agent at the same URL:
+
+```powershell
+$env:BLUN_TELEGRAM_TEAM_RELAY_HOST="0.0.0.0"
+$env:BLUN_TELEGRAM_TEAM_RELAY_PORT="28787"
+$env:BLUN_TELEGRAM_TEAM_RELAY_SECRET="change-me"
+blun-codex telegram-relay-server
+```
+
+```text
+BLUN_TELEGRAM_TEAM_RELAY_MODE=both
+BLUN_TELEGRAM_TEAM_RELAY_URL=http://SERVER-IP:28787/events
+BLUN_TELEGRAM_TEAM_RELAY_SECRET=change-me
+BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
+```
+
+Agent outbound messages should still publish to the relay, because Telegram may not expose those bot messages as raw updates to other bots.
 
 ## Public trigger model
 
@@ -113,4 +131,5 @@ Slash commands and `@` mentions are the recommended universal path because they 
 - `dispatcher.js` only retries queue delivery into the bound live thread after the current run is quiet
 - `responder.js` only relays finished answers back out
 - `team-relay-consumer.js` only reads the shared relay and queues relevant group messages
+- `team-relay-server.js` stores and serves shared relay events for machines that cannot share one local file
 - none of them are allowed to invent an answer on their own

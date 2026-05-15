@@ -138,7 +138,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "bridge_relay_once":
       return textResult(await relayRepliesOnce());
     case "bridge_team_relay_once":
-      return textResult(consumeTeamRelayOnce());
+      return textResult(await consumeTeamRelayOnce());
     case "bridge_tail_activity":
       return textResult(tailActivity(Number(args.lines || 20)));
     default:

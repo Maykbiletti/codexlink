@@ -10,7 +10,7 @@ $skipTelegramSetup = $false
 $promptParts = @()
 $parsedArgs = @($args)
 
-$directCommands = @("telegram-status", "telegram-doctor", "telegram-setup", "doctor")
+$directCommands = @("telegram-status", "telegram-doctor", "telegram-setup", "telegram-relay-server", "doctor")
 for ($scanIndex = 0; $scanIndex -lt $parsedArgs.Count; $scanIndex++) {
   $token = $parsedArgs[$scanIndex]
   if ($token -in @("--profile", "--telegram", "--workspace")) {
@@ -24,6 +24,14 @@ for ($scanIndex = 0; $scanIndex -lt $parsedArgs.Count; $scanIndex++) {
     }
     if ($scanIndex -lt ($parsedArgs.Count - 1)) {
       $commandArgs += @($parsedArgs[($scanIndex + 1)..($parsedArgs.Count - 1)])
+    }
+    if ($token -eq "telegram-relay-server") {
+      $nodeArgs = @((Join-Path $runtimeRoot "telegram-plugin\team-relay-server.js"))
+      if ($scanIndex -lt ($parsedArgs.Count - 1)) {
+        $nodeArgs += @($parsedArgs[($scanIndex + 1)..($parsedArgs.Count - 1)])
+      }
+      & node @nodeArgs
+      exit $LASTEXITCODE
     }
     $scriptName = switch ($token) {
       "telegram-status" { "telegram-status.ps1" }

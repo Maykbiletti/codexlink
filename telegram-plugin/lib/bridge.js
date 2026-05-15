@@ -2498,10 +2498,10 @@ export async function pollOnce() {
   };
 }
 
-export function consumeTeamRelayOnce() {
+export async function consumeTeamRelayOnce() {
   const config = loadConfig();
   const state = loadState(config);
-  const delta = readTeamRelayDelta(config);
+  const delta = await readTeamRelayDelta(config);
   if (delta.disabled) {
     return { ok: true, status: "disabled", captured: 0, ignored: 0 };
   }
