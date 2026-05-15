@@ -191,25 +191,20 @@ function Get-QueueTitle {
   }
 
   $queued = @($State.queue | Where-Object { $_.status -eq "queued" })
-  $pendingReplies = @(Get-OpenPendingReplies -State $State)
-  $totalWaiting = $queued.Count + $pendingReplies.Count
-  if ($totalWaiting -eq 0) {
+  if ($queued.Count -eq 0) {
     return $FallbackTitle
   }
 
   $directCount = @($queued | Where-Object { @("direct", "lane") -contains [string]$_.relevance }).Count
   $ambientCount = @($queued | Where-Object { [string]$_.relevance -eq "ambient" }).Count
   $escalationCount = @($queued | Where-Object { [string]$_.relevance -eq "escalation" }).Count
-  $pendingCount = $pendingReplies.Count
 
   $nextDirect = @($queued | Where-Object { @("direct", "lane", "escalation") -contains [string]$_.relevance } | Select-Object -First 1)
   $nextAny = @($queued | Select-Object -First 1)
-  $pendingFocus = @($pendingReplies | Sort-Object @{ Expression = { [string]$_.createdAt } } | Select-Object -First 1)
-  $focus = if ($pendingFocus.Count -gt 0) { $pendingFocus[0] } elseif ($nextDirect.Count -gt 0) { $nextDirect[0] } elseif ($nextAny.Count -gt 0) { $nextAny[0] } else { $null }
-  $preview = if ($focus) { Format-QueuePreview -Entry $focus -Pending:($pendingFocus.Count -gt 0) } else { "" }
+  $focus = if ($nextDirect.Count -gt 0) { $nextDirect[0] } elseif ($nextAny.Count -gt 0) { $nextAny[0] } else { $null }
+  $preview = if ($focus) { Format-QueuePreview -Entry $focus } else { "" }
 
-  $parts = @("Q:$totalWaiting")
-  if ($pendingCount -gt 0) { $parts += "P:$pendingCount" }
+  $parts = @("Q:$($queued.Count)")
   if ($directCount -gt 0) { $parts += "D:$directCount" }
   if ($ambientCount -gt 0) { $parts += "G:$ambientCount" }
   if ($escalationCount -gt 0) { $parts += "E:$escalationCount" }
@@ -337,36 +332,26 @@ function Get-QueueNotice {
   }
 
   $queued = @($State.queue | Where-Object { $_.status -eq "queued" })
-  $pendingReplies = @(Get-OpenPendingReplies -State $State)
-  $totalWaiting = $queued.Count + $pendingReplies.Count
-  if ($totalWaiting -eq 0) {
+  if ($queued.Count -eq 0) {
     return ""
   }
 
   $directCount = @($queued | Where-Object { @("direct", "lane") -contains [string]$_.relevance }).Count
   $ambientCount = @($queued | Where-Object { [string]$_.relevance -eq "ambient" }).Count
   $escalationCount = @($queued | Where-Object { [string]$_.relevance -eq "escalation" }).Count
-  $pendingCount = $pendingReplies.Count
 
   $focus = @($queued | Where-Object { @("direct", "lane", "escalation") -contains [string]$_.relevance } | Select-Object -First 1)
   if ($focus.Count -eq 0) {
     $focus = @($queued | Select-Object -First 1)
   }
-  $pendingFocus = @($pendingReplies | Sort-Object @{ Expression = { [string]$_.createdAt } } | Select-Object -First 1)
 
-  $parts = @("$totalWaiting waiting")
-  if ($pendingCount -gt 0) { $parts += "pending $pendingCount" }
+  $parts = @("$($queued.Count) queued")
   if ($directCount -gt 0) { $parts += "direct $directCount" }
   if ($ambientCount -gt 0) { $parts += "group $ambientCount" }
   if ($escalationCount -gt 0) { $parts += "escalation $escalationCount" }
   $parts += (Get-QueueWaitReason -State $State -IdleCooldownMs $IdleCooldownMs)
 
-  if ($pendingFocus.Count -gt 0) {
-    $preview = Format-QueuePreview -Entry $pendingFocus[0] -MaxLength 72 -Pending
-    if ($preview) {
-      $parts += $preview
-    }
-  } elseif ($focus.Count -gt 0) {
+  if ($focus.Count -gt 0) {
     $preview = Format-QueuePreview -Entry $focus[0] -MaxLength 72
     if ($preview) {
       $parts += $preview

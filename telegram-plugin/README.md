@@ -10,8 +10,9 @@ It is intentionally **not** an autonomous answer bot.
 - stores inbound and outbound history under a local state directory
 - keeps private chats and group threads separated
 - binds a live thread id
-- injects the next queued Telegram message into that exact live thread only after the session is idle
-- keeps injected Telegram messages visible as pending until the matching answer is sent
+- injects direct/private/lane Telegram messages into the active app-server thread
+- steers active turns when the app-server supports it
+- keeps queued Telegram messages visible when they are waiting instead of ready to deliver
 - sends explicit manual replies from the visible operator session
 - keeps ambient group noise queued unless it is relevant to that operator
 - lets escalation-style messages bypass the normal idle queue
@@ -47,7 +48,7 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 
 - `BLUN_TELEGRAM_AGENT_NAME`
 - `BLUN_TELEGRAM_BOT_TOKEN`
-- `BLUN_TELEGRAM_ALLOWED_CHAT_ID` (`chatId` or comma-separated list like `1605241602,-1003927574737`)
+- `BLUN_TELEGRAM_ALLOWED_CHAT_ID` (`chatId` or comma-separated list like `123456789,-1001234567890`)
 - `BLUN_TELEGRAM_CODEX_BIN`
 - `BLUN_TELEGRAM_THREAD_ID`
 - `BLUN_TELEGRAM_RESUME_TIMEOUT_MS`

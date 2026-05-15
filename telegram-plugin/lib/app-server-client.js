@@ -55,10 +55,42 @@ function extractTurnId(response) {
     || "";
 }
 
+function extractActiveTurnId(turnsResponse) {
+  const turns = Array.isArray(turnsResponse?.result?.data) ? turnsResponse.result.data : [];
+  const active = turns.find((turn) => String(turn?.status || "").trim() === "inProgress");
+  return String(active?.id || "").trim();
+}
+
 function extractThreadPath(response) {
   return response?.result?.thread?.path
     || response?.result?.path
     || "";
+}
+
+function normalizeUserInput(input) {
+  const items = Array.isArray(input) ? input : [];
+  return items.map((item) => {
+    if (!item || typeof item !== "object") {
+      return item;
+    }
+    if (item.type === "text" && !Array.isArray(item.text_elements)) {
+      return {
+        ...item,
+        text_elements: []
+      };
+    }
+    return item;
+  });
+}
+
+function buildTextInput(text) {
+  return [
+    {
+      type: "text",
+      text,
+      text_elements: []
+    }
+  ];
 }
 
 export class AppServerClient {
@@ -220,14 +252,12 @@ export async function startThreadOverWs(options) {
 export async function startTextTurnOverWs(options) {
   const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
   try {
+    const input = Array.isArray(options.input) && options.input.length > 0
+      ? normalizeUserInput(options.input)
+      : buildTextInput(options.text);
     const response = await client.request("turn/start", {
       threadId: options.threadId,
-      input: [
-        {
-          type: "text",
-          text: options.text
-        }
-      ],
+      input,
       model: options.model || null,
       effort: options.effort || null,
       personality: options.personality || null
@@ -256,11 +286,115 @@ export async function startTextTurnOverWs(options) {
   }
 }
 
+export async function startOrSteerTextTurnOverWs(options) {
+  const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
+  try {
+    const input = Array.isArray(options.input) && options.input.length > 0
+      ? normalizeUserInput(options.input)
+      : buildTextInput(options.text);
+
+    let activeTurnId = "";
+    try {
+      const turnsResponse = await client.request("thread/turns/list", {
+        threadId: options.threadId,
+        limit: 8,
+        itemsView: "notLoaded"
+      }, { timeoutMs: Math.min(options.timeoutMs || 20000, 5000) });
+      activeTurnId = extractActiveTurnId(turnsResponse);
+    } catch {
+      activeTurnId = "";
+    }
+
+    if (activeTurnId) {
+      try {
+        const steerResponse = await client.request("turn/steer", {
+          threadId: options.threadId,
+          expectedTurnId: activeTurnId,
+          input,
+          responsesapiClientMetadata: {
+            source: "telegram"
+          }
+        }, { timeoutMs: options.timeoutMs || 20000 });
+
+        return {
+          ok: true,
+          busy: false,
+          steered: true,
+          turnId: extractTurnId(steerResponse) || activeTurnId,
+          response: steerResponse
+        };
+      } catch (error) {
+        const details = `${error?.message || error}`.toLowerCase();
+        const notSteerable = details.includes("activeturnnotsteerable")
+          || details.includes("not steerable")
+          || details.includes("cannot accept same-turn steering");
+        const staleTurn = details.includes("expectedturnid")
+          || details.includes("precondition")
+          || details.includes("does not match")
+          || details.includes("no active turn");
+        if (notSteerable) {
+          return {
+            ok: false,
+            busy: true,
+            steered: true,
+            turnId: activeTurnId,
+            error
+          };
+        }
+        if (!staleTurn) {
+          return {
+            ok: false,
+            busy: true,
+            steered: true,
+            turnId: activeTurnId,
+            error
+          };
+        }
+      }
+    }
+
+    const response = await client.request("turn/start", {
+      threadId: options.threadId,
+      input,
+      model: options.model || null,
+      effort: options.effort || null,
+      personality: options.personality || null,
+      responsesapiClientMetadata: {
+        source: "telegram"
+      }
+    }, { timeoutMs: options.timeoutMs || 20000 });
+
+    return {
+      ok: true,
+      busy: false,
+      steered: false,
+      turnId: extractTurnId(response),
+      response
+    };
+  } catch (error) {
+    const details = `${error?.message || error}`.toLowerCase();
+    const busy = details.includes("active turn")
+      || details.includes("cannot accept")
+      || details.includes("already running")
+      || details.includes("busy");
+
+    return {
+      ok: false,
+      busy,
+      steered: false,
+      error
+    };
+  } finally {
+    await client.close();
+  }
+}
+
 export async function readThreadOverWs(options) {
   const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 10000 });
   try {
     const response = await client.request("thread/read", {
-      threadId: options.threadId
+      threadId: options.threadId,
+      includeTurns: Boolean(options.includeTurns)
     }, { timeoutMs: options.timeoutMs || 10000 });
     const threadId = extractThreadId(response);
     return {

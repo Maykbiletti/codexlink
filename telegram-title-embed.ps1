@@ -10,7 +10,29 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 
-if (-not ("BlunEmbeddedQueueTitleWatcher" -as [type])) {
+function Stop-EmbeddedQueueTitleWatcher {
+  param([string]$TypeName)
+
+  try {
+    $type = $TypeName -as [type]
+    if ($null -eq $type) { return }
+
+    $flags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static
+    $field = $type.GetField("_timer", $flags)
+    if ($null -eq $field) { return }
+
+    $timer = $field.GetValue($null)
+    if ($null -ne $timer) {
+      $timer.Dispose()
+      $field.SetValue($null, $null)
+    }
+  } catch {}
+}
+
+Stop-EmbeddedQueueTitleWatcher -TypeName "BlunEmbeddedQueueTitleWatcher"
+Stop-EmbeddedQueueTitleWatcher -TypeName "BlunEmbeddedQueueTitleWatcherQueueOnlyV2"
+
+if (-not ("BlunEmbeddedQueueTitleWatcherQueueOnlyV2" -as [type])) {
   Add-Type -ReferencedAssemblies "System.Web.Extensions" -TypeDefinition @"
 using System;
 using System.Collections;
@@ -19,7 +41,7 @@ using System.IO;
 using System.Threading;
 using System.Web.Script.Serialization;
 
-public static class BlunEmbeddedQueueTitleWatcher
+public static class BlunEmbeddedQueueTitleWatcherQueueOnlyV2
 {
     private static Timer _timer;
     private static string _stateFile;
@@ -29,6 +51,8 @@ public static class BlunEmbeddedQueueTitleWatcher
     private static string _lastNotice = "";
     private static string _lastUiNotice = "";
     private static string _lastUiKind = "";
+    private static int _lastOverlayTop = -1;
+    private static int _lastOverlayWidth = 0;
     private static string _logFile = "";
     private static readonly object Gate = new object();
 
@@ -44,6 +68,8 @@ public static class BlunEmbeddedQueueTitleWatcher
             _lastNotice = "";
             _lastUiNotice = "";
             _lastUiKind = "";
+            _lastOverlayTop = -1;
+            _lastOverlayWidth = 0;
             WriteLog("START");
             TrySetTitle(_baseTitle);
             if (_timer != null)
@@ -131,21 +157,10 @@ public static class BlunEmbeddedQueueTitleWatcher
 
         try
         {
-            var mode = Environment.GetEnvironmentVariable("BLUN_TELEGRAM_CONSOLE_UI_NOTICES") ?? "";
-            var disabled = string.Equals(mode, "0", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "false", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "no", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "off", StringComparison.OrdinalIgnoreCase);
-            var allowAll = string.Equals(mode, "all", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "1", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "true", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "yes", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(mode, "on", StringComparison.OrdinalIgnoreCase);
-            if (!disabled && (allowAll || string.Equals(normalizedKind, "inbound", StringComparison.OrdinalIgnoreCase)))
-            {
-                Console.WriteLine("");
-                Console.WriteLine("[Telegram] " + normalized);
-            }
+            // Never write Telegram queue notices directly into the interactive
+            // Codex terminal. The Codex TUI owns that screen; direct writes can
+            // hide the composer and make Telegram messages look like plain
+            // console text instead of real injected messages.
         }
         catch
         {
@@ -155,6 +170,99 @@ public static class BlunEmbeddedQueueTitleWatcher
         _lastUiNotice = normalized;
         _lastUiKind = normalizedKind;
         WriteLog("UI " + normalizedKind + " " + Normalize(normalized, 220));
+    }
+
+    private static void TryWriteAboveInput(string kind, string notice)
+    {
+        var prefix = string.Equals(kind, "outbound", StringComparison.OrdinalIgnoreCase)
+            ? "Telegram Reply: "
+            : "Telegram Queue: ";
+        var width = 100;
+        try
+        {
+            width = Math.Max(40, Console.WindowWidth);
+        }
+        catch
+        {
+            width = 100;
+        }
+
+        var line = Normalize(prefix + notice, Math.Max(20, width - 1));
+        if (line.Length < width - 1)
+        {
+            line = line + new string(' ', Math.Max(0, width - 1 - line.Length));
+        }
+
+        var left = 0;
+        var top = 0;
+        try
+        {
+            left = Console.CursorLeft;
+            top = Console.CursorTop;
+        }
+        catch
+        {
+            Console.WriteLine(prefix + notice);
+            return;
+        }
+
+        try
+        {
+            var bufferHeight = Math.Max(1, Console.BufferHeight);
+            var bufferWidth = Math.Max(1, Console.BufferWidth);
+            var windowTop = Math.Max(0, Console.WindowTop);
+            var windowHeight = Math.Max(1, Console.WindowHeight);
+            var bottomOffset = GetOverlayBottomOffset();
+            var targetTop = windowTop + Math.Max(0, windowHeight - bottomOffset);
+            targetTop = Math.Min(Math.Max(windowTop, targetTop), Math.Max(0, bufferHeight - 1));
+            var targetWidth = Math.Max(1, width - 1);
+
+            if (_lastOverlayTop >= 0 && _lastOverlayTop < bufferHeight)
+            {
+                Console.SetCursorPosition(0, _lastOverlayTop);
+                Console.Write(new string(' ', Math.Max(0, _lastOverlayWidth)));
+            }
+
+            Console.SetCursorPosition(0, targetTop);
+            var previousForeground = Console.ForegroundColor;
+            try
+            {
+                Console.ForegroundColor = ConsoleColor.DarkCyan;
+                Console.Write(line.Substring(0, Math.Min(line.Length, targetWidth)));
+            }
+            finally
+            {
+                Console.ForegroundColor = previousForeground;
+            }
+            _lastOverlayTop = targetTop;
+            _lastOverlayWidth = targetWidth;
+
+            var restoreTop = Math.Min(Math.Max(0, top), Math.Max(0, bufferHeight - 1));
+            var restoreLeft = Math.Min(Math.Max(0, left), Math.Max(0, width - 1));
+            Console.SetCursorPosition(restoreLeft, restoreTop);
+        }
+        catch
+        {
+            try
+            {
+                Console.SetCursorPosition(left, top);
+            }
+            catch
+            {
+            }
+            Console.WriteLine(prefix + notice);
+        }
+    }
+
+    private static int GetOverlayBottomOffset()
+    {
+        var raw = Environment.GetEnvironmentVariable("BLUN_TELEGRAM_CONSOLE_UI_BOTTOM_OFFSET") ?? "";
+        int parsed;
+        if (int.TryParse(raw, out parsed) && parsed >= 2 && parsed <= 12)
+        {
+            return parsed;
+        }
+        return 3;
     }
 
     private static void BuildSnapshot(out string title, out string notice, out string uiNotice, out string uiKind)
@@ -192,30 +300,10 @@ public static class BlunEmbeddedQueueTitleWatcher
         }
 
         int total = 0;
-        int pending = 0;
         int direct = 0;
         int ambient = 0;
         int escalation = 0;
         string preview = "";
-
-        var pendingReplies = root.ContainsKey("pendingReplies") ? AsObjects(root["pendingReplies"]) : new object[0];
-        foreach (var item in pendingReplies)
-        {
-            var entry = item as Dictionary<string, object>;
-            if (entry == null || !IsOpenPendingReply(entry))
-            {
-                continue;
-            }
-
-            total += 1;
-            pending += 1;
-            CountRelevance(entry, ref direct, ref ambient, ref escalation);
-
-            if (string.IsNullOrWhiteSpace(preview))
-            {
-                preview = FormatPreview(entry, 44, true);
-            }
-        }
 
         var queue = AsObjects(root["queue"]);
         foreach (var item in queue)
@@ -253,15 +341,13 @@ public static class BlunEmbeddedQueueTitleWatcher
         }
 
         var parts = new List<string> { "Q:" + total.ToString() };
-        if (pending > 0) parts.Add("P:" + pending.ToString());
         if (direct > 0) parts.Add("D:" + direct.ToString());
         if (ambient > 0) parts.Add("G:" + ambient.ToString());
         if (escalation > 0) parts.Add("E:" + escalation.ToString());
 
         var suffix = string.Join(" ", parts.ToArray());
         title = _baseTitle + " | " + suffix;
-        var noticeParts = new List<string> { total.ToString() + " waiting" };
-        if (pending > 0) noticeParts.Add("pending " + pending.ToString());
+        var noticeParts = new List<string> { total.ToString() + " queued" };
         if (direct > 0) noticeParts.Add("direct " + direct.ToString());
         if (ambient > 0) noticeParts.Add("group " + ambient.ToString());
         if (escalation > 0) noticeParts.Add("escalation " + escalation.ToString());
@@ -452,4 +538,4 @@ try {
   $ambientTtlMs = 600000
 }
 
-[BlunEmbeddedQueueTitleWatcher]::Start($StateFile, $BaseTitle, $ambientTtlMs, $LogFile)
+[BlunEmbeddedQueueTitleWatcherQueueOnlyV2]::Start($StateFile, $BaseTitle, $ambientTtlMs, $LogFile)

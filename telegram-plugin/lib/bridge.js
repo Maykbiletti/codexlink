@@ -1,9 +1,9 @@
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { basename, extname, join } from "node:path";
 import { listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { loadConfig } from "./env.js";
 import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
-import { getUpdates, sendChatAction, sendMessage } from "./telegram.js";
+import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
 
 function loadState(config) {
@@ -384,6 +384,19 @@ function escapeRegExp(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function startsWithAgentAddress(normalized, mention) {
+  // normalizeTriggerText strips most punctuation, so this covers "Otto?",
+  // "Otto:", "/otto", "!otto", "#otto" and "[otto]" as "otto".
+  return new RegExp(`^@?${mention}\\b(?:\\s|$)`, "u").test(normalized);
+}
+
+function startsWithTeamAddressList(normalized, mention) {
+  // Group chats often address multiple agents in one breath: "Angel, Otto ...".
+  // Keep this conservative: only treat it as direct if Otto is in the first
+  // small address block at the beginning, not if Otto is mentioned later.
+  return new RegExp(`^(?:@?[a-z][a-z0-9_-]{1,24}\\b\\s+){1,3}@?${mention}\\b(?:\\s|$)`, "u").test(normalized);
+}
+
 function looksLikeStatusBroadcast(text) {
   const normalized = foldTriggerText(text);
   if (/^status(?:\s|$|[~:.-])/u.test(normalized)) {
@@ -408,7 +421,7 @@ function isAgentAddressed(config, text) {
 
   for (const name of mentionNames) {
     const mention = escapeRegExp(name);
-    const startsAddressed = new RegExp(`^@?${mention}\\b(?:\\s|\\s*[-:,]|$)`, "u").test(normalized);
+    const startsAddressed = startsWithAgentAddress(normalized, mention) || startsWithTeamAddressList(normalized, mention);
     if (startsAddressed) {
       return true;
     }
@@ -423,8 +436,13 @@ function isAgentAddressed(config, text) {
       return true;
     }
 
-    const imperativeAfterMention = new RegExp(`\\b@?${mention}\\b\\s+(?:bitte|please|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|debugge|fix|patch|mach|setz|starte|antwort|melde)\\b`, "u").test(normalized);
+    const imperativeAfterMention = new RegExp(`\\b@?${mention}\\b\\s+(?:bitte|please|du|kannst|kann|sollst|soll|bekommst|bekommt|kriegst|erhaeltst|erhaltst|brauchst|brauche|hilf|unterstuetz|unterstuetze|sag|schick|send|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|test|debugge|fix|patch|mach|setz|starte|aktivier|antwort|melde|bescheid)\\b`, "u").test(normalized);
     if (imperativeAfterMention) {
+      return true;
+    }
+
+    const workDirective = new RegExp(`\\b@?${mention}\\b[\\s\\S]{0,120}\\b(?:bitte|please|du|kannst|kann|sollst|soll|bekommst|bekommt|kriegst|erhaeltst|erhaltst|brauchst|brauche|hilf|unterstuetz|unterstuetze|sag|schick|send|weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|test|debugge|fix|patch|setz|starte|aktivier|antwort|melde|bescheid|signal|live|stream|chunk|content)\\b|\\b(?:brauchst|brauche|hilf|unterstuetz|unterstuetze|sag|schick|send|weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|test|debugge|fix|patch|setz|starte|aktivier|antwort|melde|bescheid|signal|live|stream|chunk|content)\\b[\\s\\S]{0,120}\\b@?${mention}\\b`, "u").test(normalized);
+    if (workDirective) {
       return true;
     }
   }
@@ -445,7 +463,7 @@ function isOtherAgentAddressed(config, text) {
 
   for (const name of mentionNames) {
     const mention = escapeRegExp(name);
-    const startsAddressed = new RegExp(`^@?${mention}\\b(?:\\s|\\s*[-:,]|$)`, "u").test(normalized);
+    const startsAddressed = startsWithAgentAddress(normalized, mention) || startsWithTeamAddressList(normalized, mention);
     if (startsAddressed) {
       return true;
     }
@@ -460,7 +478,7 @@ function isOtherAgentAddressed(config, text) {
       return true;
     }
 
-    const workDirective = new RegExp(`\\b@?${mention}\\b[\\s\\S]{0,80}\\b(?:bitte|please|weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|debugge|fix|patch|setz|starte|antwort|melde|uebersetz|ubersetz|translate)\\b|\\b(?:weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|debugge|fix|patch|setz|starte|antwort|melde|uebersetz|ubersetz|translate)\\b[\\s\\S]{0,80}\\b@?${mention}\\b`, "u").test(normalized);
+    const workDirective = new RegExp(`\\b@?${mention}\\b[\\s\\S]{0,120}\\b(?:bitte|please|du|kannst|kann|sollst|soll|bekommst|bekommt|kriegst|erhaeltst|erhaltst|brauchst|brauche|hilf|unterstuetz|unterstuetze|sag|schick|send|weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|test|debugge|fix|patch|setz|starte|aktivier|antwort|melde|bescheid|signal|live|stream|chunk|content|uebersetz|ubersetz|translate)\\b|\\b(?:brauchst|brauche|hilf|unterstuetz|unterstuetze|sag|schick|send|weiter|continue|mach|pull|abruf|abrufen|zieh|hol|hole|pruef|pruf|teste|test|debugge|fix|patch|setz|starte|aktivier|antwort|melde|bescheid|signal|live|stream|chunk|content|uebersetz|ubersetz|translate)\\b[\\s\\S]{0,120}\\b@?${mention}\\b`, "u").test(normalized);
     if (workDirective) {
       return true;
     }
@@ -1014,6 +1032,135 @@ function mergeStateSnapshots(currentState, incomingState) {
   return merged;
 }
 
+const IMAGE_EXTENSIONS = new Set([".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"]);
+
+function sanitizeAttachmentName(name) {
+  const raw = basename(String(name || "").replace(/\0/g, "")).replace(/\.\./g, "");
+  const cleaned = raw.replace(/[^0-9A-Za-z._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return cleaned || "telegram-file.bin";
+}
+
+function safePathPart(value) {
+  return String(value || "")
+    .replace(/[^0-9A-Za-z_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    || "telegram";
+}
+
+function isImageMimeOrName(mimeType, name) {
+  const mime = String(mimeType || "").toLowerCase();
+  if (mime.startsWith("image/")) {
+    return true;
+  }
+  return IMAGE_EXTENSIONS.has(extname(String(name || "")).toLowerCase());
+}
+
+function pickTelegramAttachment(message) {
+  const messageId = String(message?.message_id || Date.now());
+  const photos = Array.isArray(message?.photo) ? message.photo : [];
+  if (photos.length > 0) {
+    const photo = [...photos].sort((left, right) => Number(left?.file_size || 0) - Number(right?.file_size || 0)).pop();
+    if (photo?.file_id) {
+      return {
+        kind: "photo",
+        fileId: String(photo.file_id),
+        fileUniqueId: String(photo.file_unique_id || ""),
+        originalName: `telegram-photo-${messageId}.jpg`,
+        mimeType: "image/jpeg",
+        sizeBytes: Number(photo.file_size || 0),
+        isImage: true
+      };
+    }
+  }
+
+  const document = message?.document;
+  if (document?.file_id) {
+    const originalName = String(document.file_name || `telegram-document-${messageId}`);
+    const mimeType = String(document.mime_type || "application/octet-stream");
+    return {
+      kind: "document",
+      fileId: String(document.file_id),
+      fileUniqueId: String(document.file_unique_id || ""),
+      originalName,
+      mimeType,
+      sizeBytes: Number(document.file_size || 0),
+      isImage: isImageMimeOrName(mimeType, originalName)
+    };
+  }
+
+  const video = message?.video || message?.animation;
+  if (video?.file_id) {
+    const mimeType = String(video.mime_type || "video/mp4");
+    return {
+      kind: message?.animation ? "animation" : "video",
+      fileId: String(video.file_id),
+      fileUniqueId: String(video.file_unique_id || ""),
+      originalName: String(video.file_name || `telegram-video-${messageId}.mp4`),
+      mimeType,
+      sizeBytes: Number(video.file_size || 0),
+      isImage: false
+    };
+  }
+
+  return null;
+}
+
+async function stageTelegramAttachment(config, inbound) {
+  if (!inbound?.attachment?.fileId) {
+    delete inbound.attachment;
+    return;
+  }
+
+  const attachment = inbound.attachment;
+  const maxBytes = Math.max(Number(config.attachmentMaxBytes || 0), 1);
+  try {
+    const file = await getFileInfo(config, attachment.fileId);
+    if (!file?.file_path) {
+      throw new Error("Telegram returned no file path");
+    }
+
+    const fileSize = Number(file.file_size || attachment.sizeBytes || 0);
+    if (fileSize > maxBytes) {
+      throw new Error(`file too large (${Math.round(fileSize / 1024 / 1024)} MB, max ${Math.round(maxBytes / 1024 / 1024)} MB)`);
+    }
+
+    const buffer = await downloadFileBuffer(config, file.file_path);
+    if (buffer.byteLength > maxBytes) {
+      throw new Error(`file too large (${Math.round(buffer.byteLength / 1024 / 1024)} MB, max ${Math.round(maxBytes / 1024 / 1024)} MB)`);
+    }
+
+    const fallbackName = basename(file.file_path) || attachment.originalName || "telegram-file.bin";
+    const originalName = attachment.originalName || fallbackName;
+    const safeName = sanitizeAttachmentName(originalName.includes(".") ? originalName : fallbackName);
+    const dir = join(
+      config.paths.attachmentsDir,
+      `${safePathPart(inbound.chatId)}_${safePathPart(inbound.messageId)}`
+    );
+    mkdirSync(dir, { recursive: true });
+    const localPath = join(dir, safeName);
+    writeFileSync(localPath, buffer);
+
+    inbound.attachments = [{
+      ...attachment,
+      originalName,
+      safeName,
+      sizeBytes: buffer.byteLength,
+      telegramFilePath: file.file_path,
+      localPath,
+      isImage: Boolean(attachment.isImage || isImageMimeOrName(attachment.mimeType, safeName))
+    }];
+    appendLog(config.paths.activityFile, `ATTACHMENT_SAVED chat=${inbound.chatId} message=${inbound.messageId} file=${safeName} bytes=${buffer.byteLength}`);
+  } catch (error) {
+    inbound.attachments = [{
+      ...attachment,
+      error: String(error?.message || error)
+    }];
+    appendLog(config.paths.activityFile, `ATTACHMENT_ERROR chat=${inbound.chatId} message=${inbound.messageId}: ${String(error?.message || error)}`);
+  } finally {
+    delete inbound.attachment;
+  }
+}
+
 function normalizeInbound(message) {
   const text = message.text ?? message.caption ?? "";
   const chatType = String(message.chat?.type || "unknown");
@@ -1033,6 +1180,7 @@ function normalizeInbound(message) {
     user: message.from?.username || message.from?.first_name || "unknown",
     userId: message.from?.id ? String(message.from.id) : "",
     text,
+    attachment: pickTelegramAttachment(message),
     ts: nowIso(),
     intent: "message",
     relevance: "ambient",
@@ -1321,7 +1469,13 @@ function shouldPublishInboundUiNotice(entry) {
 }
 
 function formatCompactInboundUiNotice(entry) {
-  const text = normalizeWhitespace(repairMojibake(entry?.text || "")).slice(0, 180);
+  let text = normalizeWhitespace(repairMojibake(entry?.text || "")).slice(0, 180);
+  if (!text && Array.isArray(entry?.attachments) && entry.attachments.length > 0) {
+    const first = entry.attachments[0];
+    text = first?.isImage ? "sendete einen Screenshot" : `sendete ${first?.originalName || "eine Datei"}`;
+  } else if (!text && entry?.attachment) {
+    text = entry.attachment.isImage ? "sendete einen Screenshot" : `sendete ${entry.attachment.originalName || "eine Datei"}`;
+  }
   if (!text) {
     return "";
   }
@@ -1592,8 +1746,17 @@ function normalizeThreadTimestampMs(value) {
   return numeric > 100000000000 ? numeric : numeric * 1000;
 }
 
+function parseRuntimeStartedAtMs(runtime) {
+  const parsed = Date.parse(String(runtime?.started_at || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function buildHistoryText(message) {
-  const text = String(message.text || "").trim();
+  let text = String(message.text || "").trim();
+  if (!text && Array.isArray(message.attachments) && message.attachments.length > 0) {
+    const first = message.attachments[0];
+    text = first?.isImage ? "[Telegram screenshot]" : `[Telegram file: ${first?.originalName || "attachment"}]`;
+  }
   const chatType = String(message.chatType || "");
   if (chatType === "private" || !chatType) {
     return text;
@@ -1702,6 +1865,7 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
 
     const runtimeOwner = getRuntimeOwner(config);
     const runtimeThreadId = String(runtimeOwner?.runtime?.thread_id || "").trim();
+    const runtimeStartedAtMs = parseRuntimeStartedAtMs(runtimeOwner?.runtime);
     const pinnedThreadId = String(preferredThreadId || config.currentThreadId || runtimeThreadId || "").trim();
     if (options.forcePreferred && pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
       if (state.currentThreadId !== pinnedThreadId) {
@@ -1732,11 +1896,14 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
         const source = String(thread.source || "").toLowerCase();
         const statusType = String(thread.status?.type || "").toLowerCase();
         if (source === "cli" && statusType === "active") {
-          score += 1000000000000000;
+          score += 4000000000000000;
         } else if (statusType === "active") {
-          score += 900000000000000;
+          score += 3000000000000000;
         } else if (source === "cli") {
-          score += 800000000000000;
+          score += 2000000000000000;
+        }
+        if (runtimeStartedAtMs > 0 && createdAtMs >= runtimeStartedAtMs - 120000) {
+          score += 1000000000000000;
         }
         const sessionPath = String(thread.path || "").trim();
         if (sessionPath && existsSync(sessionPath)) {
@@ -1806,7 +1973,7 @@ export function bridgeStatus() {
     lastPollAt: state.lastPollAt,
     lastInjectAt: state.lastInjectAt,
     stateDir: config.paths.root,
-    note: "Telegram first lands in queue. Automatic delivery waits for an idle session, skips ambient group noise, and still lets escalations through."
+    note: "Telegram first lands in queue. Direct/private/lane messages are delivered immediately in app-server mode; active turns receive them via turn/steer. Ambient group noise stays parked."
   };
 }
 
@@ -1968,7 +2135,7 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED_IDLE_BRIEF chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
-    if (!inbound.text.trim()) {
+    if (!inbound.text.trim() && !inbound.attachment) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED_EMPTY chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
@@ -1993,6 +2160,7 @@ export async function pollOnce() {
         telegramThreadId: inbound.telegramThreadId
       }).catch(() => {});
     }
+    await stageTelegramAttachment(config, inbound);
     state.queue.push(inbound);
     state.lastInbound = inbound;
     if (shouldPublishInboundUiNotice(inbound)) {
@@ -2089,6 +2257,15 @@ function isFastDispatchEntry(entry) {
     return true;
   }
   return false;
+}
+
+function isRealtimeAppServerEntry(entry) {
+  if (!entry) {
+    return false;
+  }
+  const relevance = String(entry.relevance || "").trim().toLowerCase();
+  const chatType = String(entry.chatType || "").trim().toLowerCase();
+  return chatType === "private" || relevance === "direct" || relevance === "lane";
 }
 
 export async function injectNext(threadId, options = {}) {
@@ -2188,9 +2365,16 @@ export async function injectNext(threadId, options = {}) {
     saveStateForConfig(config, state);
   }
 
-  const bypassDeferredGate = auto && (next.relevance === "escalation" || isFastDispatchEntry(next));
+  const bypassDeferredGate = auto && (
+    next.relevance === "escalation"
+    || isFastDispatchEntry(next)
+    || (useAppServer && isRealtimeAppServerEntry(next))
+  );
   if (bypassDeferredGate && auto && isFastDispatchEntry(next)) {
     appendLog(config.paths.activityFile, `FAST_TRIGGER_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent}`);
+  }
+  if (bypassDeferredGate && auto && useAppServer && isRealtimeAppServerEntry(next) && !isFastDispatchEntry(next)) {
+    appendLog(config.paths.activityFile, `REALTIME_BYPASS chat=${next.chatId} message=${next.messageId} relevance=${next.relevance || "-"} chat_type=${next.chatType || "-"}`);
   }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
@@ -2296,6 +2480,10 @@ export async function injectNext(threadId, options = {}) {
   state.lastAutoDispatchAt = auto ? state.lastInjectAt : state.lastAutoDispatchAt;
   const latestState = loadState(config);
   saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+  const injectPreview = normalizeWhitespace(result.responseText || result.stderr || "").slice(0, 220);
+  if (injectPreview) {
+    appendLog(config.paths.activityFile, `INJECT_RESULT thread=${resolvedThreadId} message=${next.messageId}: ${injectPreview}`);
+  }
   appendLog(config.paths.activityFile, `INJECT_${result.ok ? "OK" : "ERROR"} thread=${resolvedThreadId} message=${next.messageId}`);
   return {
     ok: result.ok,

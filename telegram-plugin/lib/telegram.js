@@ -27,6 +27,21 @@ export async function getUpdates(config, offset) {
   });
 }
 
+export async function getFileInfo(config, fileId) {
+  return telegramRequest(config, "getFile", {
+    file_id: fileId
+  });
+}
+
+export async function downloadFileBuffer(config, filePath) {
+  requireToken(config);
+  const response = await fetch(`https://api.telegram.org/file/bot${config.botToken}/${filePath}`);
+  if (!response.ok) {
+    throw new Error(`Telegram file download failed: ${response.status}`);
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
 export async function sendMessage(config, { chatId, text, replyToMessageId, telegramThreadId }) {
   return telegramRequest(config, "sendMessage", {
     chat_id: chatId,

@@ -471,6 +471,11 @@ if ($telegramEnvOverride) {
 
 $codexArgs = @()
 
+if ($profile.model) {
+  $codexArgs += "--model"
+  $codexArgs += $profile.model
+}
+
 if ($profile.reasoning_effort) {
   $codexArgs += "-c"
   $codexArgs += ("model_reasoning_effort=""" + $profile.reasoning_effort + """")
@@ -749,20 +754,28 @@ if ($useRemoteAppServer) {
       if ($loadedIds.Count -gt 0) {
         $activeThreadId = [string]$loadedIds[$loadedIds.Count - 1]
         $bestThreadScore = [double]::NegativeInfinity
+        $runtimeStartedAtMs = 0
+        try {
+          $runtimeStartedAtMs = [DateTimeOffset]::Parse([string]$currentRuntime.started_at).ToUnixTimeMilliseconds()
+        } catch {
+          $runtimeStartedAtMs = 0
+        }
         foreach ($candidate in $loadedIds) {
           $candidateThreadId = [string]$candidate
           if ([string]::IsNullOrWhiteSpace($candidateThreadId)) {
             continue
           }
           $threadScore = 0.0
+          $threadCreatedAtMs = 0.0
           try {
             $candidateInfo = Invoke-NodeJsonWithRetry -NodeArgs @($bootstrapScript, "read-thread", "--ws-url", $telegramAppServerWsUrl, "--thread-id", $candidateThreadId) -Attempts 1 -DelayMs 0
             $thread = $candidateInfo.response.result.thread
             if ($null -ne $thread -and $null -ne $thread.createdAt) {
-              $threadScore = [double]$thread.createdAt
-              if ($threadScore -gt 0 -and $threadScore -lt 1000000000000) {
-                $threadScore = $threadScore * 1000
+              $threadCreatedAtMs = [double]$thread.createdAt
+              if ($threadCreatedAtMs -gt 0 -and $threadCreatedAtMs -lt 1000000000000) {
+                $threadCreatedAtMs = $threadCreatedAtMs * 1000
               }
+              $threadScore = $threadCreatedAtMs
             }
             $threadSource = ""
             $threadStatusType = ""
@@ -773,11 +786,14 @@ if ($useRemoteAppServer) {
               $threadStatusType = ([string]$thread.status.type).ToLowerInvariant()
             }
             if ($threadSource -eq "cli" -and $threadStatusType -eq "active") {
-              $threadScore += 1000000000000000
+              $threadScore += 4000000000000000
             } elseif ($threadStatusType -eq "active") {
-              $threadScore += 900000000000000
+              $threadScore += 3000000000000000
             } elseif ($threadSource -eq "cli") {
-              $threadScore += 800000000000000
+              $threadScore += 2000000000000000
+            }
+            if ($runtimeStartedAtMs -gt 0 -and $threadCreatedAtMs -ge ($runtimeStartedAtMs - 120000)) {
+              $threadScore += 1000000000000000
             }
           } catch {
             $threadScore = 0.0

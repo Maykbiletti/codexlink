@@ -1,7 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
-import { join } from "node:path";
-import { startTextTurnOverWs } from "./app-server-client.js";
+import { spawn, spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { startOrSteerTextTurnOverWs } from "./app-server-client.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const runtimeRoot = join(here, "..", "..");
 
 function repairMojibake(value) {
   const input = String(value || "");
@@ -86,12 +90,64 @@ function summarizeBrief(text) {
 function compactInboundText(message) {
   const text = String(message.text || "").trim();
   if (!text) {
+    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+      return "hat eine Datei per Telegram gesendet.";
+    }
     return "";
   }
   if (/^---\s*BRIEF\b/i.test(text)) {
     return summarizeBrief(text);
   }
   return text;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+  if (value < 1024) {
+    return `${Math.round(value)} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatAttachmentInstructions(message) {
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (attachments.length === 0) {
+    return [];
+  }
+
+  const lines = [
+    "",
+    "Telegram-Anhang:"
+  ];
+
+  for (const attachment of attachments) {
+    if (attachment?.error) {
+      lines.push(`- ${attachment.kind || "Datei"} konnte nicht geladen werden: ${attachment.error}`);
+      continue;
+    }
+    const label = attachment.isImage ? "Bild/Screenshot" : (attachment.kind || "Datei");
+    const meta = [
+      attachment.mimeType,
+      formatBytes(attachment.sizeBytes)
+    ].filter(Boolean).join(", ");
+    const name = attachment.originalName || attachment.safeName || "telegram-file";
+    lines.push(`- ${label}: ${name}${meta ? ` (${meta})` : ""}`);
+    lines.push(`  Lokaler Pfad: ${attachment.localPath}`);
+  }
+
+  if (attachments.some((attachment) => attachment?.isImage && attachment?.localPath)) {
+    lines.push("Die Bilddatei wurde als lokaler Bild-Input an diesen Turn angehaengt. Nutze sie direkt fuer Screenshot-/UI-Analyse.");
+  } else {
+    lines.push("Nutze die lokalen Pfade, wenn du den Inhalt der Datei pruefen oder weiterverarbeiten sollst.");
+  }
+
+  return lines;
 }
 
 function normalizeAddressText(value) {
@@ -147,6 +203,7 @@ function buildPrompt(config, message) {
     header.push(label);
   }
   header.push(compactText);
+  header.push(...formatAttachmentInstructions(message));
 
   if (message.intent === "continue_nudge") {
     header.push(
@@ -165,12 +222,172 @@ function buildPrompt(config, message) {
   return header.join("\n");
 }
 
+function buildVisibleConsoleText(config, message) {
+  const compactText = compactInboundText(message);
+  const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
+  const parts = [];
+  if (!isBriefSummary) {
+    parts.push(compactInboundLabel(message));
+  }
+  parts.push(compactText);
+  parts.push(...formatAttachmentInstructions(message));
+  if (message.intent === "continue_nudge") {
+    parts.push("Weiter-Signal: Bitte den laufenden Arbeitsfluss fortsetzen und nur antworten, wenn es ein konkretes Ergebnis, einen Blocker oder eine Entscheidung gibt.");
+  }
+  return parts
+    .join("\n")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n")
+    .trim();
+}
+
+function readRuntime(config) {
+  try {
+    if (!config?.paths?.currentRuntimeFile || !existsSync(config.paths.currentRuntimeFile)) {
+      return null;
+    }
+    return JSON.parse(readFileSync(config.paths.currentRuntimeFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid) {
+  const parsed = Number.parseInt(String(pid || "0"), 10);
+  if (!parsed || parsed <= 0) {
+    return false;
+  }
+  try {
+    process.kill(parsed, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getVisibleConsoleSkipReason(config, message) {
+  if (process.platform !== "win32") {
+    return "not_windows";
+  }
+  if (!config.appServerWsUrl) {
+    return "no_app_server";
+  }
+  if (String(process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim() !== "1") {
+    return "env_disabled";
+  }
+  if (Array.isArray(message.attachments) && message.attachments.some((attachment) => attachment?.isImage && attachment?.localPath && !attachment.error)) {
+    return "image_attachment";
+  }
+  return "";
+}
+
+function injectVisibleConsole(config, message) {
+  const skipReason = getVisibleConsoleSkipReason(config, message);
+  if (skipReason) {
+    return { ok: false, skipped: true, reason: skipReason };
+  }
+
+  const runtime = readRuntime(config);
+  const frontendPid = Number.parseInt(String(runtime?.frontend_host_pid || "0"), 10) || 0;
+  if (!isPidAlive(frontendPid)) {
+    return { ok: false, skipped: true, reason: "frontend_offline" };
+  }
+
+  const scriptPath = join(runtimeRoot, "telegram-console-input.ps1");
+  if (!existsSync(scriptPath)) {
+    return { ok: false, skipped: true, reason: "script_missing" };
+  }
+
+  const visibleText = buildVisibleConsoleText(config, message);
+  if (!visibleText) {
+    return { ok: false, skipped: true, reason: "empty" };
+  }
+
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath,
+    "-TargetPid",
+    String(frontendPid),
+    "-Text",
+    visibleText,
+    "-ClearBefore",
+    "-Submit"
+  ], {
+    cwd: runtimeRoot,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 20000
+  });
+
+  if (result.status === 0) {
+    return {
+      ok: true,
+      frontendPid,
+      visibleText
+    };
+  }
+
+  return {
+    ok: false,
+    skipped: false,
+    reason: "script_failed",
+    stderr: String(result.stderr || result.error || "").trim(),
+    stdout: String(result.stdout || "").trim()
+  };
+}
+
+function buildTurnInput(config, message) {
+  const prompt = buildPrompt(config, message);
+  const input = [
+    {
+      type: "text",
+      text: prompt,
+      text_elements: []
+    }
+  ];
+
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  for (const attachment of attachments) {
+    if (!attachment?.isImage || !attachment.localPath || attachment.error) {
+      continue;
+    }
+    input.push({
+      type: "localImage",
+      path: attachment.localPath
+    });
+  }
+
+  return {
+    prompt,
+    input
+  };
+}
+
 export async function injectIntoThread(config, message, threadId) {
+  const turnInput = buildTurnInput(config, message);
   if (config.appServerWsUrl) {
-    const result = await startTextTurnOverWs({
+    const consoleResult = injectVisibleConsole(config, message);
+    if (consoleResult.ok) {
+      return {
+        ok: true,
+        busy: false,
+        turnId: "",
+        code: 0,
+        signal: null,
+        responseText: `console_injected thread=${threadId} frontend_pid=${consoleResult.frontendPid}`,
+        stdout: "",
+        stderr: ""
+      };
+    }
+
+    const result = await startOrSteerTextTurnOverWs({
       wsUrl: config.appServerWsUrl,
       threadId,
-      text: buildPrompt(config, message),
+      text: turnInput.prompt,
+      input: turnInput.input,
       model: config.model || null,
       effort: config.reasoningEffort || null,
       personality: config.personality || null,
@@ -183,7 +400,9 @@ export async function injectIntoThread(config, message, threadId) {
       turnId: result.turnId || "",
       code: result.ok ? 0 : null,
       signal: null,
-      responseText: result.ok ? `turn_started thread=${threadId}` : "",
+      responseText: result.ok
+        ? `${result.steered ? "turn_steered" : "turn_started"} thread=${threadId} console_${consoleResult.skipped ? "skip" : "fail"}=${consoleResult.reason || "unknown"}`
+        : "",
       stdout: "",
       stderr: result.error ? String(result.error.message || result.error) : ""
     };
@@ -192,7 +411,7 @@ export async function injectIntoThread(config, message, threadId) {
   const safeKey = `${message.chatId}_${message.messageId}`.replace(/[^0-9A-Za-z_-]/g, "_");
   const promptFile = `${config.paths.promptsDir}\\${safeKey}.md`;
   const responseFile = `${config.paths.responsesDir}\\${safeKey}.txt`;
-  writeFileSync(promptFile, buildPrompt(config, message), "utf8");
+  writeFileSync(promptFile, turnInput.prompt, "utf8");
 
   return await new Promise((resolve) => {
     let timedOut = false;

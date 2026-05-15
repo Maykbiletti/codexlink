@@ -25,6 +25,7 @@ export function getPaths() {
     inboxFile: join(root, "inbox.jsonl"),
     outboxFile: join(root, "outbox.jsonl"),
     activityFile: join(root, "activity.log"),
+    attachmentsDir: join(root, "attachments"),
     pollerPidFile: join(root, "poller.pid"),
     dispatcherPidFile: join(root, "dispatcher.pid"),
     responderPidFile: join(root, "responder.pid"),
@@ -42,7 +43,7 @@ export function getPaths() {
 
 export function ensureStateLayout() {
   const paths = getPaths();
-  for (const dir of [paths.root, paths.promptsDir, paths.responsesDir, paths.runtimeDir]) {
+  for (const dir of [paths.root, paths.promptsDir, paths.responsesDir, paths.runtimeDir, paths.attachmentsDir]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }

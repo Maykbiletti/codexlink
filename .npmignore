@@ -1,0 +1,11 @@
+*.bak
+*.bak-*
+**/*.bak
+**/*.bak-*
+profiles/*.json
+!profiles/default.json
+.codex/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
