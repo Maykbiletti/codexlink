@@ -1238,12 +1238,14 @@ function normalizeTelegramThreadId(value) {
   return String(value || "").trim();
 }
 
-function isAllowedChat(config, chatId) {
+function isAllowedChat(config, inbound) {
   const allowed = Array.isArray(config.allowedChatIds) ? config.allowedChatIds : [];
   if (allowed.length === 0) {
     return true;
   }
-  return allowed.includes(String(chatId || "").trim());
+  const chatId = String(inbound?.chatId || inbound || "").trim();
+  const userId = String(inbound?.userId || "").trim();
+  return allowed.includes(chatId) || (userId && allowed.includes(userId));
 }
 
 function splitTelegramText(text, maxLength = 3500) {
@@ -2125,9 +2127,9 @@ export async function pollOnce() {
       continue;
     }
     const inbound = normalizeInbound(update.message);
-    if (!isAllowedChat(config, inbound.chatId)) {
+    if (!isAllowedChat(config, inbound)) {
       ignored += 1;
-      appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} message=${inbound.messageId}`);
+      appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} user=${inbound.userId || "-"} message=${inbound.messageId}`);
       continue;
     }
     if (String(inbound.chatType || "") === "private" && looksLikeMnemoIdleLoopBrief(inbound.text)) {

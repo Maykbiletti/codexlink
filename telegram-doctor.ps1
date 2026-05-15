@@ -1,6 +1,7 @@
 param(
   [string]$Profile = "default",
-  [switch]$Json
+  [switch]$Json,
+  [switch]$Fix
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,6 +134,95 @@ function Write-DoctorReport {
   }
 }
 
+function Write-DotEnvFile {
+  param(
+    [string]$Path,
+    [hashtable]$Values
+  )
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path $dir)) {
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  }
+  $lines = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($key in ($Values.Keys | Sort-Object)) {
+    if ([string]::IsNullOrWhiteSpace([string]$key)) { continue }
+    $value = [string]$Values[$key]
+    $lines.Add($key + "=" + $value) | Out-Null
+  }
+  Set-Content -Path $Path -Value $lines -Encoding UTF8
+}
+
+function Stop-PidQuiet {
+  param([object]$PidValue)
+  $pidText = [string]$PidValue
+  if (-not $pidText) { return $false }
+  $pidInt = 0
+  if (-not [int]::TryParse($pidText, [ref]$pidInt)) { return $false }
+  if ($pidInt -le 0) { return $false }
+  try {
+    Stop-Process -Id $pidInt -Force -ErrorAction Stop
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Invoke-RuntimeFix {
+  param(
+    [object]$Status,
+    [string]$RuntimeRoot
+  )
+  $actions = New-Object 'System.Collections.Generic.List[string]'
+  $runtime = $Status.current_runtime
+  if ($runtime) {
+    $pids = @(
+      $runtime.frontend_host_pid,
+      $runtime.app_server_pid,
+      $runtime.queue_notifier_pid,
+      $runtime.poller_pid,
+      $runtime.dispatcher_pid,
+      $runtime.responder_pid
+    ) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($pidValue in $pids) {
+      if (Stop-PidQuiet -PidValue $pidValue) {
+        $actions.Add("stopped_pid=" + [string]$pidValue) | Out-Null
+      }
+    }
+  }
+
+  $runtimeFile = Join-Path $env:USERPROFILE (".codex\runtimes\" + [string]$Status.profile + "\current-remote-runtime.json")
+  if (Test-Path $runtimeFile) {
+    Remove-Item -LiteralPath $runtimeFile -Force -ErrorAction SilentlyContinue
+    $actions.Add("removed_runtime_file") | Out-Null
+  }
+
+  $envFile = Join-Path ([string]$Status.state_dir) ".env"
+  $envValues = Read-DotEnvFile -Path $envFile
+  if ($envValues.ContainsKey("BLUN_TELEGRAM_THREAD_ID")) {
+    $envValues["BLUN_TELEGRAM_THREAD_ID"] = ""
+    Write-DotEnvFile -Path $envFile -Values $envValues
+    $actions.Add("cleared_env_thread") | Out-Null
+  }
+
+  $stateFile = Join-Path ([string]$Status.state_dir) "state.json"
+  if (Test-Path $stateFile) {
+    try {
+      $state = Get-Content -Raw -Path $stateFile | ConvertFrom-Json
+      if ($state.PSObject.Properties.Name.Contains("currentThreadId")) {
+        $state.currentThreadId = ""
+      } else {
+        $state | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue ""
+      }
+      $state | ConvertTo-Json -Depth 10 | Set-Content -Path $stateFile -Encoding UTF8
+      $actions.Add("cleared_state_thread") | Out-Null
+    } catch {
+      $actions.Add("state_thread_clear_failed") | Out-Null
+    }
+  }
+
+  return @($actions)
+}
+
 function Get-ProfilePath {
   param(
     [string]$RuntimeRoot,
@@ -230,6 +320,17 @@ Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) 
 Add-Check -List $checks -Name "app_server_ws" -Status $(if ($status.active_ws) { "ok" } else { "warn" }) -Detail $(if ($status.active_ws) { $status.active_ws } else { "No active websocket recorded." })
 Add-Check -List $checks -Name "dispatch_mode" -Status $(if ($status.dispatch_mode -eq "deferred") { "ok" } else { "warn" }) -Detail ("mode=" + [string]$status.dispatch_mode + " cooldown_ms=" + [string]$status.idle_cooldown_ms + " pending_reply_timeout_ms=" + [string]$status.pending_reply_timeout_ms)
 Add-Check -List $checks -Name "bound_thread" -Status $(if ($status.active_thread_id) { "ok" } else { "warn" }) -Detail $(if ($status.active_thread_id) { $status.active_thread_id } else { "No active thread bound yet." })
+$loadedThreads = @($status.loaded_threads | Where-Object { $_ })
+$threadVisibilityStatus = "ok"
+$threadVisibilityDetail = "loaded=" + [string]$loadedThreads.Count
+if ($loadedThreads.Count -gt 1) {
+  $threadVisibilityStatus = "warn"
+  $threadVisibilityDetail = "multiple loaded threads: " + (($loadedThreads | ForEach-Object { [string]$_ }) -join ",") + ". Run telegram-doctor --fix, then restart telegram-plugin."
+} elseif ($status.active_thread_id -and $loadedThreads.Count -eq 1 -and ([string]$loadedThreads[0]) -ne ([string]$status.active_thread_id)) {
+  $threadVisibilityStatus = "warn"
+  $threadVisibilityDetail = "bound thread differs from loaded visible thread. Run telegram-doctor --fix, then restart telegram-plugin."
+}
+Add-Check -List $checks -Name "thread_visibility" -Status $threadVisibilityStatus -Detail $threadVisibilityDetail
 Add-Check -List $checks -Name "frontend_owner" -Status $(if ($status.frontend_owner_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.frontend_owner_pid + " alive=" + [string]$status.frontend_owner_alive)
 Add-Check -List $checks -Name "queue_notifier" -Status $(if (($null -eq $status.queue_notifier_pid) -or ($status.queue_notifier_alive)) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.queue_notifier_pid + " alive=" + [string]$status.queue_notifier_alive)
 Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.poller_pid + " alive=" + [string]$status.poller_alive)
@@ -272,6 +373,22 @@ $result = [ordered]@{
   plugin_root = $status.plugin_root
   checks = $checks
   status = $status
+}
+
+if ($Fix) {
+  $fixActions = Invoke-RuntimeFix -Status $status -RuntimeRoot $runtimeRoot
+  $result["fix_actions"] = $fixActions
+  if ($Json) {
+    $result | ConvertTo-Json -Depth 8
+    exit 0
+  }
+  Write-DoctorReport -Result $result -TokenSource $tokenSource -AllowedChatSource $allowedChatSource
+  Write-Host ""
+  Write-Host "Fix angewendet. Starte danach neu: blun-codex --profile $($result.profile) telegram-plugin" -ForegroundColor Yellow
+  if ($fixActions.Count -gt 0) {
+    Write-Host ("Aktionen: " + ($fixActions -join ", ")) -ForegroundColor DarkGray
+  }
+  exit 0
 }
 
 if ($Json) {

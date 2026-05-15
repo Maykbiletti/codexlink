@@ -129,6 +129,13 @@ Doctor:
 blun-codex telegram-doctor
 ```
 
+Runtime automatisch bereinigen, wenn mehrere Threads geladen sind oder eine alte Bindung klemmt:
+
+```powershell
+blun-codex telegram-doctor --fix
+blun-codex telegram-plugin
+```
+
 JSON doctor output:
 
 ```powershell
