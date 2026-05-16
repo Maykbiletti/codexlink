@@ -2617,9 +2617,6 @@ function getQueuedDispatchPriority(item) {
   if (relevance === "escalation") {
     return 0;
   }
-  if (isFastDispatchEntry(item)) {
-    return 1;
-  }
   if (chatType === "private" || relevance === "direct" || relevance === "lane") {
     return 2;
   }
@@ -2657,25 +2654,6 @@ function selectNextQueuedEntry(queue, options = {}) {
     return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane";
   });
   return eligible.sort(compareQueuedDispatchOrder)[0] || null;
-}
-
-function isFastDispatchEntry(entry) {
-  if (!entry) {
-    return false;
-  }
-  if (String(entry.intent || "").trim().toLowerCase() === "continue_nudge") {
-    return true;
-  }
-  return false;
-}
-
-function isRealtimeAppServerEntry(entry) {
-  if (!entry) {
-    return false;
-  }
-  const relevance = String(entry.relevance || "").trim().toLowerCase();
-  const chatType = String(entry.chatType || "").trim().toLowerCase();
-  return chatType === "private" || relevance === "direct" || relevance === "lane";
 }
 
 function isGroupChatEntry(entry) {
@@ -2789,11 +2767,8 @@ export async function injectNext(threadId, options = {}) {
   }
 
   const bypassDeferredGate = auto && next.relevance === "escalation";
-  if (bypassDeferredGate && auto && isFastDispatchEntry(next)) {
-    appendLog(config.paths.activityFile, `FAST_TRIGGER_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent}`);
-  }
-  if (bypassDeferredGate && auto && useAppServer && isRealtimeAppServerEntry(next) && !isFastDispatchEntry(next)) {
-    appendLog(config.paths.activityFile, `REALTIME_BYPASS chat=${next.chatId} message=${next.messageId} relevance=${next.relevance || "-"} chat_type=${next.chatType || "-"}`);
+  if (bypassDeferredGate) {
+    appendLog(config.paths.activityFile, `ESCALATION_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
   }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
