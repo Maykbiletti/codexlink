@@ -53,6 +53,33 @@ function Test-AllowedChatIdsFormat {
   return $true
 }
 
+function Test-TeamRelayUrl {
+  param(
+    [string]$Url,
+    [string]$Secret
+  )
+  if (-not $Url) {
+    return [pscustomobject]@{ ok = $false; detail = "not configured" }
+  }
+  try {
+    $builder = [System.UriBuilder]::new($Url)
+    $query = [System.Web.HttpUtility]::ParseQueryString($builder.Query)
+    $query["after"] = "tail"
+    $builder.Query = $query.ToString()
+    $headers = @{}
+    if ($Secret) {
+      $headers["Authorization"] = "Bearer $Secret"
+    }
+    $response = Invoke-WebRequest -Uri $builder.Uri.AbsoluteUri -Headers $headers -UseBasicParsing -TimeoutSec 3
+    if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+      return [pscustomobject]@{ ok = $true; detail = "reachable" }
+    }
+    return [pscustomobject]@{ ok = $false; detail = ("HTTP " + [string]$response.StatusCode) }
+  } catch {
+    return [pscustomobject]@{ ok = $false; detail = [string]$_.Exception.Message }
+  }
+}
+
 function Get-OverallStatus {
   param([System.Collections.Generic.List[object]]$Checks)
   if (@($Checks | Where-Object { $_.status -eq "fail" }).Count -gt 0) {
@@ -338,11 +365,26 @@ Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok
 Add-Check -List $checks -Name "dispatcher" -Status $(if ($status.dispatcher_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.dispatcher_pid + " alive=" + [string]$status.dispatcher_alive)
 Add-Check -List $checks -Name "responder" -Status $(if ($status.responder_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.responder_pid + " alive=" + [string]$status.responder_alive)
 $teamRelayMode = ([string]$status.team_relay_mode).ToLower()
+$groupDeliveryMode = ([string]$status.group_delivery).ToLower()
 $teamRelayConfigured = $status.team_relay_file -or $status.team_relay_url_configured
 $teamRelayShouldRun = @("consume", "both") -contains $teamRelayMode
 $teamRelayConfigStatus = if ($teamRelayMode -eq "off") { "ok" } elseif ($teamRelayConfigured) { "ok" } else { "warn" }
 $teamRelayConfigDetail = "mode=" + [string]$status.team_relay_mode + " file=" + $(if ($status.team_relay_file) { [string]$status.team_relay_file } else { "-" }) + " url=" + $(if ($status.team_relay_url_configured) { "configured" } else { "-" })
 Add-Check -List $checks -Name "team_relay_config" -Status $teamRelayConfigStatus -Detail $teamRelayConfigDetail
+$teamRelayUrl = [string]$activeEnv["BLUN_TELEGRAM_TEAM_RELAY_URL"]
+if ($teamRelayUrl) {
+  $relayProbe = Test-TeamRelayUrl -Url $teamRelayUrl -Secret ([string]$activeEnv["BLUN_TELEGRAM_TEAM_RELAY_SECRET"])
+  Add-Check -List $checks -Name "team_relay_url" -Status $(if ($relayProbe.ok) { "ok" } else { "warn" }) -Detail $relayProbe.detail
+} elseif ($groupDeliveryMode -eq "observe") {
+  Add-Check -List $checks -Name "team_relay_url" -Status "warn" -Detail "No shared relay URL. File relay only works when every agent reads the same absolute file path on the same host."
+}
+if ($groupDeliveryMode -eq "observe" -and $teamRelayMode -eq "off") {
+  Add-Check -List $checks -Name "observe_team_relay" -Status "warn" -Detail "observe is enabled, but team relay is off. Other bots' messages may not reach this CLI."
+} elseif ($groupDeliveryMode -eq "observe" -and -not $teamRelayConfigured) {
+  Add-Check -List $checks -Name "observe_team_relay" -Status "warn" -Detail "observe is enabled, but no team relay file or URL is configured."
+} else {
+  Add-Check -List $checks -Name "observe_team_relay" -Status "ok" -Detail ("group_delivery=" + [string]$status.group_delivery + " relay_mode=" + [string]$status.team_relay_mode)
+}
 if ($teamRelayShouldRun -and $teamRelayConfigured) {
   Add-Check -List $checks -Name "team_relay_consumer" -Status $(if ($status.team_relay_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.team_relay_pid + " alive=" + [string]$status.team_relay_alive)
 } else {

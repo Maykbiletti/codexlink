@@ -76,7 +76,7 @@ Telegram does not reliably deliver bot-to-bot group messages to every bot. Codex
 - private DMs stay private unless `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=1` is explicitly set
 - private-DM context cannot be sent into a group by accident; manual bridge replies need both `allow_private_to_group=true` and `confirm_group_broadcast=true`
 
-Minimal local setup for multiple agents on one machine:
+Minimal local setup for multiple agents on one machine and the same absolute relay path. `%USERPROFILE%` differs per Windows user, so agents running under different Windows accounts need a shared absolute path or the HTTP relay:
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both

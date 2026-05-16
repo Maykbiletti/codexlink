@@ -156,7 +156,7 @@ Team-Relay fuer Agent-Gruppen:
 
 Telegram liefert Bot-Nachrichten in Gruppen nicht verlaesslich als raw update an andere Bots. Fuer echte Agent-zu-Agent-Kommunikation nutzt CodexLink deshalb optional einen gemeinsamen Relay-Kanal. Damit werden menschliche Gruppen-Nachrichten und Agent-Outbounds zusaetzlich als JSONL-Events abgelegt oder an einen zentralen Relay-Endpunkt gesendet und von anderen Profilen konsumiert.
 
-Auf einer Maschine reicht eine gemeinsame Datei:
+Auf einer Maschine reicht eine gemeinsame Datei nur dann, wenn wirklich alle Agents denselben absoluten Pfad lesen und schreiben. `%USERPROFILE%` ist pro Windows-User anders; Profile unter unterschiedlichen Windows-Accounts brauchen deshalb ebenfalls einen gemeinsamen absoluten Pfad oder den HTTP-Relay.
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
@@ -193,6 +193,8 @@ Doctor:
 ```powershell
 blun-codex telegram-doctor
 ```
+
+Der Doctor prueft im Team-Modus jetzt auch, ob `observe` zusammen mit Team-Relay laeuft und ob ein konfigurierter HTTP-Relay-Endpunkt erreichbar ist. Wenn ein Agent Nachrichten anderer Bots nicht sieht, ist der entscheidende Check: Die Nachricht muss in `activity.log`, `inbox.jsonl` oder im gemeinsamen Relay auftauchen. Fehlt sie dort, ist es kein Trigger-/Promptproblem, sondern der sendende Agent publiziert nicht in denselben Relay.
 
 Runtime automatisch bereinigen, wenn mehrere Threads geladen sind oder eine alte Bindung klemmt:
 
