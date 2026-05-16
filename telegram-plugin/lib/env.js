@@ -39,6 +39,9 @@ function parseGroupDeliveryMode(rawValue) {
   if (["mention", "mentions", "addressed", "strict"].includes(value)) {
     return "mentions";
   }
+  if (["observe", "observer", "listen", "context", "all-context", "all_context"].includes(value)) {
+    return "observe";
+  }
   if (["ambient", "queue", "park"].includes(value)) {
     return "ambient";
   }

@@ -118,6 +118,14 @@ Kurze Namens-Pings wie `Codex`, `Assistant` oder ein eigener Profilname werden s
 
 Gruppen-Nachrichten werden standardmaessig ebenfalls an die aktive CLI geliefert. Das ist der beste Default fuer oeffentliche Setups und Single-Agent-Bots: Telegram ist nur der Transport, der sichtbare Agent entscheidet im Thread selbst, ob die Nachricht fuer ihn relevant ist. Universal-Trigger wie `/ask`, `/debug`, `@assistant`, `ai explain this`, `hilfe`, `erklaer`, `hjalp`, `ayuda`, `aide`, `aiuto`, `ajuda` oder `pomoc` werden zusaetzlich als direkte Agent-Intents erkannt.
 
+Fuer echte Agent-Teams ist der empfohlene Modus:
+
+```text
+BLUN_TELEGRAM_GROUP_DELIVERY=observe
+```
+
+Dann bekommt jeder Codex-Agent alle Gruppen-Nachrichten als Kontext in die aktive CLI. Direkt adressierte Nachrichten bleiben `direct`; nicht adressierte Gruppen-Nachrichten laufen als `observe`. `observe` wird injiziert, erzeugt aber keine automatische Telegram-Antwort. Der Agent soll nur reagieren, wenn er direkt gemeint ist, sein Scope betroffen ist, eine falsche Annahme korrigiert werden muss oder eine konkrete Entscheidung/Handlung sichtbar ist.
+
 Wenn mehrere Agents denselben Gruppenchat wirklich strikt teilen, kann der alte konservative Modus aktiviert werden:
 
 ```text
@@ -174,7 +182,7 @@ BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 
 Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit expliziter Gruppenbroadcast-Freigabe in eine Gruppe senden. Technisch braucht ein manueller Bridge-Reply dafuer beide Flags: `allow_private_to_group=true` und `confirm_group_broadcast=true`.
 
-Direkt adressierte Team-Bot-Nachrichten werden im Gruppenmodus wie normale Teamarbeit behandelt. Wenn z. B. `angeliathebot` oder ein Relay-Event `Alfred bitte pruefen` schreibt, darf die Nachricht in die sichtbare CLI injiziert werden und eine Gruppenantwort erzeugen. Ambient Bot-Geraeusch ohne Agent-Ansprache bleibt geparkt/ignoriert.
+Direkt adressierte Team-Bot-Nachrichten werden im Gruppenmodus wie normale Teamarbeit behandelt. Wenn z. B. `angeliathebot` oder ein Relay-Event `Alfred bitte pruefen` schreibt, darf die Nachricht in die sichtbare CLI injiziert werden und eine Gruppenantwort erzeugen. Im `observe`-Modus sieht der Agent auch nicht adressierte Team-Nachrichten, antwortet aber nicht automatisch darauf.
 
 Im Standardmodus `BLUN_TELEGRAM_DISPATCH_MODE=deferred` werden Telegram-Nachrichten wie normale Codex-CLI-Eingaben behandelt: Wenn der sichtbare Run noch aktiv ist, bleibt die Nachricht in der lokalen Queue und wird erst nach dem aktuellen Run injiziert. Normale `direct`-Nachrichten und `weiter`-Signale umgehen diese Sperre nicht; nur echte `escalation`-Eintraege duerfen sofort durch.
 

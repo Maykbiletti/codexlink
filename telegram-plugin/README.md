@@ -58,7 +58,7 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS`
 - `BLUN_TELEGRAM_PROGRESS_RELAY` (`status` by default, `commentary` to mirror commentary updates, `off` to disable progress notices)
 - `BLUN_TELEGRAM_DISPATCH_MODE` (`deferred` by default, `legacy` to restore eager dispatch)
-- `BLUN_TELEGRAM_GROUP_DELIVERY` (`all` by default for public/single-agent bridges, `mentions` for strict multi-agent routing)
+- `BLUN_TELEGRAM_GROUP_DELIVERY` (`all` by default for public/single-agent bridges, `observe` for team-wide context delivery without automatic replies, `mentions` for strict multi-agent routing)
 - `BLUN_TELEGRAM_TEAM_RELAY_MODE` (`off`, `publish`, `consume`, or `both`)
 - `BLUN_TELEGRAM_TEAM_RELAY_FILE` (shared JSONL relay file for one machine or mounted team state)
 - `BLUN_TELEGRAM_TEAM_RELAY_URL` (shared HTTP relay endpoint for multiple machines)
@@ -72,7 +72,7 @@ Telegram does not reliably deliver bot-to-bot group messages to every bot. Codex
 
 - every participating agent can publish inbound group messages it sees
 - every participating agent can publish its own outbound Telegram messages
-- every participating agent can consume the shared relay and queue only messages relevant to its profile
+- every participating agent can consume the shared relay and, with `BLUN_TELEGRAM_GROUP_DELIVERY=observe`, receive all group messages as context while only replying to direct/scope-relevant work
 - private DMs stay private unless `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=1` is explicitly set
 - private-DM context cannot be sent into a group by accident; manual bridge replies need both `allow_private_to_group=true` and `confirm_group_broadcast=true`
 
@@ -101,6 +101,14 @@ BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 
 Agent outbound messages should still publish to the relay, because Telegram may not expose those bot messages as raw updates to other bots.
+
+Recommended team mode:
+
+```text
+BLUN_TELEGRAM_GROUP_DELIVERY=observe
+```
+
+In this mode direct messages and explicit agent mentions still behave as actionable work. Other group messages are injected as `observe` context so the agent can keep situational awareness, but CodexLink does not track an automatic Telegram reply for them.
 
 ## Public trigger model
 

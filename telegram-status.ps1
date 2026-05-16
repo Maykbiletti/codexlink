@@ -130,6 +130,7 @@ $queued = @($queue | Where-Object {
   return $true
 })
 $directQueued = @($queued | Where-Object { @("direct", "lane") -contains [string]$_.relevance })
+$observeQueued = @($queued | Where-Object { [string]$_.relevance -eq "observe" })
 $ambientQueued = @($queued | Where-Object { [string]$_.relevance -eq "ambient" })
 $escalationQueued = @($queued | Where-Object { [string]$_.relevance -eq "escalation" })
 $submitted = @($queue | Where-Object { $_.status -eq "submitted" })
@@ -153,7 +154,7 @@ $eligibleQueued = if ($dispatchMode -eq "legacy") {
   @($queued)
 } else {
   @($queued | Where-Object {
-    [string]$_.chatType -eq "private" -or @("direct", "lane", "escalation") -contains [string]$_.relevance
+    [string]$_.chatType -eq "private" -or @("direct", "lane", "escalation", "observe") -contains [string]$_.relevance
   })
 }
 $nextQueued = @(
@@ -162,7 +163,8 @@ $nextQueued = @(
       @{ Expression = {
           if ([string]$_.relevance -eq "escalation") { 0 }
           elseif ([string]$_.chatType -eq "private" -or @("direct", "lane") -contains [string]$_.relevance) { 1 }
-          else { 2 }
+          elseif ([string]$_.relevance -eq "observe") { 2 }
+          else { 3 }
         }
       },
       @{ Expression = { [string]$_.ts } },
@@ -257,6 +259,7 @@ $result = [ordered]@{
   queue_depth = $queued.Count
   visible_waiting_depth = ($queued.Count + $pendingReplies.Count)
   direct_queue_depth = $directQueued.Count
+  observe_queue_depth = $observeQueued.Count
   ambient_queue_depth = $ambientQueued.Count
   escalation_queue_depth = $escalationQueued.Count
   parked_queue_depth = $staleAmbientQueued.Count

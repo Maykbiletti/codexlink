@@ -375,7 +375,7 @@ if ($status.last_outbound) {
   Add-Check -List $checks -Name "last_outbound" -Status "warn" -Detail "No outbound Telegram message recorded yet."
 }
 
-Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " ambient=" + $status.ambient_queue_depth + " parked=" + $status.parked_queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth + " expired_pending_replies=" + $status.expired_pending_reply_depth)
+Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " observe=" + $status.observe_queue_depth + " ambient=" + $status.ambient_queue_depth + " parked=" + $status.parked_queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth + " expired_pending_replies=" + $status.expired_pending_reply_depth)
 
 $result = [ordered]@{
   profile = $status.profile

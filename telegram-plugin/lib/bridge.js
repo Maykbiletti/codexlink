@@ -226,6 +226,10 @@ function shouldDeliverAllGroupMessages(config) {
   return groupDeliveryMode(config) === "all";
 }
 
+function shouldObserveAllGroupMessages(config) {
+  return groupDeliveryMode(config) === "observe";
+}
+
 function looksLikeUniversalAgentIntent(text) {
   const normalized = foldTriggerText(text);
   if (!normalized) {
@@ -648,7 +652,7 @@ function classifyInboundRelevance(config, inbound) {
   }
 
   if (!isStatusBroadcast && isOtherAgentAddressed(config, text)) {
-    return "ambient";
+    return isGroupChat && shouldObserveAllGroupMessages(config) ? "observe" : "ambient";
   }
 
   if (String(inbound.chatType || "") === "private") {
@@ -656,7 +660,7 @@ function classifyInboundRelevance(config, inbound) {
   }
 
   if (isStatusBroadcast) {
-    return "ambient";
+    return isGroupChat && shouldObserveAllGroupMessages(config) ? "observe" : "ambient";
   }
 
   if (looksLikeEscalation(text)) {
@@ -672,8 +676,12 @@ function classifyInboundRelevance(config, inbound) {
     return "direct";
   }
 
+  if (isGroupChat && shouldObserveAllGroupMessages(config)) {
+    return "observe";
+  }
+
   if (inbound.senderIsBot) {
-    return "ambient";
+    return isGroupChat && shouldObserveAllGroupMessages(config) ? "observe" : "ambient";
   }
 
   return "ambient";
@@ -1792,7 +1800,7 @@ function shouldPublishInboundUiNotice(entry) {
   }
   const chatType = String(entry.chatType || "").toLowerCase();
   const relevance = String(entry.relevance || "").toLowerCase();
-  return chatType === "private" || ["direct", "lane", "escalation"].includes(relevance);
+  return chatType === "private" || ["direct", "lane", "escalation", "observe"].includes(relevance);
 }
 
 function formatCompactInboundUiNotice(entry) {
@@ -2017,6 +2025,9 @@ function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionO
 
 function shouldTrackPendingReply(config, message) {
   if (!message) {
+    return false;
+  }
+  if (String(message.relevance || "").trim().toLowerCase() === "observe") {
     return false;
   }
   if (looksLikeBotSender(message) && !shouldReplyToTeamBotSender(config, message)) {
@@ -2282,6 +2293,7 @@ export function bridgeStatus() {
   const submitted = state.queue.filter((item) => item.status === "submitted");
   const parked = state.queue.filter((item) => item.status === "parked");
   const ambient = queued.filter((item) => item.relevance === "ambient");
+  const observe = queued.filter((item) => item.relevance === "observe");
   const pendingReplies = (state.pendingReplies || []).filter((item) => isNonTerminalPendingReply(item));
   const expiredReplies = (state.pendingReplies || []).filter((item) => String(item.status || "") === "expired");
   return {
@@ -2295,6 +2307,7 @@ export function bridgeStatus() {
     idleCooldownMs: config.idleCooldownMs,
     pendingReplyTimeoutMs: config.pendingReplyTimeoutMs,
     queueDepth: queued.length,
+    observeQueueDepth: observe.length,
     ambientQueueDepth: ambient.length,
     parkedQueueDepth: parked.length,
     submittedDepth: submitted.length,
@@ -2307,7 +2320,7 @@ export function bridgeStatus() {
     lastInjectAt: state.lastInjectAt,
     teamRelay: teamRelayStatus(config),
     stateDir: config.paths.root,
-    note: "Telegram first lands in queue. By default group delivery is all, so public/single-agent bridges pass group messages to the visible agent. Set BLUN_TELEGRAM_GROUP_DELIVERY=mentions for strict multi-agent routing."
+    note: "Telegram first lands in queue. Use BLUN_TELEGRAM_GROUP_DELIVERY=observe for team-wide group visibility without automatic Telegram replies, all for eager group delivery, mentions for strict routing."
   };
 }
 
@@ -2651,7 +2664,7 @@ function selectNextQueuedEntry(queue, options = {}) {
   const eligible = queued.filter((item) => {
     const relevance = String(item.relevance || "").toLowerCase();
     const chatType = String(item.chatType || "").toLowerCase();
-    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane";
+    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane" || relevance === "observe";
   });
   return eligible.sort(compareQueuedDispatchOrder)[0] || null;
 }

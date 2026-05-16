@@ -184,7 +184,8 @@ function buildAgentRuntimeContext(config) {
     `[CodexLink Agent Context: You are ${name}.`,
     lane ? `Assigned lane: ${lane}. Stay inside this lane unless the user explicitly redirects you.` : "Stay inside your assigned profile scope.",
     "Treat short greetings or name-only pings as reachability checks, not translation/correction tasks.",
-    "For a greeting, reply briefly and naturally as this agent. Do not ask whether to translate, correct, or rewrite unless the user asks for that."
+    "For a greeting, reply briefly and naturally as this agent. Do not ask whether to translate, correct, or rewrite unless the user asks for that.",
+    "When writing to humans, be short, concrete, and natural. Avoid AI filler, long acknowledgements, corporate phrasing, and repeating the user's wording."
   ];
   if (customPrompt) {
     lines.push(customPrompt);
@@ -212,6 +213,13 @@ function buildPrompt(config, message) {
     );
   }
 
+  if (String(message.relevance || "").toLowerCase() === "observe") {
+    header.push(
+      "",
+      "[Gruppen-Kontext: Diese Nachricht wurde dir zur Lagebeobachtung zugestellt. Reagiere nur, wenn du direkt angesprochen wirst, dein Scope betroffen ist, eine Fehlannahme korrigiert werden muss oder eine konkrete Handlung/Entscheidung sichtbar ist. Wenn nichts davon zutrifft, keine Antwort und kein Tool-Lauf.]"
+    );
+  }
+
   if (isAddressOnlyPing(config, compactText)) {
     header.push(
       "",
@@ -233,6 +241,9 @@ function buildVisibleConsoleText(config, message) {
   parts.push(...formatAttachmentInstructions(message));
   if (message.intent === "continue_nudge") {
     parts.push("Weiter-Signal: Bitte den laufenden Arbeitsfluss fortsetzen und nur antworten, wenn es ein konkretes Ergebnis, einen Blocker oder eine Entscheidung gibt.");
+  }
+  if (String(message.relevance || "").toLowerCase() === "observe") {
+    parts.push("Gruppen-Kontext: Nur handeln oder antworten, wenn du direkt gemeint bist, dein Scope betroffen ist oder eine konkrete Korrektur/Entscheidung nötig ist.");
   }
   return parts
     .join("\n")
