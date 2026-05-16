@@ -124,7 +124,9 @@ Fuer echte Agent-Teams ist der empfohlene Modus:
 BLUN_TELEGRAM_GROUP_DELIVERY=observe
 ```
 
-Dann bekommt jeder Codex-Agent alle Gruppen-Nachrichten als Kontext in die aktive CLI. Direkt adressierte Nachrichten bleiben `direct`; nicht adressierte Gruppen-Nachrichten laufen als `observe`. `observe` wird injiziert, erzeugt aber keine automatische Telegram-Antwort. Der Agent soll nur reagieren, wenn er direkt gemeint ist, sein Scope betroffen ist, eine falsche Annahme korrigiert werden muss oder eine konkrete Entscheidung/Handlung sichtbar ist.
+Dann bekommt jeder Codex-Agent alle Gruppen-Nachrichten als Kontext in die aktive CLI. Direkt adressierte Nachrichten bleiben `direct`; nicht adressierte Gruppen-Nachrichten laufen als `observe`. `observe` wird injiziert, erzeugt aber keine automatische Telegram-Antwort.
+
+Observe-Regel: grundsaetzlich still bleiben. Der Agent antwortet oder handelt nur, wenn die Nachricht ausdruecklich in die Runde fragt (`jemand eine Idee?`, `kann wer pruefen?`, `wer weiss das?`), der eigene Scope betroffen ist, ein konkreter Fehler oder ein Risiko erkennbar ist, oder eine kurze fachliche Antwort echten Mehrwert bringt. Keine Antwort bei normalem Status anderer Agents, Smalltalk, fremden Arbeitsuebergaben ohne eigene Zustaendigkeit oder reinen Bot-Logs.
 
 Wenn mehrere Agents denselben Gruppenchat wirklich strikt teilen, kann der alte konservative Modus aktiviert werden:
 
