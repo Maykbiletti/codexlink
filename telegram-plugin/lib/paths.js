@@ -30,6 +30,7 @@ export function getPaths() {
     dispatcherPidFile: join(root, "dispatcher.pid"),
     responderPidFile: join(root, "responder.pid"),
     teamRelayPidFile: join(root, "team-relay.pid"),
+    claudeRelayPidFile: join(root, "claude-relay.pid"),
     pollerStdoutFile: join(root, "poller.stdout.log"),
     pollerStderrFile: join(root, "poller.stderr.log"),
     dispatcherStdoutFile: join(root, "dispatcher.stdout.log"),
@@ -39,6 +40,9 @@ export function getPaths() {
     teamRelayStdoutFile: join(root, "team-relay.stdout.log"),
     teamRelayStderrFile: join(root, "team-relay.stderr.log"),
     teamRelayCursorFile: join(root, "team-relay.cursor.json"),
+    claudeRelayStdoutFile: join(root, "claude-relay.stdout.log"),
+    claudeRelayStderrFile: join(root, "claude-relay.stderr.log"),
+    claudeRelayCursorFile: join(root, "claude-relay.cursor.json"),
     historyFile: join(codexHome, "history.jsonl"),
     promptsDir: join(root, "prompts"),
     responsesDir: join(root, "responses")

@@ -283,7 +283,11 @@ function getVisibleConsoleSkipReason(config, message) {
   if (!config.appServerWsUrl) {
     return "no_app_server";
   }
-  const visibleConsoleMode = String(process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim().toLowerCase();
+  const sender = String(message?.user || "").trim();
+  if (message?.relay?.sourceAgent || message?.senderIsBot === true || /_bot$/i.test(sender)) {
+    return "team_bot_submit_path";
+  }
+  const visibleConsoleMode = String(config.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim().toLowerCase();
   if (visibleConsoleMode !== "force") {
     return "env_disabled";
   }

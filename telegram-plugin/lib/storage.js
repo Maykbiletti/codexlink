@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 function sleepSync(ms) {
@@ -32,28 +32,56 @@ export function saveJson(path, value) {
   const text = JSON.stringify(value, null, 2);
   const dir = dirname(path);
   const base = basename(path);
+  const lockPath = join(dir, `.${base}.lock`);
   let lastError = null;
+  let lockFd = null;
 
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const tempPath = join(dir, `.${base}.${process.pid}.${Date.now()}.${attempt}.tmp`);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
     try {
-      writeFileSync(tempPath, text, "utf8");
-      renameSync(tempPath, path);
-      return;
+      lockFd = openSync(lockPath, "wx");
+      break;
     } catch (error) {
       lastError = error;
       try {
-        unlinkSync(tempPath);
+        const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+        if (ageMs > 15000) unlinkSync(lockPath);
       } catch {
-        // Ignore cleanup failures for temp files.
+        // Ignore stale-lock cleanup failures.
       }
-      if (attempt < 5) {
+      if (attempt < 79) {
         sleepSync(25 * (attempt + 1));
       }
     }
   }
 
-  throw lastError || new Error(`Failed to save JSON file: ${path}`);
+  if (lockFd == null) {
+    throw lastError || new Error(`Failed to acquire JSON file lock: ${path}`);
+  }
+
+  try {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const tempPath = join(dir, `.${base}.${process.pid}.${Date.now()}.${attempt}.tmp`);
+      try {
+        writeFileSync(tempPath, text, "utf8");
+        renameSync(tempPath, path);
+        return;
+      } catch (error) {
+        lastError = error;
+        try {
+          unlinkSync(tempPath);
+        } catch {
+          // Ignore cleanup failures for temp files.
+        }
+        if (attempt < 11) {
+          sleepSync(50 * (attempt + 1));
+        }
+      }
+    }
+    throw lastError || new Error(`Failed to save JSON file: ${path}`);
+  } finally {
+    try { closeSync(lockFd); } catch {}
+    try { unlinkSync(lockPath); } catch {}
+  }
 }
 
 export function appendJsonl(path, value) {

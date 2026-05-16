@@ -16,6 +16,11 @@ function saveStateForConfig(config, state) {
   saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(state));
 }
 
+function saveMergedStateForConfig(config, state) {
+  const latestState = loadState(config);
+  saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+}
+
 function persistActiveThreadBinding(config, threadId) {
   const value = String(threadId || "").trim();
   if (!value) {
@@ -245,6 +250,14 @@ function looksLikeUniversalAgentIntent(text) {
   return UNIVERSAL_AGENT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+function looksLikeTeamFinding(text) {
+  const normalized = foldTriggerText(text);
+  if (!normalized) {
+    return false;
+  }
+  return /\b(finding|findings|befund|bug|blocker|acceptance|matrix|report|test|verdict|review|diff|patch|fix|regression|fehler|problem|warnung|kritisch|failed|fail|bestanden|nicht bestanden|teilbestanden|rot|gruen|grun|weiter|brief|scope|todo|offen|priority|prio)\b/u.test(normalized);
+}
+
 const CONTINUE_NEGATIVE_ONLY = new Set([
   "ok",
   "okay",
@@ -459,6 +472,10 @@ function getContinueTriggerScore(text, context = {}) {
 
 function looksLikeContinueNudge(text, context = {}) {
   const score = getContinueTriggerScore(text, context);
+  const words = tokenCount(foldTriggerText(text));
+  if (words > 12 && score < 3) {
+    return false;
+  }
   if (score >= 3) {
     return true;
   }
@@ -593,9 +610,6 @@ function isAgentAddressed(config, text) {
       return true;
     }
 
-    if (containsToken(normalized, name)) {
-      return true;
-    }
   }
 
   return false;
@@ -642,6 +656,11 @@ function classifyInboundRelevance(config, inbound) {
   const text = String(inbound.text || "");
   const isStatusBroadcast = looksLikeStatusBroadcast(text);
   const isGroupChat = String(inbound.chatType || "") !== "private";
+  const isBotTeamFinding = isGroupChat && Boolean(inbound.senderIsBot) && looksLikeTeamFinding(text);
+
+  if (String(inbound.chatType || "") === "private") {
+    return "direct";
+  }
 
   if (!isStatusBroadcast && isAgentAddressed(config, text)) {
     return "direct";
@@ -651,12 +670,19 @@ function classifyInboundRelevance(config, inbound) {
     return "direct";
   }
 
+  if (!isStatusBroadcast && isBotTeamFinding) {
+    return "direct";
+  }
+
   if (!isStatusBroadcast && isOtherAgentAddressed(config, text)) {
+    if (isBotTeamFinding || looksLikeTeamFinding(text)) {
+      return "direct";
+    }
     return isGroupChat && shouldObserveAllGroupMessages(config) ? "observe" : "ambient";
   }
 
-  if (String(inbound.chatType || "") === "private") {
-    return "direct";
+  if (isGroupChat && shouldObserveAllGroupMessages(config)) {
+    return "observe";
   }
 
   if (isStatusBroadcast) {
@@ -747,7 +773,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["error", "ignored_bot", "superseded", "expired", "stale_thread", "suppressed_private_reply"].includes(String(entry.status || ""));
+    && !["error", "ignored_bot", "superseded", "expired", "stale_thread", "parked", "suppressed_private_reply"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -760,7 +786,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(status)) {
+  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "parked"].includes(status)) {
     return false;
   }
   return !hasResponseMessageIds(entry);
@@ -929,7 +955,8 @@ function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
     if (!entry || entry.status !== "queued") {
       continue;
     }
-    if (String(entry.relevance || "") !== "ambient") {
+    const relevance = String(entry.relevance || "").trim().toLowerCase();
+    if (relevance !== "ambient" && relevance !== "observe") {
       continue;
     }
     if (isoAgeMs(entry.ts) < ttlMs) {
@@ -938,7 +965,7 @@ function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
     entry.status = "parked";
     entry.parkedAt = nowIso();
     if (!entry.responsePreview) {
-      entry.responsePreview = `[ambient parked after ${ttlMs}ms]`;
+      entry.responsePreview = `[${relevance} parked after ${ttlMs}ms]`;
     }
     parked += 1;
   }
@@ -987,6 +1014,86 @@ function recoverStaleInjectingEntriesInPlace(entries, staleMs = 1000 * 60 * 5) {
     entry.injectRecoveredAt = nowIso();
     recovered += 1;
   }
+  return recovered;
+}
+
+function hasRecentInjectOk(config, entry) {
+  const messageId = String(entry?.messageId || "").trim();
+  if (!messageId) {
+    return false;
+  }
+  return readTail(config.paths.activityFile, 800).some((line) => {
+    const text = String(line || "");
+    return text.includes(" INJECT_OK ") && text.includes(`message=${messageId}`);
+  });
+}
+
+function closeAlreadyInjectedEntriesInPlace(config, entries) {
+  let closed = 0;
+  for (const entry of entries || []) {
+    const status = String(entry?.status || "").trim().toLowerCase();
+    if (!["queued", "injecting", "submitted"].includes(status)) {
+      continue;
+    }
+    if (!hasRecentInjectOk(config, entry)) {
+      continue;
+    }
+    entry.status = "delivered";
+    entry.deliveredAt = entry.deliveredAt || nowIso();
+    entry.injectFinishedAt = entry.injectFinishedAt || entry.deliveredAt;
+    entry.responsePreview = entry.responsePreview || "[closed after previous INJECT_OK]";
+    closed += 1;
+  }
+  return closed;
+}
+
+function recoverRecentQueuedInboxEntriesInPlace(config, state, maxAgeMs = 5 * 60 * 1000) {
+  const queue = Array.isArray(state.queue) ? state.queue : [];
+  const pendingReplies = Array.isArray(state.pendingReplies) ? state.pendingReplies : [];
+  const known = new Set([...queue, ...pendingReplies].map((entry) => queueKey(entry)));
+  let recovered = 0;
+
+  for (const line of readTail(config.paths.inboxFile, 200)) {
+    let entry = null;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const key = queueKey(entry);
+    if (!key || key === ":" || known.has(key)) {
+      continue;
+    }
+    const status = String(entry?.status || "").trim().toLowerCase();
+    if (status !== "queued") {
+      continue;
+    }
+    const relevance = String(entry?.relevance || "").trim().toLowerCase();
+    const chatType = String(entry?.chatType || "").trim().toLowerCase();
+    const directLike = chatType === "private" || ["direct", "lane", "escalation"].includes(relevance);
+    if (!directLike) {
+      continue;
+    }
+    if (hasRecentInjectOk(config, entry)) {
+      continue;
+    }
+    const ageMs = isoAgeMs(entry.ts || entry.createdAt || entry.lastAttemptAt || "");
+    if (maxAgeMs > 0 && ageMs >= maxAgeMs) {
+      continue;
+    }
+
+    state.queue.push({
+      ...entry,
+      status: "queued",
+      attempts: Number(entry.attempts || 0),
+      lastAttemptAt: null,
+      recoveredFromInboxAt: nowIso()
+    });
+    known.add(key);
+    recovered += 1;
+    appendLog(config.paths.activityFile, `INBOX_QUEUE_RECOVERED chat=${entry.chatId} message=${entry.messageId} relevance=${entry.relevance || "-"}`);
+  }
+
   return recovered;
 }
 
@@ -1874,6 +1981,53 @@ function findRecentOutboundForTurn(config, chatId, source, sourceTurnId, text = 
   };
 }
 
+function findRecentOutboundForReply(config, chatId, replyToMessageId, text = "", windowMs = 120000) {
+  if (!config?.paths?.outboxFile || !existsSync(config.paths.outboxFile)) {
+    return null;
+  }
+  const normalizedChatId = String(chatId || "").trim();
+  const normalizedReplyTo = String(replyToMessageId || "").trim();
+  const normalizedText = normalizeWhitespace(repairMojibake(text || ""));
+  if (!normalizedChatId || !normalizedReplyTo || !normalizedText) {
+    return null;
+  }
+
+  const cutoff = Date.now() - windowMs;
+  const matches = [];
+  for (const line of readTail(config.paths.outboxFile, 400).reverse()) {
+    try {
+      const item = JSON.parse(line);
+      if (String(item?.chatId || "").trim() !== normalizedChatId) {
+        continue;
+      }
+      if (String(item?.replyToMessageId || "").trim() !== normalizedReplyTo) {
+        continue;
+      }
+      const itemText = normalizeWhitespace(repairMojibake(item?.text || ""));
+      if (itemText !== normalizedText) {
+        continue;
+      }
+      const itemTs = Date.parse(item?.ts || "");
+      if (Number.isFinite(itemTs) && itemTs < cutoff) {
+        continue;
+      }
+      matches.push(item);
+    } catch {
+      // Ignore malformed tail lines.
+    }
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  matches.sort((left, right) => String(left?.ts || "").localeCompare(String(right?.ts || "")));
+  return {
+    outbound: matches[matches.length - 1],
+    messageIds: matches.map((item) => String(item.messageId || "").trim()).filter(Boolean)
+  };
+}
+
 async function maybeSendDeferredReceipt(config, state, entry, reason) {
   if (!shouldSendDeferredReceipt(config, entry, reason)) {
     return false;
@@ -1970,11 +2124,51 @@ function countOpenPendingReplies(state, config) {
     if (!isNonTerminalPendingReply(entry)) {
       return false;
     }
+    if (looksLikeBotSender(entry)) {
+      return false;
+    }
     if (timeoutMs > 0 && isoAgeMs(entry.createdAt) >= timeoutMs) {
       return false;
     }
     return true;
   }).length;
+}
+
+function shouldSupersedePendingGateForNext(config, entry) {
+  const relevance = String(entry?.relevance || "").trim().toLowerCase();
+  if (relevance === "escalation") {
+    return true;
+  }
+  if (!["direct", "lane"].includes(relevance)) {
+    return false;
+  }
+  if (looksLikeBotSender(entry)) {
+    return shouldReplyToTeamBotSender(config, entry);
+  }
+  return true;
+}
+
+function shouldBypassDeferredGateForNext(config, entry) {
+  const relevance = String(entry?.relevance || "").trim().toLowerCase();
+  if (relevance === "escalation") {
+    return true;
+  }
+  return shouldSupersedePendingGateForNext(config, entry);
+}
+
+function supersedeOpenPendingRepliesForNext(state, next) {
+  const replies = Array.isArray(state?.pendingReplies) ? state.pendingReplies : [];
+  let changed = 0;
+  for (const entry of replies) {
+    if (!isReplyAwaitingOutcome(entry)) {
+      continue;
+    }
+    entry.status = "superseded";
+    entry.sentAt = entry.sentAt || nowIso();
+    entry.responsePreview = `[superseded by newer message ${next?.messageId || ""}]`;
+    changed += 1;
+  }
+  return changed;
 }
 
 async function resolveSessionActivity(config, threadId, entry = null) {
@@ -2213,7 +2407,7 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
     if (options.forcePreferred && pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
       if (state.currentThreadId !== pinnedThreadId) {
         state.currentThreadId = pinnedThreadId;
-        saveStateForConfig(config, state);
+        saveMergedStateForConfig(config, state);
         appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD_PINNED thread=${pinnedThreadId}`);
       }
       persistActiveThreadBinding(config, pinnedThreadId);
@@ -2264,7 +2458,7 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
 
     if (state.currentThreadId !== bestThreadId) {
       state.currentThreadId = bestThreadId;
-      saveStateForConfig(config, state);
+      saveMergedStateForConfig(config, state);
       appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD thread=${bestThreadId}`);
     }
     persistActiveThreadBinding(config, bestThreadId);
@@ -2287,7 +2481,7 @@ export function bridgeStatus() {
     if (parkedAmbient > 0) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
-    saveStateForConfig(config, state);
+    saveMergedStateForConfig(config, state);
   }
   const queued = state.queue.filter((item) => item.status === "queued");
   const submitted = state.queue.filter((item) => item.status === "submitted");
@@ -2350,6 +2544,23 @@ async function sendOutboundChunks(config, state, options) {
         ok: true,
         outbound: existing.outbound,
         messageIds: existing.messageIds,
+        skippedDuplicate: true
+      };
+    }
+  }
+
+  if ((source === "auto" || source === "auto_progress") && replyToMessageId) {
+    const existingReply = findRecentOutboundForReply(config, chatId, replyToMessageId, text);
+    if (existingReply?.outbound) {
+      state.lastOutbound = existingReply.outbound;
+      appendLog(
+        config.paths.activityFile,
+        `OUT_AUTO_SKIP_REPLY_DUP chat=${chatId} reply_to=${replyToMessageId} outbound=${existingReply.messageIds.join(",")}`
+      );
+      return {
+        ok: true,
+        outbound: existingReply.outbound,
+        messageIds: existingReply.messageIds,
         skippedDuplicate: true
       };
     }
@@ -2448,7 +2659,7 @@ export function bindCurrentThread(threadId) {
     throw new Error("No thread id provided and CODEX_THREAD_ID is not available.");
   }
   state.currentThreadId = resolved;
-  saveStateForConfig(config, state);
+  saveMergedStateForConfig(config, state);
   appendLog(config.paths.activityFile, `BOUND thread=${resolved}`);
   return {
     ok: true,
@@ -2616,7 +2827,7 @@ export function listQueue(limit = 10) {
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   if (parkedAmbient > 0) {
     appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
-    saveStateForConfig(config, state);
+    saveMergedStateForConfig(config, state);
   }
   return state.queue.slice(-Math.max(1, limit));
 }
@@ -2657,6 +2868,7 @@ function compareQueuedDispatchOrder(left, right) {
 function selectNextQueuedEntry(queue, options = {}) {
   const auto = Boolean(options.auto);
   const deferredMode = String(options.dispatchMode || "deferred").toLowerCase() !== "legacy";
+  const observeInject = Boolean(options.observeInject);
   const queued = Array.isArray(queue) ? queue.filter((item) => item?.status === "queued") : [];
   if (!auto || !deferredMode) {
     return queued.sort(compareQueuedDispatchOrder)[0] || null;
@@ -2664,7 +2876,11 @@ function selectNextQueuedEntry(queue, options = {}) {
   const eligible = queued.filter((item) => {
     const relevance = String(item.relevance || "").toLowerCase();
     const chatType = String(item.chatType || "").toLowerCase();
-    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane" || relevance === "observe";
+    return relevance === "escalation"
+      || chatType === "private"
+      || relevance === "direct"
+      || relevance === "lane"
+      || (observeInject && relevance === "observe");
   });
   return eligible.sort(compareQueuedDispatchOrder)[0] || null;
 }
@@ -2678,14 +2894,22 @@ export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   const state = loadState(config);
   const recoveredInjecting = recoverStaleInjectingEntriesInPlace(state.queue || []);
+  const closedAlreadyInjected = closeAlreadyInjectedEntriesInPlace(config, state.queue || []);
   const reclassified = reclassifyQueuedEntriesInPlace(config, state.queue || []);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
+  const recoveredInboxQueued = recoverRecentQueuedInboxEntriesInPlace(config, state);
   const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0) {
+  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0 || closedAlreadyInjected > 0 || recoveredInboxQueued > 0) {
     if (recoveredInjecting > 0) {
       appendLog(config.paths.activityFile, `INJECT_STALE_RECOVERED count=${recoveredInjecting}`);
+    }
+    if (recoveredInboxQueued > 0) {
+      appendLog(config.paths.activityFile, `INBOX_QUEUE_RECOVERED count=${recoveredInboxQueued}`);
+    }
+    if (closedAlreadyInjected > 0) {
+      appendLog(config.paths.activityFile, `INJECT_ALREADY_OK_CLOSED count=${closedAlreadyInjected}`);
     }
     if (reclassified.changed > 0) {
       appendLog(config.paths.activityFile, `QUEUE_RECLASSIFIED changed=${reclassified.changed} parked=${reclassified.parked}`);
@@ -2694,7 +2918,7 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
     appendLog(config.paths.activityFile, `PENDING_REPLY_EXPIRED count=${expiredPendingReplies}`);
-    saveStateForConfig(config, state);
+    saveMergedStateForConfig(config, state);
   }
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
@@ -2710,7 +2934,8 @@ export async function injectNext(threadId, options = {}) {
 
   const next = selectNextQueuedEntry(state.queue || [], {
     auto,
-    dispatchMode: config.dispatchMode
+    dispatchMode: config.dispatchMode,
+    observeInject: config.observeInject
   });
 
   if (!next) {
@@ -2776,30 +3001,35 @@ export async function injectNext(threadId, options = {}) {
   const staleThreadPendingReplies = closeStaleThreadPendingRepliesInPlace(state.pendingReplies || [], resolvedThreadId);
   if (staleThreadPendingReplies > 0) {
     appendLog(config.paths.activityFile, `PENDING_REPLY_STALE_THREAD count=${staleThreadPendingReplies} active_thread=${resolvedThreadId}`);
-    saveStateForConfig(config, state);
+    saveMergedStateForConfig(config, state);
   }
 
-  const bypassDeferredGate = auto && next.relevance === "escalation";
+  const bypassDeferredGate = auto && shouldBypassDeferredGateForNext(config, next);
   if (bypassDeferredGate) {
-    appendLog(config.paths.activityFile, `ESCALATION_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
+    appendLog(config.paths.activityFile, `DIRECT_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
   }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
     if (openPendingReplies > 0) {
-      await maybeSendDeferredReceipt(config, state, next, "pending_reply");
-      saveStateForConfig(config, state);
-      return {
-        ok: false,
-        status: "deferred",
-        reason: "pending_reply",
-        pendingReplies: openPendingReplies
-      };
+      if (shouldSupersedePendingGateForNext(config, next)) {
+        const supersededPendingReplies = supersedeOpenPendingRepliesForNext(state, next);
+        appendLog(config.paths.activityFile, `PENDING_REPLY_BYPASS message=${next.messageId} superseded=${supersededPendingReplies} previous_open=${openPendingReplies}`);
+      } else {
+        await maybeSendDeferredReceipt(config, state, next, "pending_reply");
+        saveMergedStateForConfig(config, state);
+        return {
+          ok: false,
+          status: "deferred",
+          reason: "pending_reply",
+          pendingReplies: openPendingReplies
+        };
+      }
     }
 
     const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
     if (sessionActivity.active) {
       await maybeSendDeferredReceipt(config, state, next, "session_active");
-      saveStateForConfig(config, state);
+      saveMergedStateForConfig(config, state);
       return {
         ok: false,
         status: "deferred",
@@ -2819,7 +3049,7 @@ export async function injectNext(threadId, options = {}) {
     }
   }
   if (promoted > 0) {
-    saveStateForConfig(config, state);
+    saveMergedStateForConfig(config, state);
   }
 
   next.attempts = Number(next.attempts || 0) + 1;
@@ -2848,7 +3078,7 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `HISTORY_APPEND thread=${resolvedThreadId} message=${next.messageId}`);
     }
   }
-  saveStateForConfig(config, state);
+  saveMergedStateForConfig(config, state);
   appendLog(config.paths.activityFile, `INJECT_START thread=${resolvedThreadId} message=${next.messageId}`);
   const result = await injectIntoThread(config, next, resolvedThreadId);
   if (result.busy) {
@@ -2942,7 +3172,7 @@ export async function relayRepliesOnce() {
 
   const pendingReplies = (state.pendingReplies || []).filter((entry) => isReplyAwaitingOutcome(entry));
   if (pendingReplies.length === 0) {
-    saveStateForConfig(config, state);
+    saveMergedStateForConfig(config, state);
     return { ok: true, status: "empty", delivered: 0 };
   }
 
@@ -3140,7 +3370,7 @@ export async function relayRepliesOnce() {
   }
 
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
-  saveStateForConfig(config, state);
+  saveMergedStateForConfig(config, state);
   return {
     ok: true,
     status: delivered > 0 ? "sent" : "pending",
@@ -3168,7 +3398,7 @@ export async function reply(text, options = {}) {
     allowPrivateToGroup: options.allowPrivateToGroup,
     confirmGroupBroadcast: options.confirmGroupBroadcast
   });
-  saveStateForConfig(config, state);
+  saveMergedStateForConfig(config, state);
   return result;
 }
 

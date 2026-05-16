@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ensureStateLayout, getPaths } from "./paths.js";
 
 function readDotEnvFile(path) {
@@ -58,6 +59,10 @@ export function loadConfig() {
   delete fallbackEnv.BLUN_TELEGRAM_STATE_DIR;
   delete fallbackEnv.BLUN_TELEGRAM_THREAD_ID;
   const env = { ...fallbackEnv, ...process.env, ...fileEnv };
+  const defaultTeamRelayFile = join(paths.codexHome, "channels", "blun-team-relay.jsonl");
+  const teamRelayUrl = env.BLUN_TELEGRAM_TEAM_RELAY_URL?.trim() || "";
+  const teamRelayFile = env.BLUN_TELEGRAM_TEAM_RELAY_FILE?.trim() || (teamRelayUrl ? "" : defaultTeamRelayFile);
+  const teamRelayMode = env.BLUN_TELEGRAM_TEAM_RELAY_MODE?.trim().toLowerCase() || "both";
   const allowedChatIds = parseAllowedChatIds(env.BLUN_TELEGRAM_ALLOWED_CHAT_ID || env.TELEGRAM_ALLOWED_CHAT_ID || "");
   const mentionNames = parseMentionNames(
     env.BLUN_TELEGRAM_MENTION_NAMES
@@ -92,12 +97,19 @@ export function loadConfig() {
     attachmentMaxBytes: Number.parseInt(env.BLUN_TELEGRAM_ATTACHMENT_MAX_BYTES || "52428800", 10) || 52428800,
     progressFallbackMs: Number.parseInt(env.BLUN_TELEGRAM_PROGRESS_FALLBACK_MS || "20000", 10) || 20000,
     progressRelayMode: env.BLUN_TELEGRAM_PROGRESS_RELAY?.trim().toLowerCase() || "status",
-    teamRelayMode: env.BLUN_TELEGRAM_TEAM_RELAY_MODE?.trim().toLowerCase() || "off",
-    teamRelayFile: env.BLUN_TELEGRAM_TEAM_RELAY_FILE?.trim() || "",
-    teamRelayUrl: env.BLUN_TELEGRAM_TEAM_RELAY_URL?.trim() || "",
+    teamRelayMode,
+    teamRelayFile,
+    teamRelayUrl,
     teamRelaySecret: env.BLUN_TELEGRAM_TEAM_RELAY_SECRET?.trim() || "",
     teamRelayPrivate: env.BLUN_TELEGRAM_TEAM_RELAY_PRIVATE?.trim() || "0",
     teamRelayStart: env.BLUN_TELEGRAM_TEAM_RELAY_START?.trim().toLowerCase() || "tail",
+    claudeRelayStart: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_CLAUDE_RELAY_START || ""),
+    claudeRelaySessionFile: env.BLUN_TELEGRAM_CLAUDE_RELAY_SESSION_FILE?.trim() || "",
+    claudeRelayAgentName: env.BLUN_TELEGRAM_CLAUDE_RELAY_AGENT_NAME?.trim() || "claude",
+    claudeRelayUser: env.BLUN_TELEGRAM_CLAUDE_RELAY_USER?.trim() || "claude_bot",
+    claudeRelayUserId: env.BLUN_TELEGRAM_CLAUDE_RELAY_USER_ID?.trim() || "",
+    claudeRelayGroupTitle: env.BLUN_TELEGRAM_CLAUDE_RELAY_GROUP_TITLE?.trim() || "",
+    claudeRelayBackfillBytes: Number.parseInt(env.BLUN_TELEGRAM_CLAUDE_RELAY_BACKFILL_BYTES || "262144", 10) || 262144,
     queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
     groupDeliveryMode: parseGroupDeliveryMode(
@@ -106,8 +118,10 @@ export function loadConfig() {
       || env.BLUN_TELEGRAM_RELEVANCE_MODE
       || "all"
     ),
+    observeInject: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_OBSERVE_INJECT || ""),
     privateDmGroupGuard: !/^(0|false|no|off)$/i.test(String(env.BLUN_TELEGRAM_PRIVATE_DM_GROUP_GUARD || "1")),
     privateReplyMode: env.BLUN_TELEGRAM_PRIVATE_REPLY_MODE?.trim().toLowerCase() || "auto",
+    visibleConsoleInject: env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT?.trim().toLowerCase() || "",
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",

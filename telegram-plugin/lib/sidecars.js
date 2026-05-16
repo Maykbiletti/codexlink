@@ -82,13 +82,22 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_QUEUE_NOTICE: config.queueNoticeEnabled ? "1" : "0",
     BLUN_TELEGRAM_DISPATCH_MODE: config.dispatchMode || "deferred",
     BLUN_TELEGRAM_GROUP_DELIVERY: config.groupDeliveryMode || "all",
+    BLUN_TELEGRAM_OBSERVE_INJECT: config.observeInject ? "1" : "0",
     BLUN_TELEGRAM_PRIVATE_REPLY_MODE: config.privateReplyMode || "auto",
+    BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT: config.visibleConsoleInject || "",
     BLUN_TELEGRAM_TEAM_RELAY_MODE: config.teamRelayMode || "off",
     BLUN_TELEGRAM_TEAM_RELAY_FILE: config.teamRelayFile || "",
     BLUN_TELEGRAM_TEAM_RELAY_URL: config.teamRelayUrl || "",
     BLUN_TELEGRAM_TEAM_RELAY_SECRET: config.teamRelaySecret || "",
     BLUN_TELEGRAM_TEAM_RELAY_PRIVATE: config.teamRelayPrivate || "0",
     BLUN_TELEGRAM_TEAM_RELAY_START: config.teamRelayStart || "tail",
+    BLUN_TELEGRAM_CLAUDE_RELAY_START: config.claudeRelayStart ? "1" : "0",
+    BLUN_TELEGRAM_CLAUDE_RELAY_SESSION_FILE: config.claudeRelaySessionFile || "",
+    BLUN_TELEGRAM_CLAUDE_RELAY_AGENT_NAME: config.claudeRelayAgentName || "",
+    BLUN_TELEGRAM_CLAUDE_RELAY_USER: config.claudeRelayUser || "",
+    BLUN_TELEGRAM_CLAUDE_RELAY_USER_ID: config.claudeRelayUserId || "",
+    BLUN_TELEGRAM_CLAUDE_RELAY_GROUP_TITLE: config.claudeRelayGroupTitle || "",
+    BLUN_TELEGRAM_CLAUDE_RELAY_BACKFILL_BYTES: String(config.claudeRelayBackfillBytes || 262144),
     BLUN_TELEGRAM_PLUGIN_MODE: config.pluginMode || "plugin",
     BLUN_CODEX_MODEL: config.model || "",
     BLUN_CODEX_REASONING_EFFORT: config.reasoningEffort || "",
@@ -162,10 +171,20 @@ export function ensureBackgroundSidecars(config) {
       { forceRestart: true }
     )
     : { started: false, pid: 0, reason: "disabled" };
+  const claudeRelay = config.claudeRelayStart
+    ? ensureSidecar(
+      "claude-telegram-relay-consumer.js",
+      config.paths.claudeRelayPidFile,
+      config.paths.claudeRelayStdoutFile,
+      config.paths.claudeRelayStderrFile,
+      config,
+      { forceRestart: true }
+    )
+    : { started: false, pid: 0, reason: "disabled" };
 
   appendLog(
     config.paths.activityFile,
-    `PLUGIN_AUTOSTART poller=${poller.pid || 0}:${poller.reason} dispatcher=${dispatcher.pid || 0}:${dispatcher.reason} responder=${responder.pid || 0}:${responder.reason} team_relay=${teamRelay.pid || 0}:${teamRelay.reason}`
+    `PLUGIN_AUTOSTART poller=${poller.pid || 0}:${poller.reason} dispatcher=${dispatcher.pid || 0}:${dispatcher.reason} responder=${responder.pid || 0}:${responder.reason} team_relay=${teamRelay.pid || 0}:${teamRelay.reason} claude_relay=${claudeRelay.pid || 0}:${claudeRelay.reason}`
   );
 
   return {
@@ -174,6 +193,7 @@ export function ensureBackgroundSidecars(config) {
     poller,
     dispatcher,
     responder,
-    teamRelay
+    teamRelay,
+    claudeRelay
   };
 }

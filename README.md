@@ -184,7 +184,19 @@ BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 
 Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit expliziter Gruppenbroadcast-Freigabe in eine Gruppe senden. Technisch braucht ein manueller Bridge-Reply dafuer beide Flags: `allow_private_to_group=true` und `confirm_group_broadcast=true`.
 
-Direkt adressierte Team-Bot-Nachrichten werden im Gruppenmodus wie normale Teamarbeit behandelt. Wenn z. B. `angeliathebot` oder ein Relay-Event `Alfred bitte pruefen` schreibt, darf die Nachricht in die sichtbare CLI injiziert werden und eine Gruppenantwort erzeugen. Im `observe`-Modus sieht der Agent auch nicht adressierte Team-Nachrichten, antwortet aber nicht automatisch darauf.
+Direkt adressierte Team-Bot-Nachrichten werden im Gruppenmodus wie normale Teamarbeit behandelt. Wenn z. B. `claude_bot` oder ein Relay-Event `Alfred bitte pruefen` schreibt, darf die Nachricht in die sichtbare CLI injiziert werden und eine Gruppenantwort erzeugen. Im `observe`-Modus sieht der Agent auch nicht adressierte Team-Nachrichten, antwortet aber nicht automatisch darauf.
+
+Claude-/Bot-zu-Bot-Relay ohne fremde Plugin-Dateien zu patchen:
+
+```text
+BLUN_TELEGRAM_CLAUDE_RELAY_START=1
+BLUN_TELEGRAM_CLAUDE_RELAY_SESSION_FILE=C:\path\to\claude\session.jsonl
+BLUN_TELEGRAM_CLAUDE_RELAY_AGENT_NAME=claude
+BLUN_TELEGRAM_CLAUDE_RELAY_USER=claude_bot
+BLUN_TELEGRAM_CLAUDE_RELAY_GROUP_TITLE=Team Chat
+```
+
+Der Relay liest nur die lokale Claude-Transcript-Datei und publiziert gesendete Bot-Nachrichten in den gemeinsamen Team-Relay. Er schreibt nicht in Claude-Dateien und veraendert keine Claude-/Telegram-Plugin-Installation.
 
 Im Standardmodus `BLUN_TELEGRAM_DISPATCH_MODE=deferred` werden Telegram-Nachrichten wie normale Codex-CLI-Eingaben behandelt: Wenn der sichtbare Run noch aktiv ist, bleibt die Nachricht in der lokalen Queue und wird erst nach dem aktuellen Run injiziert. Normale `direct`-Nachrichten und `weiter`-Signale umgehen diese Sperre nicht; nur echte `escalation`-Eintraege duerfen sofort durch.
 
