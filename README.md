@@ -131,6 +131,8 @@ BLUN_TELEGRAM_MENTION_NAMES=assistant,codex
 BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
 ```
 
+Die Mention-Namen werden an Poller, Dispatcher, Responder und Team-Relay-Consumer weitergereicht. Das ist wichtig, weil die Sidecars die Gruppen-/Relay-Nachrichten klassifizieren, bevor sie in die sichtbare CLI injiziert werden.
+
 Wichtig bei mehreren Profilen: ein Telegram-Bot-Token darf nicht gleichzeitig von alten oder fremden Pollern abgefragt werden. Sonst meldet Telegram `Conflict: terminated by other getUpdates request`, und Nachrichten koennen verspaetet oder gar nicht in der sichtbaren CLI landen. Aktuelle Versionen pollen non-blocking und schneller; wenn trotzdem Conflicts auftauchen, alle alten `blun-codex telegram-plugin` Fenster fuer denselben Bot schliessen und genau eine aktuelle Session starten.
 
 Beispiel mit konkreten Profilnamen:
