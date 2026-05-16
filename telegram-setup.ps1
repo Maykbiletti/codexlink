@@ -53,6 +53,38 @@ function Write-DotEnvFile {
   Set-Content -Path $Path -Value $lines -Encoding UTF8
 }
 
+function Ensure-TeamRelayDefaults {
+  param(
+    [hashtable]$Values,
+    [string]$DefaultFile
+  )
+
+  $changed = $false
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $changed = $true
+  }
+  $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
+  $hasRelayUrl = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_URL") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_URL"])
+  if (-not $hasRelayFile -and -not $hasRelayUrl) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_PRIVATE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"] = "0"
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_START") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_START"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_START"] = "tail"
+    $changed = $true
+  }
+  return $changed
+}
+
 function Test-TelegramTokenFormat {
   param([string]$Value)
   if (-not $Value) { return $false }
@@ -271,6 +303,8 @@ $stateDir = if ($profileJson.telegram -and $profileJson.telegram.state_dir) {
 Ensure-Dir -Path $stateDir
 $envPath = Join-Path $stateDir ".env"
 $envValues = Read-DotEnvFile -Path $envPath
+$defaultTeamRelayFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+$changed = Ensure-TeamRelayDefaults -Values $envValues -DefaultFile $defaultTeamRelayFile
 
 $currentToken = [string]$envValues["BLUN_TELEGRAM_BOT_TOKEN"]
 if (-not (Test-TelegramTokenFormat -Value $currentToken)) {
@@ -284,13 +318,15 @@ if (-not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)) {
 
 $needsToken = -not (Test-TelegramTokenFormat -Value $currentToken)
 $needsChatIds = -not (Test-AllowedChatIdsFormat -Value $currentAllowedChatIds)
-$changed = $false
 $tokenWasPrompted = $false
 
 if ($EnsureConfigured -and -not $needsToken -and -not $needsChatIds) {
+  if ($changed) {
+    Write-DotEnvFile -Path $envPath -Values $envValues
+  }
   $result = [ordered]@{
     ok = $true
-    changed = $false
+    changed = $changed
     profile = $profileAgent
     state_dir = $stateDir
     env_path = $envPath

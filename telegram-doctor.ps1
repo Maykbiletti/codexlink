@@ -179,6 +179,38 @@ function Write-DotEnvFile {
   Set-Content -Path $Path -Value $lines -Encoding UTF8
 }
 
+function Ensure-TeamRelayDefaults {
+  param(
+    [hashtable]$Values,
+    [string]$DefaultFile
+  )
+
+  $changed = $false
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $changed = $true
+  }
+  $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
+  $hasRelayUrl = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_URL") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_URL"])
+  if (-not $hasRelayFile -and -not $hasRelayUrl) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_PRIVATE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"] = "0"
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_START") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_START"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_START"] = "tail"
+    $changed = $true
+  }
+  return $changed
+}
+
 function Stop-PidQuiet {
   param([object]$PidValue)
   $pidText = [string]$PidValue
@@ -226,10 +258,18 @@ function Invoke-RuntimeFix {
 
   $envFile = Join-Path ([string]$Status.state_dir) ".env"
   $envValues = Read-DotEnvFile -Path $envFile
+  $envChanged = $false
   if ($envValues.ContainsKey("BLUN_TELEGRAM_THREAD_ID")) {
     $envValues["BLUN_TELEGRAM_THREAD_ID"] = ""
-    Write-DotEnvFile -Path $envFile -Values $envValues
+    $envChanged = $true
     $actions.Add("cleared_env_thread") | Out-Null
+  }
+  if (Ensure-TeamRelayDefaults -Values $envValues -DefaultFile (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl")) {
+    $envChanged = $true
+    $actions.Add("ensured_team_relay_defaults") | Out-Null
+  }
+  if ($envChanged) {
+    Write-DotEnvFile -Path $envFile -Values $envValues
   }
 
   $stateFile = Join-Path ([string]$Status.state_dir) "state.json"

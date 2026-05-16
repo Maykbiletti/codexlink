@@ -199,6 +199,38 @@ function Write-DotEnvFile {
   Set-Content -Path $Path -Value $lines -Encoding UTF8
 }
 
+function Ensure-TeamRelayDefaults {
+  param(
+    [hashtable]$Values,
+    [string]$DefaultFile
+  )
+
+  $changed = $false
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $changed = $true
+  }
+  $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
+  $hasRelayUrl = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_URL") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_URL"])
+  if (-not $hasRelayFile -and -not $hasRelayUrl) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_PRIVATE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"] = "0"
+    $changed = $true
+  }
+  if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_START") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_START"])) {
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_START"] = "tail"
+    $changed = $true
+  }
+  return $changed
+}
+
 function Write-TextFileWithRetry {
   param(
     [string]$Path,
@@ -429,6 +461,8 @@ $telegramExistingEnv = @{}
 if ($telegramStateDir) {
   Ensure-Dir -Path $telegramStateDir
   $telegramExistingEnv = Read-DotEnvFile -Path (Join-Path $telegramStateDir ".env")
+  $telegramDefaultTeamRelayFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+  [void](Ensure-TeamRelayDefaults -Values $telegramExistingEnv -DefaultFile $telegramDefaultTeamRelayFile)
 }
 
 if (-not $telegramAllowedChatId -and $telegramExistingEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]) {
@@ -436,10 +470,22 @@ if (-not $telegramAllowedChatId -and $telegramExistingEnv["BLUN_TELEGRAM_ALLOWED
 }
 
 if ($telegramEnabled) {
+  $telegramGroupDelivery = [string]$telegramExistingEnv["BLUN_TELEGRAM_GROUP_DELIVERY"]
+  $telegramTeamRelayMode = [string]$telegramExistingEnv["BLUN_TELEGRAM_TEAM_RELAY_MODE"]
+  $telegramTeamRelayFile = [string]$telegramExistingEnv["BLUN_TELEGRAM_TEAM_RELAY_FILE"]
+  $telegramTeamRelayUrl = [string]$telegramExistingEnv["BLUN_TELEGRAM_TEAM_RELAY_URL"]
+  $telegramTeamRelayPrivate = [string]$telegramExistingEnv["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"]
+  $telegramTeamRelayStart = [string]$telegramExistingEnv["BLUN_TELEGRAM_TEAM_RELAY_START"]
   Set-EnvVar "BLUN_TELEGRAM_AGENT_NAME" $profile.agent_name
   Set-EnvVar "BLUN_TELEGRAM_STATE_DIR" $telegramStateDir
   Set-EnvVar "BLUN_TELEGRAM_ALLOWED_CHAT_ID" $telegramAllowedChatId
   Set-EnvVar "BLUN_TELEGRAM_PLUGIN_MODE" $TelegramMode
+  Set-EnvVar "BLUN_TELEGRAM_GROUP_DELIVERY" $telegramGroupDelivery
+  Set-EnvVar "BLUN_TELEGRAM_TEAM_RELAY_MODE" $telegramTeamRelayMode
+  Set-EnvVar "BLUN_TELEGRAM_TEAM_RELAY_FILE" $telegramTeamRelayFile
+  Set-EnvVar "BLUN_TELEGRAM_TEAM_RELAY_URL" $telegramTeamRelayUrl
+  Set-EnvVar "BLUN_TELEGRAM_TEAM_RELAY_PRIVATE" $telegramTeamRelayPrivate
+  Set-EnvVar "BLUN_TELEGRAM_TEAM_RELAY_START" $telegramTeamRelayStart
   $telegramEnvPairs = @()
   $telegramEnvPairs += "BLUN_TELEGRAM_AGENT_NAME = $(Quote-TomlLiteral $profile.agent_name)"
   $telegramEnvPairs += "BLUN_TELEGRAM_STATE_DIR = $(Quote-TomlLiteral $telegramStateDir)"
@@ -447,6 +493,16 @@ if ($telegramEnabled) {
   if ($telegramAllowedChatId) {
     $telegramEnvPairs += "BLUN_TELEGRAM_ALLOWED_CHAT_ID = $(Quote-TomlLiteral $telegramAllowedChatId)"
   }
+  $telegramEnvPairs += "BLUN_TELEGRAM_GROUP_DELIVERY = $(Quote-TomlLiteral $telegramGroupDelivery)"
+  $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_MODE = $(Quote-TomlLiteral $telegramTeamRelayMode)"
+  if ($telegramTeamRelayFile) {
+    $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_FILE = $(Quote-TomlLiteral $telegramTeamRelayFile)"
+  }
+  if ($telegramTeamRelayUrl) {
+    $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_URL = $(Quote-TomlLiteral $telegramTeamRelayUrl)"
+  }
+  $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_PRIVATE = $(Quote-TomlLiteral $telegramTeamRelayPrivate)"
+  $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_START = $(Quote-TomlLiteral $telegramTeamRelayStart)"
   $telegramEnvOverride = "mcp_servers.codexlink_telegram.env={" + ($telegramEnvPairs -join ", ") + "}"
 }
 
@@ -558,6 +614,7 @@ if ($useRemoteAppServer) {
     $stateEnv["BLUN_TELEGRAM_PLUGIN_MODE"] = $TelegramMode
     $stateEnv["BLUN_TELEGRAM_APP_SERVER_WS_URL"] = $telegramAppServerWsUrl
     $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = $previousBoundThreadId
+    [void](Ensure-TeamRelayDefaults -Values $stateEnv -DefaultFile (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"))
     Write-DotEnvFile -Path $envFilePath -Values $stateEnv
     Write-DebugStage -Path $debugLogPath -Message ("ENV_WRITTEN ws_url=" + $telegramAppServerWsUrl + " env_file=" + $envFilePath + " previous_thread=" + $previousBoundThreadId)
     if ($null -ne $telegramState) {

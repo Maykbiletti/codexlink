@@ -147,9 +147,10 @@ $runtimeThreadId = if ($currentRuntime -and $currentRuntime.thread_id) { [string
 $telegramPluginRoot = Get-TelegramPluginRoot -RuntimeRoot $runtimeRoot
 $dispatchMode = if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { [string]$envFile["BLUN_TELEGRAM_DISPATCH_MODE"] } else { "deferred" }
 $groupDeliveryMode = if ($envFile["BLUN_TELEGRAM_GROUP_DELIVERY"]) { [string]$envFile["BLUN_TELEGRAM_GROUP_DELIVERY"] } else { "all" }
-$teamRelayMode = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"] } else { "off" }
-$teamRelayFile = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"] } else { "" }
 $teamRelayUrl = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"] } else { "" }
+$teamRelayMode = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"] } else { "both" }
+$defaultTeamRelayFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+$teamRelayFile = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"] } elseif ($teamRelayUrl) { "" } else { $defaultTeamRelayFile }
 $idleCooldownMs = if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { [int]$envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { 15000 }
 $eligibleQueued = if ($dispatchMode -eq "legacy") {
   @($queued)
