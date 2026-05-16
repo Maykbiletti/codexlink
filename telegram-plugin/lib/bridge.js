@@ -2788,11 +2788,7 @@ export async function injectNext(threadId, options = {}) {
     saveStateForConfig(config, state);
   }
 
-  const bypassDeferredGate = auto && (
-    next.relevance === "escalation"
-    || isFastDispatchEntry(next)
-    || (useAppServer && isRealtimeAppServerEntry(next))
-  );
+  const bypassDeferredGate = auto && next.relevance === "escalation";
   if (bypassDeferredGate && auto && isFastDispatchEntry(next)) {
     appendLog(config.paths.activityFile, `FAST_TRIGGER_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent}`);
   }

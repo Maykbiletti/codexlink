@@ -174,6 +174,8 @@ Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit exp
 
 Direkt adressierte Team-Bot-Nachrichten werden im Gruppenmodus wie normale Teamarbeit behandelt. Wenn z. B. `angeliathebot` oder ein Relay-Event `Alfred bitte pruefen` schreibt, darf die Nachricht in die sichtbare CLI injiziert werden und eine Gruppenantwort erzeugen. Ambient Bot-Geraeusch ohne Agent-Ansprache bleibt geparkt/ignoriert.
 
+Im Standardmodus `BLUN_TELEGRAM_DISPATCH_MODE=deferred` werden Telegram-Nachrichten wie normale Codex-CLI-Eingaben behandelt: Wenn der sichtbare Run noch aktiv ist, bleibt die Nachricht in der lokalen Queue und wird erst nach dem aktuellen Run injiziert. Normale `direct`-Nachrichten und `weiter`-Signale umgehen diese Sperre nicht; nur echte `escalation`-Eintraege duerfen sofort durch.
+
 Doctor:
 
 ```powershell
