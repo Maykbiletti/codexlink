@@ -81,6 +81,7 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_QUEUE_NOTICE: config.queueNoticeEnabled ? "1" : "0",
     BLUN_TELEGRAM_DISPATCH_MODE: config.dispatchMode || "deferred",
     BLUN_TELEGRAM_GROUP_DELIVERY: config.groupDeliveryMode || "all",
+    BLUN_TELEGRAM_PRIVATE_REPLY_MODE: config.privateReplyMode || "auto",
     BLUN_TELEGRAM_TEAM_RELAY_MODE: config.teamRelayMode || "off",
     BLUN_TELEGRAM_TEAM_RELAY_FILE: config.teamRelayFile || "",
     BLUN_TELEGRAM_TEAM_RELAY_URL: config.teamRelayUrl || "",

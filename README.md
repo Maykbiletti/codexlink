@@ -172,6 +172,8 @@ BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 
 Private DMs bleiben dabei privat. Ein Agent darf private DM-Kontexte nur mit expliziter Gruppenbroadcast-Freigabe in eine Gruppe senden. Technisch braucht ein manueller Bridge-Reply dafuer beide Flags: `allow_private_to_group=true` und `confirm_group_broadcast=true`.
 
+Direkt adressierte Team-Bot-Nachrichten werden im Gruppenmodus wie normale Teamarbeit behandelt. Wenn z. B. `angeliathebot` oder ein Relay-Event `Alfred bitte pruefen` schreibt, darf die Nachricht in die sichtbare CLI injiziert werden und eine Gruppenantwort erzeugen. Ambient Bot-Geraeusch ohne Agent-Ansprache bleibt geparkt/ignoriert.
+
 Doctor:
 
 ```powershell

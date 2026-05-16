@@ -739,7 +739,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(String(entry.status || ""));
+    && !["error", "ignored_bot", "superseded", "expired", "stale_thread", "suppressed_private_reply"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -752,7 +752,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(status)) {
+  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(status)) {
     return false;
   }
   return !hasResponseMessageIds(entry);
@@ -1081,6 +1081,21 @@ function looksLikeBotSender(entry) {
     return true;
   }
   return /_bot$/i.test(String(entry?.user || "").trim());
+}
+
+function shouldReplyToTeamBotSender(config, entry) {
+  if (!looksLikeBotSender(entry)) {
+    return true;
+  }
+  if (!isGroupChatEntry(entry)) {
+    return false;
+  }
+  const text = String(entry?.sourceText || entry?.text || "");
+  const relevance = String(entry?.relevance || "").trim().toLowerCase();
+  if (["direct", "lane", "escalation"].includes(relevance)) {
+    return true;
+  }
+  return isAgentAddressed(config, text) || looksLikeContinueNudge(text, {});
 }
 
 function reconcilePendingRepliesInPlace(pendingReplies) {
@@ -1551,6 +1566,11 @@ function isPrivateChatType(chatType) {
   return String(chatType || "").trim().toLowerCase() === "private";
 }
 
+function isPrivateReplySuppressed(config) {
+  const mode = String(config?.privateReplyMode || "").trim().toLowerCase();
+  return ["off", "suppress", "disabled", "none", "group_only", "group-only"].includes(mode);
+}
+
 function isExplicitTrue(value) {
   return value === true || /^(1|true|yes|on)$/i.test(String(value || ""));
 }
@@ -1599,15 +1619,21 @@ function shouldSendDeferredReceipt(config, entry, reason) {
   }
   const relevance = String(entry.relevance || "").toLowerCase();
   const chatType = String(entry.chatType || "").toLowerCase();
+  if (chatType === "private" && isPrivateReplySuppressed(config)) {
+    return false;
+  }
   return chatType === "private" || relevance === "direct" || relevance === "lane";
 }
 
-function shouldSendTypingIndicator(entry) {
+function shouldSendTypingIndicator(config, entry) {
   if (!entry || entry.senderIsBot) {
     return false;
   }
   const relevance = String(entry.relevance || "").toLowerCase();
   const chatType = String(entry.chatType || "").toLowerCase();
+  if (chatType === "private" && isPrivateReplySuppressed(config)) {
+    return false;
+  }
   return chatType === "private" || relevance === "direct" || relevance === "lane";
 }
 
@@ -1989,11 +2015,11 @@ function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionO
   };
 }
 
-function shouldTrackPendingReply(message) {
+function shouldTrackPendingReply(config, message) {
   if (!message) {
     return false;
   }
-  if (looksLikeBotSender(message)) {
+  if (looksLikeBotSender(message) && !shouldReplyToTeamBotSender(config, message)) {
     return false;
   }
   const intent = String(message.intent || "message").trim().toLowerCase();
@@ -2466,7 +2492,7 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED_AMBIENT chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
       continue;
     }
-    if (shouldSendTypingIndicator(inbound)) {
+    if (shouldSendTypingIndicator(config, inbound)) {
       void sendChatAction(config, {
         chatId: inbound.chatId,
         telegramThreadId: inbound.telegramThreadId
@@ -2722,13 +2748,17 @@ export async function injectNext(threadId, options = {}) {
       stdout: next.stdout
     });
     appendLog(config.paths.activityFile, `PING_ACK chat=${next.chatId} message=${next.messageId}`);
-    await sendOutboundChunks(config, state, {
-      chatId: next.chatId,
-      text: "Ja, ich bin da.",
-      replyToMessageId: next.messageId,
-      telegramThreadId: next.telegramThreadId,
-      source: "ping_ack"
-    });
+    if (isPrivateChatType(next.chatType) && isPrivateReplySuppressed(config)) {
+      appendLog(config.paths.activityFile, `PING_ACK_SUPPRESSED_PRIVATE chat=${next.chatId} message=${next.messageId}`);
+    } else {
+      await sendOutboundChunks(config, state, {
+        chatId: next.chatId,
+        text: "Ja, ich bin da.",
+        replyToMessageId: next.messageId,
+        telegramThreadId: next.telegramThreadId,
+        source: "ping_ack"
+      });
+    }
     const latestState = loadState(config);
     saveStateForConfig(config, mergeStateSnapshots(latestState, state));
     return {
@@ -2873,10 +2903,8 @@ export async function injectNext(threadId, options = {}) {
     injectFinishedAt: next.deliveredAt
   });
   if (useAppServer && result.ok) {
-    if (!shouldTrackPendingReply(next)) {
+    if (!shouldTrackPendingReply(config, next)) {
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
-    } else if (looksLikeBotSender(next)) {
-      appendLog(config.paths.activityFile, `REPLY_SKIP_BOT thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
     } else {
       const pendingReply = buildPendingReplyEntry(next, resolvedThreadId, next.turnId, sessionPath, sessionOffset);
       state.pendingReplies = mergePendingReplyLists(state.pendingReplies || [], [pendingReply]);
@@ -2920,7 +2948,7 @@ export async function relayRepliesOnce() {
     if (entry.sentAt || entry.status === "error") {
       continue;
     }
-    if (!looksLikeBotSender(entry)) {
+    if (!looksLikeBotSender(entry) || shouldReplyToTeamBotSender(config, entry)) {
       continue;
     }
     entry.status = "ignored_bot";
@@ -2940,6 +2968,14 @@ export async function relayRepliesOnce() {
   const sessionSignals = new Map();
 
   for (const entry of pendingReplies) {
+    if (isPrivateChatType(entry.chatType) && isPrivateReplySuppressed(config)) {
+      entry.sentAt = nowIso();
+      entry.status = "suppressed_private_reply";
+      entry.responsePreview = entry.responsePreview || "[private Telegram replies suppressed by BLUN_TELEGRAM_PRIVATE_REPLY_MODE]";
+      appendLog(config.paths.activityFile, `REPLY_SUPPRESSED_PRIVATE chat=${entry.chatId} source_message=${entry.messageId}`);
+      continue;
+    }
+
     if (!entry.sessionPath) {
       entry.sessionPath = await resolveThreadSessionPath(config, entry.threadId);
     }
