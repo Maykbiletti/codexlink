@@ -756,7 +756,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["error", "ignored_bot", "superseded", "expired", "stale_thread", "suppressed_private_reply"].includes(String(entry.status || ""));
+    && !["error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "suppressed_private_reply"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -769,7 +769,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread"].includes(status)) {
+  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted"].includes(status)) {
     return false;
   }
   return !hasResponseMessageIds(entry);
@@ -1109,10 +1109,13 @@ function shouldReplyToTeamBotSender(config, entry) {
   }
   const text = String(entry?.sourceText || entry?.text || "");
   const relevance = String(entry?.relevance || "").trim().toLowerCase();
-  if (["direct", "lane", "escalation"].includes(relevance)) {
+  if (relevance === "escalation") {
     return true;
   }
-  return isAgentAddressed(config, text) || looksLikeContinueNudge(text, {});
+  if (["direct", "lane"].includes(relevance) && isAgentAddressed(config, text)) {
+    return true;
+  }
+  return looksLikeContinueNudge(text, {});
 }
 
 function reconcilePendingRepliesInPlace(pendingReplies) {
@@ -1420,76 +1423,170 @@ function normalizeInbound(message, updateType = "message") {
 }
 
 function buildInboundRelayEvent(config, inbound, status = "seen") {
+  const relevance = String(inbound.relevance || "ambient").trim().toLowerCase();
+  const sourceAgent = String(inbound.sourceAgent || inbound.source_agent || inbound.user || "telegram").trim() || "telegram";
+  const targetAgent = ["direct"].includes(relevance) ? String(config.agentName || "").trim() : "";
   return {
     direction: "inbound",
     agentName: config.agentName,
+    publisherAgent: config.agentName,
+    publisher_agent: config.agentName,
+    sourceAgent,
+    source_agent: sourceAgent,
+    targetAgent,
+    target_agent: targetAgent,
     status,
     chatId: inbound.chatId,
+    chat_id: inbound.chatId,
     messageId: inbound.messageId,
+    message_id: inbound.messageId,
     replyToMessageId: inbound.replyToMessageId || "",
+    reply_to_message_id: inbound.replyToMessageId || "",
     telegramThreadId: inbound.telegramThreadId || "",
+    telegram_thread_id: inbound.telegramThreadId || "",
     chatType: inbound.chatType || "",
+    chat_type: inbound.chatType || "",
     conversationKey: inbound.conversationKey || "",
+    conversation_key: inbound.conversationKey || "",
     groupTitle: inbound.groupTitle || "",
+    group_title: inbound.groupTitle || "",
     user: inbound.user || "",
     userId: inbound.userId || "",
+    user_id: inbound.userId || "",
     senderIsBot: Boolean(inbound.senderIsBot),
-    relevance: inbound.relevance || "ambient",
+    sender_is_bot: Boolean(inbound.senderIsBot),
+    relevance,
     intent: inbound.intent || "message",
     updateType: inbound.updateType || "message",
+    update_type: inbound.updateType || "message",
+    scope: relevance === "lane" ? String(config.lane || "").trim() : "",
+    priority: relevance === "escalation" ? "high" : "normal",
     text: inbound.text || "",
     ts: inbound.ts || nowIso()
   };
 }
 
 function buildOutboundRelayEvent(config, outbound, contextEntry = null) {
+  const sourceAgent = String(config.agentName || "CodexLink").trim() || "CodexLink";
   return {
     direction: "outbound",
     agentName: config.agentName,
+    publisherAgent: config.agentName,
+    publisher_agent: config.agentName,
+    sourceAgent,
+    source_agent: sourceAgent,
+    targetAgent: "",
+    target_agent: "",
     status: "sent",
     chatId: outbound.chatId,
+    chat_id: outbound.chatId,
     messageId: outbound.messageId,
+    message_id: outbound.messageId,
     replyToMessageId: outbound.replyToMessageId || "",
+    reply_to_message_id: outbound.replyToMessageId || "",
     telegramThreadId: outbound.telegramThreadId || "",
+    telegram_thread_id: outbound.telegramThreadId || "",
     chatType: contextEntry?.chatType || (String(outbound.chatId || "").startsWith("-") ? "supergroup" : "private"),
+    chat_type: contextEntry?.chatType || (String(outbound.chatId || "").startsWith("-") ? "supergroup" : "private"),
     conversationKey: contextEntry?.conversationKey || `${outbound.chatId}:${outbound.telegramThreadId || "root"}`,
+    conversation_key: contextEntry?.conversationKey || `${outbound.chatId}:${outbound.telegramThreadId || "root"}`,
     groupTitle: contextEntry?.groupTitle || "",
+    group_title: contextEntry?.groupTitle || "",
     user: config.displayName || config.agentName || "CodexLink",
     userId: "",
+    user_id: "",
     senderIsBot: true,
+    sender_is_bot: true,
     source: outbound.source || "manual",
     sourceTurnId: outbound.sourceTurnId || "",
+    source_turn_id: outbound.sourceTurnId || "",
+    scope: "",
+    priority: "normal",
     text: outbound.text || "",
     ts: outbound.ts || nowIso()
   };
 }
 
+function firstRelayText(event, ...keys) {
+  for (const key of keys) {
+    const value = event?.[key];
+    if (value === null || value === undefined) {
+      continue;
+    }
+    const text = String(value).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function normalizeRelayAgentToken(value) {
+  return String(value || "").trim().toLowerCase().replace(/^@+/, "");
+}
+
+function currentRelayAgentAliases(config) {
+  const names = [
+    config?.agentName,
+    config?.displayName,
+    ...(Array.isArray(config?.mentionNames) ? config.mentionNames : [])
+  ];
+  return new Set(names.map(normalizeRelayAgentToken).filter(Boolean));
+}
+
+function getRelayTargetMatch(config, targetAgent) {
+  const raw = Array.isArray(targetAgent) ? targetAgent.join(",") : String(targetAgent || "");
+  const targets = raw
+    .split(/[,\s]+/)
+    .map(normalizeRelayAgentToken)
+    .filter(Boolean);
+  if (targets.length === 0 || targets.some((value) => ["*", "all", "any", "team", "broadcast"].includes(value))) {
+    return { matched: true, specific: false };
+  }
+  const aliases = currentRelayAgentAliases(config);
+  return {
+    matched: targets.some((target) => aliases.has(target)),
+    specific: true
+  };
+}
+
 function normalizeTeamRelayInbound(config, state, event) {
-  const sourceAgent = String(event?.agentName || event?.publisherAgent || "").trim();
-  if (!event || sourceAgent.toLowerCase() === String(config.agentName || "").trim().toLowerCase()) {
+  const sourceAgent = firstRelayText(event, "sourceAgent", "source_agent", "agentName", "publisherAgent", "publisher_agent", "user");
+  const publisherAgent = firstRelayText(event, "publisherAgent", "publisher_agent", "agentName");
+  const currentAgent = normalizeRelayAgentToken(config.agentName || "");
+  if (!event || normalizeRelayAgentToken(sourceAgent) === currentAgent || normalizeRelayAgentToken(publisherAgent) === currentAgent) {
     return null;
   }
 
-  const chatId = String(event.chatId || "").trim();
-  const messageId = String(event.messageId || "").trim();
+  const targetAgent = firstRelayText(event, "targetAgent", "target_agent");
+  const targetMatch = getRelayTargetMatch(config, targetAgent);
+  if (!targetMatch.matched) {
+    return null;
+  }
+
+  const chatId = firstRelayText(event, "chatId", "chat_id");
+  const messageId = firstRelayText(event, "messageId", "message_id");
   const text = String(event.text || "").trim();
-  const chatType = String(event.chatType || "").trim().toLowerCase();
+  const chatType = firstRelayText(event, "chatType", "chat_type").toLowerCase() || (chatId.startsWith("-") ? "supergroup" : "unknown");
   if (!chatId || !messageId || !text || chatType === "private") {
     return null;
   }
 
-  const telegramThreadId = normalizeTelegramThreadId(event.telegramThreadId || "");
+  const telegramThreadId = normalizeTelegramThreadId(firstRelayText(event, "telegramThreadId", "telegram_thread_id"));
+  const conversationKey = firstRelayText(event, "conversationKey", "conversation_key") || `${chatId}:${telegramThreadId || "root"}`;
+  const scope = firstRelayText(event, "scope");
+  const priority = firstRelayText(event, "priority");
   const inbound = {
     chatId,
     messageId,
-    replyToMessageId: String(event.replyToMessageId || "").trim(),
+    replyToMessageId: firstRelayText(event, "replyToMessageId", "reply_to_message_id"),
     telegramThreadId,
-    chatType: chatType || (chatId.startsWith("-") ? "supergroup" : "unknown"),
-    senderIsBot: Boolean(event.senderIsBot || String(event.direction || "").toLowerCase() === "outbound"),
-    conversationKey: String(event.conversationKey || "").trim() || `${chatId}:${telegramThreadId || "root"}`,
-    groupTitle: String(event.groupTitle || "").trim(),
+    chatType,
+    senderIsBot: Boolean(event.senderIsBot || event.sender_is_bot || String(event.direction || "").toLowerCase() === "outbound"),
+    conversationKey,
+    groupTitle: firstRelayText(event, "groupTitle", "group_title"),
     user: String(event.user || sourceAgent || "team-relay").trim() || "team-relay",
-    userId: String(event.userId || "").trim(),
+    userId: firstRelayText(event, "userId", "user_id"),
     text,
     ts: String(event.ts || "").trim() || nowIso(),
     intent: "message",
@@ -1500,12 +1597,24 @@ function normalizeTeamRelayInbound(config, state, event) {
     relay: {
       id: String(event.id || "").trim(),
       direction: String(event.direction || "").trim(),
-      sourceAgent
+      sourceAgent,
+      publisherAgent,
+      targetAgent,
+      scope,
+      priority
     }
   };
   const continueContext = buildContinueContext(state, inbound);
   inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
   inbound.relevance = classifyInboundRelevance(config, inbound);
+  if (targetMatch.specific && inbound.relevance !== "escalation") {
+    inbound.relevance = "direct";
+  } else if (scope && config.lane && normalizeRelayAgentToken(scope) === normalizeRelayAgentToken(config.lane) && inbound.relevance === "ambient") {
+    inbound.relevance = "lane";
+  }
+  if (priority.toLowerCase() === "high" && inbound.relevance === "ambient") {
+    inbound.relevance = "escalation";
+  }
   return inbound;
 }
 
@@ -3080,14 +3189,38 @@ export async function relayRepliesOnce() {
           timestamp: String(item?.timestamp || "").trim()
         }))
         .filter((item) => item.message);
-      sessionSignals.set(entry.sessionPath, { completions, finalAnswers, commentaries });
+      const aborts = delta.items
+        .filter((item) => item?.type === "event_msg" && item?.payload?.type === "turn_aborted")
+        .map((item) => ({
+          turnId: String(item?.payload?.turn_id || "").trim(),
+          reason: String(item?.payload?.reason || "").trim(),
+          timestamp: String(item?.timestamp || "").trim()
+        }))
+        .filter((item) => item.timestamp);
+      sessionSignals.set(entry.sessionPath, { completions, finalAnswers, commentaries, aborts });
     }
 
-    const signals = sessionSignals.get(entry.sessionPath) || { completions: [], finalAnswers: [], commentaries: [] };
+    const signals = sessionSignals.get(entry.sessionPath) || { completions: [], finalAnswers: [], commentaries: [], aborts: [] };
     const completions = signals.completions || [];
     const finalAnswers = signals.finalAnswers || [];
     const commentaries = signals.commentaries || [];
+    const aborts = signals.aborts || [];
     const progressRelayMode = getProgressRelayMode(config);
+
+    const abortedTurn = aborts.find((item) => {
+      if (item.timestamp < entry.createdAt) {
+        return false;
+      }
+      return !entry.turnId || !item.turnId || item.turnId === entry.turnId;
+    });
+    if (abortedTurn) {
+      entry.sentAt = nowIso();
+      entry.status = "aborted";
+      entry.turnId = entry.turnId || abortedTurn.turnId || "";
+      entry.responsePreview = abortedTurn.reason ? `[turn aborted: ${abortedTurn.reason}]` : "[turn aborted]";
+      appendLog(config.paths.activityFile, `REPLY_ABORTED thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId}`);
+      continue;
+    }
 
     if (progressRelayMode === "commentary" && !entry.progressSentAt) {
       const progress = commentaries.find((item) => {

@@ -21,6 +21,7 @@
     "telegram-title-embed.ps1",
     "telegram-status.ps1",
     "telegram-doctor.ps1",
+    "codexlink-install.ps1",
     "telegram-setup.ps1",
     "telegram-console-input.ps1",
     "telegram-title-watcher.ps1"

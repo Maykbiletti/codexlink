@@ -10,7 +10,7 @@ $skipTelegramSetup = $false
 $promptParts = @()
 $parsedArgs = @($args)
 
-$directCommands = @("telegram-status", "telegram-doctor", "telegram-setup", "telegram-relay-server", "doctor")
+$directCommands = @("telegram-status", "telegram-doctor", "telegram-setup", "telegram-relay-server", "doctor", "install", "repair")
 for ($scanIndex = 0; $scanIndex -lt $parsedArgs.Count; $scanIndex++) {
   $token = $parsedArgs[$scanIndex]
   if ($token -in @("--profile", "--telegram", "--workspace")) {
@@ -31,6 +31,13 @@ for ($scanIndex = 0; $scanIndex -lt $parsedArgs.Count; $scanIndex++) {
         $nodeArgs += @($parsedArgs[($scanIndex + 1)..($parsedArgs.Count - 1)])
       }
       & node @nodeArgs
+      exit $LASTEXITCODE
+    }
+    if ($token -in @("install", "repair")) {
+      if ($token -eq "repair") {
+        $commandArgs += "-NoStart"
+      }
+      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "codexlink-install.ps1") @commandArgs
       exit $LASTEXITCODE
     }
     $scriptName = switch ($token) {

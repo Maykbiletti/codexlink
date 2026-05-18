@@ -46,31 +46,88 @@ function relayFetchOptions(config, options = {}) {
   };
 }
 
+function firstText(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) {
+      continue;
+    }
+    const text = String(value).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function relayField(event, camelName, snakeName = "") {
+  return firstText(event?.[camelName], snakeName ? event?.[snakeName] : "");
+}
+
 export function buildTeamRelayEventId(event) {
-  const chatId = String(event?.chatId || "").trim();
-  const messageId = String(event?.messageId || "").trim();
-  if (chatId && messageId) {
-    return `telegram:${chatId}:${messageId}`;
+  const sourceAgent = firstText(
+    event?.sourceAgent,
+    event?.source_agent,
+    event?.user,
+    event?.agentName,
+    event?.publisherAgent,
+    "unknown"
+  );
+  const chatId = relayField(event, "chatId", "chat_id");
+  const messageId = relayField(event, "messageId", "message_id");
+  if (sourceAgent && chatId && messageId) {
+    return `telegram:${sourceAgent}:${chatId}:${messageId}`;
   }
   return `relay:${String(event?.direction || "event")}:${String(event?.agentName || "unknown")}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 }
 
 function normalizeRelayEvent(config, event) {
+  const publisherAgent = firstText(event?.publisherAgent, event?.publisher_agent, config?.agentName, "default");
+  const sourceAgent = firstText(event?.sourceAgent, event?.source_agent, event?.agentName, publisherAgent);
+  const targetAgent = firstText(event?.targetAgent, event?.target_agent);
+  const chatId = relayField(event, "chatId", "chat_id");
+  const messageId = relayField(event, "messageId", "message_id");
+  const replyToMessageId = relayField(event, "replyToMessageId", "reply_to_message_id");
+  const telegramThreadId = relayField(event, "telegramThreadId", "telegram_thread_id");
+  const chatType = relayField(event, "chatType", "chat_type").toLowerCase();
+  const conversationKey = relayField(event, "conversationKey", "conversation_key");
+  const groupTitle = relayField(event, "groupTitle", "group_title");
+  const userId = relayField(event, "userId", "user_id");
   const normalized = {
     v: 1,
-    id: String(event?.id || event?.eventId || "").trim() || buildTeamRelayEventId(event),
+    ...event,
+    id: String(event?.id || event?.eventId || event?.event_id || "").trim(),
     ts: String(event?.ts || "").trim() || nowIso(),
-    source: "codexlink.telegram",
-    publisherAgent: String(config?.agentName || "default").trim() || "default",
-    ...event
+    source: String(event?.source || "codexlink.telegram").trim() || "codexlink.telegram",
+    publisherAgent,
+    publisher_agent: publisherAgent,
+    agentName: firstText(event?.agentName, sourceAgent, publisherAgent, "default"),
+    sourceAgent,
+    source_agent: sourceAgent,
+    targetAgent,
+    target_agent: targetAgent,
+    chatId,
+    chat_id: chatId,
+    messageId,
+    message_id: messageId,
+    replyToMessageId,
+    reply_to_message_id: replyToMessageId,
+    telegramThreadId,
+    telegram_thread_id: telegramThreadId,
+    chatType,
+    chat_type: chatType,
+    conversationKey,
+    conversation_key: conversationKey,
+    groupTitle,
+    group_title: groupTitle,
+    user: firstText(event?.user, sourceAgent),
+    userId,
+    user_id: userId,
+    scope: firstText(event?.scope),
+    priority: firstText(event?.priority, "normal").toLowerCase(),
+    text: String(event?.text || "")
   };
   normalized.id = String(normalized.id || "").trim() || buildTeamRelayEventId(normalized);
-  normalized.agentName = String(normalized.agentName || config?.agentName || "default").trim() || "default";
   normalized.direction = String(normalized.direction || "event").trim().toLowerCase();
-  normalized.chatId = String(normalized.chatId || "").trim();
-  normalized.messageId = String(normalized.messageId || "").trim();
-  normalized.chatType = String(normalized.chatType || "").trim().toLowerCase();
-  normalized.text = String(normalized.text || "");
   return normalized;
 }
 
@@ -146,11 +203,17 @@ export async function publishTeamRelayEvent(config, event) {
   }
 
   let filePublished = false;
+  let fileError = "";
   const file = String(config?.teamRelayFile || "").trim();
   if (file) {
-    mkdirSync(dirname(file), { recursive: true });
-    appendJsonl(file, relayEvent);
-    filePublished = true;
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      appendJsonl(file, relayEvent);
+      filePublished = true;
+    } catch (error) {
+      fileError = String(error?.message || error);
+      appendLog(config.paths.activityFile, `TEAM_RELAY_FILE_ERROR id=${relayEvent.id}: ${fileError}`);
+    }
   }
 
   let urlPublished = false;
@@ -168,6 +231,7 @@ export async function publishTeamRelayEvent(config, event) {
   return {
     ok: true,
     published: filePublished || urlPublished,
+    fileError: fileError || undefined,
     event: relayEvent
   };
 }

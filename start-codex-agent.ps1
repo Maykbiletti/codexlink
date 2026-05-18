@@ -65,6 +65,13 @@ function Ensure-Dir {
   }
 }
 
+function Get-DefaultTeamRelayFile {
+  if ($env:ProgramData) {
+    return (Join-Path $env:ProgramData "Blun\codexlink\blun-team-relay.jsonl")
+  }
+  return (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl")
+}
+
 function Set-EnvVar {
   param([string]$Name, [string]$Value)
   if ($null -ne $Value -and $Value -ne "") {
@@ -219,6 +226,17 @@ function Ensure-TeamRelayDefaults {
   if (-not $hasRelayFile -and -not $hasRelayUrl) {
     $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
     $changed = $true
+  } elseif ($hasRelayFile -and -not $hasRelayUrl) {
+    $legacyDefaultFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+    try {
+      $currentRelayFile = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"]))
+      $legacyRelayFile = [System.IO.Path]::GetFullPath($legacyDefaultFile)
+      if ([string]::Equals($currentRelayFile, $legacyRelayFile, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
+        $changed = $true
+      }
+    } catch {
+    }
   }
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_PRIVATE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"])) {
     $Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"] = "0"
@@ -461,7 +479,7 @@ $telegramExistingEnv = @{}
 if ($telegramStateDir) {
   Ensure-Dir -Path $telegramStateDir
   $telegramExistingEnv = Read-DotEnvFile -Path (Join-Path $telegramStateDir ".env")
-  $telegramDefaultTeamRelayFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+  $telegramDefaultTeamRelayFile = Get-DefaultTeamRelayFile
   [void](Ensure-TeamRelayDefaults -Values $telegramExistingEnv -DefaultFile $telegramDefaultTeamRelayFile)
 }
 
@@ -616,7 +634,7 @@ if ($useRemoteAppServer) {
     $stateEnv["BLUN_TELEGRAM_PLUGIN_MODE"] = $TelegramMode
     $stateEnv["BLUN_TELEGRAM_APP_SERVER_WS_URL"] = $telegramAppServerWsUrl
     $stateEnv["BLUN_TELEGRAM_THREAD_ID"] = $previousBoundThreadId
-    [void](Ensure-TeamRelayDefaults -Values $stateEnv -DefaultFile (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"))
+    [void](Ensure-TeamRelayDefaults -Values $stateEnv -DefaultFile (Get-DefaultTeamRelayFile))
     Write-DotEnvFile -Path $envFilePath -Values $stateEnv
     Write-DebugStage -Path $debugLogPath -Message ("ENV_WRITTEN ws_url=" + $telegramAppServerWsUrl + " env_file=" + $envFilePath + " previous_thread=" + $previousBoundThreadId)
     if ($null -ne $telegramState) {

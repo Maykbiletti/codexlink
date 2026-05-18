@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, normalize, resolve } from "node:path";
 import { ensureStateLayout, getPaths } from "./paths.js";
 
 function readDotEnvFile(path) {
@@ -49,6 +49,20 @@ function parseGroupDeliveryMode(rawValue) {
   return "all";
 }
 
+function defaultTeamRelayFile(paths) {
+  if (process.platform === "win32") {
+    const programData = process.env.ProgramData?.trim() || "C:\\ProgramData";
+    return join(programData, "Blun", "codexlink", "blun-team-relay.jsonl");
+  }
+  return join(paths.codexHome, "channels", "blun-team-relay.jsonl");
+}
+
+function samePath(left, right) {
+  const normalizedLeft = normalize(resolve(String(left || ""))).toLowerCase();
+  const normalizedRight = normalize(resolve(String(right || ""))).toLowerCase();
+  return normalizedLeft === normalizedRight;
+}
+
 export function loadConfig() {
   ensureStateLayout();
   const paths = getPaths();
@@ -59,9 +73,13 @@ export function loadConfig() {
   delete fallbackEnv.BLUN_TELEGRAM_STATE_DIR;
   delete fallbackEnv.BLUN_TELEGRAM_THREAD_ID;
   const env = { ...fallbackEnv, ...process.env, ...fileEnv };
-  const defaultTeamRelayFile = join(paths.codexHome, "channels", "blun-team-relay.jsonl");
+  const defaultRelayFile = defaultTeamRelayFile(paths);
+  const legacyDefaultRelayFile = join(paths.codexHome, "channels", "blun-team-relay.jsonl");
   const teamRelayUrl = env.BLUN_TELEGRAM_TEAM_RELAY_URL?.trim() || "";
-  const teamRelayFile = env.BLUN_TELEGRAM_TEAM_RELAY_FILE?.trim() || (teamRelayUrl ? "" : defaultTeamRelayFile);
+  const configuredTeamRelayFile = env.BLUN_TELEGRAM_TEAM_RELAY_FILE?.trim() || "";
+  const teamRelayFile = configuredTeamRelayFile && !samePath(configuredTeamRelayFile, legacyDefaultRelayFile)
+    ? configuredTeamRelayFile
+    : (teamRelayUrl ? "" : defaultRelayFile);
   const teamRelayMode = env.BLUN_TELEGRAM_TEAM_RELAY_MODE?.trim().toLowerCase() || "both";
   const allowedChatIds = parseAllowedChatIds(env.BLUN_TELEGRAM_ALLOWED_CHAT_ID || env.TELEGRAM_ALLOWED_CHAT_ID || "");
   const mentionNames = parseMentionNames(

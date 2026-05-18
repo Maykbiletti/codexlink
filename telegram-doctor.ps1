@@ -34,6 +34,13 @@ function Add-Check {
   }) | Out-Null
 }
 
+function Get-DefaultTeamRelayFile {
+  if ($env:ProgramData) {
+    return (Join-Path $env:ProgramData "Blun\codexlink\blun-team-relay.jsonl")
+  }
+  return (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl")
+}
+
 function Test-TelegramTokenFormat {
   param([string]$Value)
   if (-not $Value) { return $false }
@@ -199,6 +206,17 @@ function Ensure-TeamRelayDefaults {
   if (-not $hasRelayFile -and -not $hasRelayUrl) {
     $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
     $changed = $true
+  } elseif ($hasRelayFile -and -not $hasRelayUrl) {
+    $legacyDefaultFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+    try {
+      $currentRelayFile = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"]))
+      $legacyRelayFile = [System.IO.Path]::GetFullPath($legacyDefaultFile)
+      if ([string]::Equals($currentRelayFile, $legacyRelayFile, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"] = $DefaultFile
+        $changed = $true
+      }
+    } catch {
+    }
   }
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_PRIVATE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"])) {
     $Values["BLUN_TELEGRAM_TEAM_RELAY_PRIVATE"] = "0"
@@ -264,7 +282,7 @@ function Invoke-RuntimeFix {
     $envChanged = $true
     $actions.Add("cleared_env_thread") | Out-Null
   }
-  if (Ensure-TeamRelayDefaults -Values $envValues -DefaultFile (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl")) {
+  if (Ensure-TeamRelayDefaults -Values $envValues -DefaultFile (Get-DefaultTeamRelayFile)) {
     $envChanged = $true
     $actions.Add("ensured_team_relay_defaults") | Out-Null
   }

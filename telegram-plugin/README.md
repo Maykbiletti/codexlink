@@ -60,7 +60,7 @@ Copy `.env.example` to `.env` in the state directory or export env vars:
 - `BLUN_TELEGRAM_DISPATCH_MODE` (`deferred` by default, `legacy` to restore eager dispatch)
 - `BLUN_TELEGRAM_GROUP_DELIVERY` (`all` by default for public/single-agent bridges, `observe` for team-wide context delivery without automatic replies, `mentions` for strict multi-agent routing)
 - `BLUN_TELEGRAM_TEAM_RELAY_MODE` (`both` by default, or `off`, `publish`, `consume`)
-- `BLUN_TELEGRAM_TEAM_RELAY_FILE` (defaults to `%USERPROFILE%\.codex\channels\blun-team-relay.jsonl`; use a shared absolute path for agents under different Windows users)
+- `BLUN_TELEGRAM_TEAM_RELAY_FILE` (defaults to `%ProgramData%\Blun\codexlink\blun-team-relay.jsonl` on Windows; use a shared absolute path for agents under different machines/accounts)
 - `BLUN_TELEGRAM_TEAM_RELAY_URL` (shared HTTP relay endpoint for multiple machines)
 - `BLUN_TELEGRAM_TEAM_RELAY_SECRET` (optional bearer secret for the shared HTTP relay)
 - `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE` (`0` by default; private DMs are not shared)
@@ -76,12 +76,26 @@ Telegram does not reliably deliver bot-to-bot group messages to every bot. Codex
 - private DMs stay private unless `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=1` is explicitly set
 - private-DM context cannot be sent into a group by accident; manual bridge replies need both `allow_private_to_group=true` and `confirm_group_broadcast=true`
 
-Minimal local setup for multiple agents on one machine and the same Windows user is now the default. `%USERPROFILE%` differs per Windows user, so agents running under different Windows accounts need a shared absolute path or the HTTP relay:
+Minimal local setup for multiple agents on one Windows machine is now the default. All agents use the shared ProgramData relay path unless `BLUN_TELEGRAM_TEAM_RELAY_FILE` or `BLUN_TELEGRAM_TEAM_RELAY_URL` is configured:
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
-BLUN_TELEGRAM_TEAM_RELAY_FILE=%USERPROFILE%\.codex\channels\blun-team-relay.jsonl
+BLUN_TELEGRAM_TEAM_RELAY_FILE=%ProgramData%\Blun\codexlink\blun-team-relay.jsonl
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
+```
+
+External publishers can also write the minimal snake_case event format. CodexLink normalizes it to the internal camelCase format and deduplicates by `source_agent + chat_id + message_id`:
+
+```json
+{
+  "source_agent": "dieter",
+  "target_agent": "alfred",
+  "chat_id": "-1003927574737",
+  "message_id": "telegram-id",
+  "scope": "engineering",
+  "priority": "normal",
+  "text": "..."
+}
 ```
 
 For multiple machines, run one shared relay server and point every agent at the same URL:

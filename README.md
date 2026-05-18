@@ -185,12 +185,26 @@ Team-Relay fuer Agent-Gruppen:
 
 Telegram liefert Bot-Nachrichten in Gruppen nicht verlaesslich als raw update an andere Bots. Fuer echte Agent-zu-Agent-Kommunikation nutzt CodexLink deshalb optional einen gemeinsamen Relay-Kanal. Damit werden menschliche Gruppen-Nachrichten und Agent-Outbounds zusaetzlich als JSONL-Events abgelegt oder an einen zentralen Relay-Endpunkt gesendet und von anderen Profilen konsumiert.
 
-Auf einer Maschine reicht eine gemeinsame Datei nur dann, wenn wirklich alle Agents denselben absoluten Pfad lesen und schreiben. `%USERPROFILE%` ist pro Windows-User anders; Profile unter unterschiedlichen Windows-Accounts brauchen deshalb ebenfalls einen gemeinsamen absoluten Pfad oder den HTTP-Relay.
+Auf einer Windows-Maschine nutzt die normale Installation automatisch eine gemeinsame Relay-Datei unter `%ProgramData%\Blun\codexlink\blun-team-relay.jsonl`. Damit lesen und schreiben verschiedene Codex-Profile denselben Kanal, auch wenn sie unter unterschiedlichen Windows-Accounts laufen. Fuer mehrere Maschinen bleibt der HTTP-Relay die richtige Loesung.
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
-BLUN_TELEGRAM_TEAM_RELAY_FILE=%USERPROFILE%\.codex\channels\blun-team-relay.jsonl
+BLUN_TELEGRAM_TEAM_RELAY_FILE=%ProgramData%\Blun\codexlink\blun-team-relay.jsonl
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
+```
+
+Externe Publisher duerfen das minimale Team-Relay-Format nutzen; CodexLink normalisiert es intern und dedupliziert ueber `source_agent + chat_id + message_id`:
+
+```json
+{
+  "source_agent": "dieter",
+  "target_agent": "alfred",
+  "chat_id": "-1003927574737",
+  "message_id": "telegram-id",
+  "scope": "engineering",
+  "priority": "normal",
+  "text": "..."
+}
 ```
 
 Auf mehreren Maschinen reicht eine lokale Datei nicht. Dann braucht ihr einen gemeinsamen Relay-Server:
@@ -362,6 +376,25 @@ blun-codex telegram-setup
 ```
 
 If something is missing later, `blun-codex telegram-doctor` tells you exactly what is missing and what to run next.
+
+For normal users, the easiest path is now the self-healing installer:
+
+```powershell
+npm install -g github:Maykbiletti/codexlink
+blun-codex install --profile otto
+```
+
+`install` runs setup, applies `telegram-doctor --fix`, prints the core health
+checks, and then starts Telegram mode. If a session is already open and you only
+want to repair the runtime without starting a new visible Codex window, run:
+
+```powershell
+blun-codex repair --profile otto
+```
+
+This is the recommended support path before manual debugging. It fixes stale
+thread bindings, stale runtime files, missing relay defaults, and stopped
+sidecars before asking the user to touch `.env` files or process lists.
 
 Inbound Telegram messages are mirrored into the visible Codex console by default,
 so the operator can see that the message arrived. Queue summaries and outbound

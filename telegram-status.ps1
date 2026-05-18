@@ -24,6 +24,13 @@ function Read-DotEnvFile {
   return $values
 }
 
+function Get-DefaultTeamRelayFile {
+  if ($env:ProgramData) {
+    return (Join-Path $env:ProgramData "Blun\codexlink\blun-team-relay.jsonl")
+  }
+  return (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl")
+}
+
 function Test-PidAlive {
   param([int]$ProcId)
   if ($ProcId -le 0) { return $false }
@@ -149,8 +156,19 @@ $dispatchMode = if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { [string]$envFile[
 $groupDeliveryMode = if ($envFile["BLUN_TELEGRAM_GROUP_DELIVERY"]) { [string]$envFile["BLUN_TELEGRAM_GROUP_DELIVERY"] } else { "all" }
 $teamRelayUrl = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"] } else { "" }
 $teamRelayMode = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"] } else { "both" }
-$defaultTeamRelayFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+$defaultTeamRelayFile = Get-DefaultTeamRelayFile
 $teamRelayFile = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"] } elseif ($teamRelayUrl) { "" } else { $defaultTeamRelayFile }
+if ($teamRelayFile -and -not $teamRelayUrl) {
+  $legacyDefaultFile = Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl"
+  try {
+    $currentRelayFile = [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($teamRelayFile))
+    $legacyRelayFile = [System.IO.Path]::GetFullPath($legacyDefaultFile)
+    if ([string]::Equals($currentRelayFile, $legacyRelayFile, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $teamRelayFile = $defaultTeamRelayFile
+    }
+  } catch {
+  }
+}
 $idleCooldownMs = if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { [int]$envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { 15000 }
 $eligibleQueued = if ($dispatchMode -eq "legacy") {
   @($queued)

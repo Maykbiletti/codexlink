@@ -14,6 +14,10 @@ function relayFilePath(config) {
   if (explicit) {
     return explicit;
   }
+  if (process.platform === "win32") {
+    const programData = process.env.ProgramData?.trim() || "C:\\ProgramData";
+    return join(programData, "Blun", "codexlink", "blun-team-relay.jsonl");
+  }
   return join(getPaths().codexHome, "channels", "blun-team-relay.jsonl");
 }
 
@@ -92,21 +96,67 @@ function readRequestBody(req) {
   });
 }
 
+function firstText(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) {
+      continue;
+    }
+    const text = String(value).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
 function normalizeEvent(config, event) {
+  const publisherAgent = firstText(event?.publisherAgent, event?.publisher_agent, event?.agentName, "unknown");
+  const sourceAgent = firstText(event?.sourceAgent, event?.source_agent, event?.agentName, publisherAgent);
+  const targetAgent = firstText(event?.targetAgent, event?.target_agent);
+  const chatId = firstText(event?.chatId, event?.chat_id);
+  const messageId = firstText(event?.messageId, event?.message_id);
+  const replyToMessageId = firstText(event?.replyToMessageId, event?.reply_to_message_id);
+  const telegramThreadId = firstText(event?.telegramThreadId, event?.telegram_thread_id);
+  const chatType = firstText(event?.chatType, event?.chat_type).toLowerCase();
+  const conversationKey = firstText(event?.conversationKey, event?.conversation_key);
+  const groupTitle = firstText(event?.groupTitle, event?.group_title);
+  const userId = firstText(event?.userId, event?.user_id);
   const normalized = {
     v: 1,
-    id: String(event?.id || "").trim() || buildTeamRelayEventId(event),
+    ...event,
+    id: String(event?.id || event?.eventId || event?.event_id || "").trim(),
     ts: String(event?.ts || "").trim() || nowIso(),
     source: String(event?.source || "codexlink.telegram").trim(),
-    publisherAgent: String(event?.publisherAgent || event?.agentName || "unknown").trim() || "unknown",
-    ...event
+    publisherAgent,
+    publisher_agent: publisherAgent,
+    agentName: firstText(event?.agentName, sourceAgent, publisherAgent, "unknown"),
+    sourceAgent,
+    source_agent: sourceAgent,
+    targetAgent,
+    target_agent: targetAgent,
+    chatId,
+    chat_id: chatId,
+    messageId,
+    message_id: messageId,
+    replyToMessageId,
+    reply_to_message_id: replyToMessageId,
+    telegramThreadId,
+    telegram_thread_id: telegramThreadId,
+    chatType,
+    chat_type: chatType,
+    conversationKey,
+    conversation_key: conversationKey,
+    groupTitle,
+    group_title: groupTitle,
+    user: firstText(event?.user, sourceAgent),
+    userId,
+    user_id: userId,
+    scope: firstText(event?.scope),
+    priority: firstText(event?.priority, "normal").toLowerCase(),
+    text: String(event?.text || "")
   };
   normalized.id = String(normalized.id || "").trim() || buildTeamRelayEventId(normalized);
-  normalized.chatId = String(normalized.chatId || "").trim();
-  normalized.messageId = String(normalized.messageId || "").trim();
-  normalized.text = String(normalized.text || "");
   normalized.direction = String(normalized.direction || "event").trim().toLowerCase();
-  normalized.agentName = String(normalized.agentName || normalized.publisherAgent || "unknown").trim() || "unknown";
   return normalized;
 }
 
