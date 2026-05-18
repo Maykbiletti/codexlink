@@ -1321,6 +1321,22 @@ function markMatchingQueueEntriesInPlace(state, source, updates) {
   return changed;
 }
 
+function markMatchingDeliveryStateInPlace(state, source, updates) {
+  let changed = markMatchingQueueEntriesInPlace(state, source, updates);
+  const key = queueKey(source || {});
+  if (!key || key === ":") {
+    return changed;
+  }
+  for (const entry of state.pendingReplies || []) {
+    if (queueKey(entry) !== key) {
+      continue;
+    }
+    Object.assign(entry, updates);
+    changed += 1;
+  }
+  return changed;
+}
+
 function mergeStateSnapshots(currentState, incomingState) {
   const merged = {
     ...currentState,
@@ -3138,7 +3154,7 @@ export async function injectNext(threadId, options = {}) {
   next.responsePreview = result.responseText.slice(0, 400);
   next.stderr = result.stderr.slice(0, 400);
   next.stdout = result.stdout.slice(0, 400);
-  markMatchingQueueEntriesInPlace(state, next, {
+  const injectResultUpdates = {
     status: next.status,
     deliveredAt: next.deliveredAt,
     threadId: next.threadId,
@@ -3147,7 +3163,8 @@ export async function injectNext(threadId, options = {}) {
     stderr: next.stderr,
     stdout: next.stdout,
     injectFinishedAt: next.deliveredAt
-  });
+  };
+  markMatchingDeliveryStateInPlace(state, next, injectResultUpdates);
   if (useAppServer && result.ok) {
     if (!shouldTrackPendingReply(config, next)) {
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
@@ -3160,6 +3177,7 @@ export async function injectNext(threadId, options = {}) {
   state.lastInjectAt = nowIso();
   state.lastAutoDispatchAt = auto ? state.lastInjectAt : state.lastAutoDispatchAt;
   const latestState = loadState(config);
+  markMatchingDeliveryStateInPlace(latestState, next, injectResultUpdates);
   saveStateForConfig(config, mergeStateSnapshots(latestState, state));
   const injectPreview = normalizeWhitespace(result.responseText || result.stderr || "").slice(0, 220);
   if (injectPreview) {
