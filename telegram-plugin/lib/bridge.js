@@ -2821,7 +2821,7 @@ export async function injectNext(threadId, options = {}) {
     || (useAppServer ? state.currentThreadId : config.currentThreadId)
     || ""
   ).trim();
-  const resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId, {
+  let resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId, {
     forcePreferred: Boolean(explicitThreadId)
   });
   if (!resolvedThreadId) {
@@ -2904,7 +2904,26 @@ export async function injectNext(threadId, options = {}) {
   }
   saveStateForConfig(config, state);
   appendLog(config.paths.activityFile, `INJECT_START thread=${resolvedThreadId} message=${next.messageId}`);
-  const result = await injectIntoThread(config, next, resolvedThreadId);
+  let result = await injectIntoThread(config, next, resolvedThreadId);
+  const injectErrorText = `${result.responseText || ""}\n${result.stderr || ""}`;
+  if (useAppServer && !result.ok && /thread\s+not\s+found/i.test(injectErrorText)) {
+    appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY old_thread=${resolvedThreadId} message=${next.messageId}`);
+    const retryThreadId = await resolveActiveThreadId(config, state, "", {
+      forcePreferred: false
+    });
+    if (retryThreadId && retryThreadId !== resolvedThreadId) {
+      resolvedThreadId = retryThreadId;
+      next.threadId = retryThreadId;
+      markMatchingQueueEntriesInPlace(state, next, {
+        threadId: retryThreadId
+      });
+      saveStateForConfig(config, state);
+      appendLog(config.paths.activityFile, `INJECT_RETRY_START thread=${resolvedThreadId} message=${next.messageId}`);
+      result = await injectIntoThread(config, next, resolvedThreadId);
+    } else {
+      appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY_SKIPPED thread=${resolvedThreadId} message=${next.messageId}`);
+    }
+  }
   if (result.busy) {
     const promotedThisAttempt = useAppServer ? false : promoteVisibleQueuedEntry(config, state, resolvedThreadId, next);
     next.status = promotedThisAttempt ? "submitted" : "queued";
