@@ -318,6 +318,13 @@ function injectVisibleConsole(config, message) {
   if (!visibleText) {
     return { ok: false, skipped: true, reason: "empty" };
   }
+  const submitDelayMs = Math.min(
+    1800,
+    Math.max(
+      Number(config.visibleConsoleSubmitDelayMs || 260),
+      Math.ceil(visibleText.length / 4)
+    )
+  );
 
   const result = spawnSync("powershell.exe", [
     "-NoProfile",
@@ -332,7 +339,7 @@ function injectVisibleConsole(config, message) {
     "-ClearBefore",
     "-Submit",
     "-SubmitDelayMs",
-    String(config.visibleConsoleSubmitDelayMs || 260)
+    String(submitDelayMs)
   ], {
     cwd: runtimeRoot,
     encoding: "utf8",
@@ -344,7 +351,8 @@ function injectVisibleConsole(config, message) {
     return {
       ok: true,
       frontendPid,
-      visibleText
+      visibleText,
+      submitDelayMs
     };
   }
 
