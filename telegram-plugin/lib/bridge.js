@@ -2860,6 +2860,7 @@ export async function injectNext(threadId, options = {}) {
   }
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
+  const letCodexQueueVisibleMessages = auto && useAppServer && usesVisibleConsoleInject(config);
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
     return {
@@ -2946,7 +2947,10 @@ export async function injectNext(threadId, options = {}) {
   if (bypassDeferredGate) {
     appendLog(config.paths.activityFile, `ESCALATION_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
   }
-  if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
+  if (letCodexQueueVisibleMessages && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
+    appendLog(config.paths.activityFile, `CODEX_QUEUE_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
+  }
+  if (auto && !bypassDeferredGate && !letCodexQueueVisibleMessages && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
     if (openPendingReplies > 0) {
       await maybeSendDeferredReceipt(config, state, next, "pending_reply");
