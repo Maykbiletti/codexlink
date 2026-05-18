@@ -118,7 +118,7 @@ CodexLink injiziert Nachrichten standardmaessig ueber den App-Server in den akti
 BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
 ```
 
-In diesem Modus schreibt CodexLink die Nachricht ins sichtbare Eingabefeld, wartet kurz und sendet dann einen echten `Enter`/`VK_RETURN`. Die Antwort wird trotzdem weiter aus der Codex-Session getrackt und nach Telegram zurueckgesendet. Das ist der Modus, wenn Telegram exakt wie normale Konsoleneingabe wirken soll.
+In diesem Modus schreibt CodexLink die Nachricht ins sichtbare Eingabefeld, wartet kurz und sendet dann einen echten `Enter`/`VK_RETURN` mit Carriage-Return-Zeichen. Die Antwort wird trotzdem weiter aus der Codex-Session getrackt und nach Telegram zurueckgesendet. Das ist der Modus, wenn Telegram exakt wie normale Konsoleneingabe wirken soll.
 
 Kurze Namens-Pings wie `Codex`, `Assistant` oder ein eigener Profilname werden standardmaessig ebenfalls als echte Nachricht in den aktiven Thread injiziert. Das macht Reachability-Tests sichtbar und vermeidet, dass Telegram wie ein separater Hintergrundbot wirkt. Wer den alten Ack-only-Modus fuer solche Pings braucht, kann `BLUN_TELEGRAM_PING_ACK_ONLY=1` setzen.
 
@@ -139,8 +139,11 @@ Wichtig fuer diesen Modus:
 BLUN_TELEGRAM_ALLOWED_CHAT_ID=<private-user-id>,<group-id>
 BLUN_TELEGRAM_GROUP_DELIVERY=all
 BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
+BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_DELAY_MS=260
 BLUN_TELEGRAM_TEAM_RELAY_URL=
 ```
+
+Auch Bild-/Datei-Nachrichten laufen in `force` standardmaessig durch die sichtbare Konsole; der Prompt enthaelt dann den lokalen Attachment-Pfad. Wer Attachments bewusst wieder ueber den App-Server statt die Konsole steuern will, setzt `BLUN_TELEGRAM_VISIBLE_CONSOLE_SKIP_ATTACHMENTS=1`.
 
 Eine kaputte `BLUN_TELEGRAM_TEAM_RELAY_URL` verursacht sonst Latenz, weil Publish/Read-Versuche auf den unerreichbaren Relay warten. Wenn kein gemeinsamer HTTP-Relay laeuft, die URL leer lassen. Fuer konfigurierte HTTP-Relays kann `BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS` gesetzt werden; Default ist kurz gehalten.
 

@@ -287,7 +287,11 @@ function getVisibleConsoleSkipReason(config, message) {
   if (visibleConsoleMode !== "force") {
     return "env_disabled";
   }
-  if (Array.isArray(message.attachments) && message.attachments.some((attachment) => attachment?.isImage && attachment?.localPath && !attachment.error)) {
+  if (
+    config.visibleConsoleSkipAttachments
+    && Array.isArray(message.attachments)
+    && message.attachments.some((attachment) => attachment?.isImage && attachment?.localPath && !attachment.error)
+  ) {
     return "image_attachment";
   }
   return "";
@@ -328,7 +332,7 @@ function injectVisibleConsole(config, message) {
     "-ClearBefore",
     "-Submit",
     "-SubmitDelayMs",
-    "120"
+    String(config.visibleConsoleSubmitDelayMs || 260)
   ], {
     cwd: runtimeRoot,
     encoding: "utf8",

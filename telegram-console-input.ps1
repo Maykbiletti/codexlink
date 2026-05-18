@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 
 $typeName = "ConsoleInputWriter"
 $assemblyDir = Join-Path $env:TEMP "blun-codexlink"
-$assemblyPath = Join-Path $assemblyDir "console-input-writer-v5.dll"
+$assemblyPath = Join-Path $assemblyDir "console-input-writer-v6.dll"
 
 $source = @"
 using System;
@@ -100,7 +100,7 @@ public static class ConsoleInputWriter {
         if (submitDelayMs > 0) {
           System.Threading.Thread.Sleep(submitDelayMs);
         }
-        WriteKey(input, (char)0, VK_RETURN, SCAN_RETURN);
+        WriteKey(input, (char)13, VK_RETURN, SCAN_RETURN);
       }
     } finally {
       CloseHandle(input);
