@@ -216,7 +216,7 @@ function buildPrompt(config, message) {
   if (String(message.relevance || "").toLowerCase() === "observe") {
     header.push(
       "",
-      "[Observe-Gruppenkontext: Grundregel ist still bleiben. Antworte oder handle nur, wenn die Nachricht ausdruecklich in die Runde fragt (z. B. jemand eine Idee, kann wer pruefen, wer weiss das), dein eigener Scope betroffen ist, du einen konkreten Fehler oder ein Risiko erkennst, oder eine kurze fachliche Antwort echten Mehrwert bringt. Keine Antwort bei normalem Status anderer Agents, Smalltalk, fremden Arbeitsuebergaben ohne eigene Zustaendigkeit oder reinen Bot-Logs. Wenn nichts davon zutrifft: keine Antwort und kein Tool-Lauf.]"
+      "[Kontext: still mitlesen. Nur handeln bei direkter Frage, eigener Zustaendigkeit oder klarem Risiko.]"
     );
   }
 
@@ -241,9 +241,6 @@ function buildVisibleConsoleText(config, message) {
   parts.push(...formatAttachmentInstructions(message));
   if (message.intent === "continue_nudge") {
     parts.push("Weiter-Signal: Bitte den laufenden Arbeitsfluss fortsetzen und nur antworten, wenn es ein konkretes Ergebnis, einen Blocker oder eine Entscheidung gibt.");
-  }
-  if (String(message.relevance || "").toLowerCase() === "observe") {
-    parts.push("Observe-Gruppenkontext: Grundsaetzlich still bleiben. Nur antworten/handeln bei Rundfrage, eigenem Scope, konkretem Fehler/Risiko oder kurzem fachlichem Mehrwert. Nicht antworten auf Status, Smalltalk, fremde Uebergaben ohne Zustaendigkeit oder reine Bot-Logs.");
   }
   return parts
     .join("\n")
