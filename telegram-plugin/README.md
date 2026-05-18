@@ -98,6 +98,8 @@ External publishers can also write the minimal snake_case event format. CodexLin
 }
 ```
 
+The HTTP relay also accepts the same event wrapped as `{ "event": ... }`, `{ "payload": ... }`, `{ "data": ... }`, or `{ "message": ... }`. Invalid POSTs return the concrete missing required fields.
+
 For multiple machines, run one shared relay server and point every agent at the same URL:
 
 ```powershell

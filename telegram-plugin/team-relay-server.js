@@ -109,6 +109,19 @@ function firstText(...values) {
   return "";
 }
 
+function unwrapEvent(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  for (const key of ["event", "payload", "data", "message"]) {
+    const value = raw[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value;
+    }
+  }
+  return raw;
+}
+
 function normalizeEvent(config, event) {
   const publisherAgent = firstText(event?.publisherAgent, event?.publisher_agent, event?.agentName, "unknown");
   const sourceAgent = firstText(event?.sourceAgent, event?.source_agent, event?.agentName, publisherAgent);
@@ -182,9 +195,18 @@ async function handleRequest(req, res, config, file) {
   if (req.method === "POST" && url.pathname === "/events") {
     const body = await readRequestBody(req);
     const raw = JSON.parse(body || "{}");
-    const event = normalizeEvent(config, raw);
+    const event = normalizeEvent(config, unwrapEvent(raw));
     if (!event.chatId || !event.messageId || !event.text.trim()) {
-      jsonResponse(res, 400, { ok: false, error: "incomplete event" });
+      jsonResponse(res, 400, {
+        ok: false,
+        error: "incomplete event",
+        required: ["chatId/chat_id", "messageId/message_id", "text"],
+        missing: [
+          event.chatId ? "" : "chatId/chat_id",
+          event.messageId ? "" : "messageId/message_id",
+          event.text.trim() ? "" : "text"
+        ].filter(Boolean)
+      });
       return;
     }
     mkdirSync(dirname(file), { recursive: true });

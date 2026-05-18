@@ -188,14 +188,14 @@ $nextQueued = @(
         }
       },
       @{ Expression = { [string]$_.ts } },
-      @{ Expression = { [int]$_.messageId } } |
+      @{ Expression = { [string]$_.messageId } } |
     Select-Object -First 1
 )
 $nextPendingReply = @(
   $pendingReplies |
     Sort-Object `
       @{ Expression = { [string]$_.createdAt } },
-      @{ Expression = { [int]$_.messageId } } |
+      @{ Expression = { [string]$_.messageId } } |
     Select-Object -First 1
 )
 $waitReason = if ($pendingReplies.Count -gt 0) {
