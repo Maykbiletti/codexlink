@@ -92,6 +92,7 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS: String(config.teamRelayTimeoutMs || 750),
     BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT: config.visibleConsoleInject || "",
     BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_DELAY_MS: String(config.visibleConsoleSubmitDelayMs || 260),
+    BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_MAX_DELAY_MS: String(config.visibleConsoleSubmitMaxDelayMs || 12000),
     BLUN_TELEGRAM_VISIBLE_CONSOLE_SKIP_ATTACHMENTS: config.visibleConsoleSkipAttachments ? "1" : "0",
     BLUN_TELEGRAM_PLUGIN_MODE: config.pluginMode || "plugin",
     BLUN_CODEX_MODEL: config.model || "",

@@ -106,6 +106,7 @@ export function loadConfig() {
     teamRelayTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS || "750", 10) || 750,
     visibleConsoleInject: env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT?.trim().toLowerCase() || "",
     visibleConsoleSubmitDelayMs: Number.parseInt(env.BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_DELAY_MS || "260", 10) || 260,
+    visibleConsoleSubmitMaxDelayMs: Number.parseInt(env.BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_MAX_DELAY_MS || "12000", 10) || 12000,
     visibleConsoleSkipAttachments: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_VISIBLE_CONSOLE_SKIP_ATTACHMENTS || ""),
     queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",

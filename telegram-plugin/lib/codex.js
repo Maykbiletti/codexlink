@@ -297,6 +297,21 @@ function getVisibleConsoleSkipReason(config, message) {
   return "";
 }
 
+function visibleConsoleSubmitDelayMs(config, visibleText) {
+  const text = String(visibleText || "");
+  const configuredMin = Number.parseInt(String(config.visibleConsoleSubmitDelayMs || "260"), 10) || 260;
+  const configuredMax = Number.parseInt(String(config.visibleConsoleSubmitMaxDelayMs || "12000"), 10) || 12000;
+  const safeMax = Math.max(configuredMin, Math.min(30000, configuredMax));
+  const chars = text.length;
+  const lines = (text.match(/\n/g) || []).length;
+  // The console input writer queues keystrokes faster than the Codex TUI can
+  // consume long messages. Enter must wait for the TUI buffer, not just for
+  // WriteConsoleInputW to return.
+  const lengthDelay = Math.ceil(chars / 1.2);
+  const lineDelay = lines * 120;
+  return Math.min(safeMax, Math.max(configuredMin, 700, lengthDelay + lineDelay));
+}
+
 function injectVisibleConsole(config, message) {
   const skipReason = getVisibleConsoleSkipReason(config, message);
   if (skipReason) {
@@ -318,13 +333,7 @@ function injectVisibleConsole(config, message) {
   if (!visibleText) {
     return { ok: false, skipped: true, reason: "empty" };
   }
-  const submitDelayMs = Math.min(
-    1800,
-    Math.max(
-      Number(config.visibleConsoleSubmitDelayMs || 260),
-      Math.ceil(visibleText.length / 4)
-    )
-  );
+  const submitDelayMs = visibleConsoleSubmitDelayMs(config, visibleText);
 
   const result = spawnSync("powershell.exe", [
     "-NoProfile",
@@ -344,7 +353,7 @@ function injectVisibleConsole(config, message) {
     cwd: runtimeRoot,
     encoding: "utf8",
     windowsHide: true,
-    timeout: 20000
+    timeout: Math.max(20000, submitDelayMs + 15000)
   });
 
   if (result.status === 0) {
