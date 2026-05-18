@@ -283,7 +283,7 @@ function getVisibleConsoleSkipReason(config, message) {
   if (!config.appServerWsUrl) {
     return "no_app_server";
   }
-  const visibleConsoleMode = String(process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim().toLowerCase();
+  const visibleConsoleMode = String(config.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim().toLowerCase();
   if (visibleConsoleMode !== "force") {
     return "env_disabled";
   }
