@@ -102,6 +102,8 @@ export function loadConfig() {
     teamRelayFile,
     teamRelayUrl,
     teamRelaySecret: env.BLUN_TELEGRAM_TEAM_RELAY_SECRET?.trim() || "",
+    teamRelayHost: env.BLUN_TELEGRAM_TEAM_RELAY_HOST?.trim() || "",
+    teamRelayPort: Number.parseInt(env.BLUN_TELEGRAM_TEAM_RELAY_PORT || "28787", 10) || 28787,
     teamRelayPrivate: env.BLUN_TELEGRAM_TEAM_RELAY_PRIVATE?.trim() || "0",
     teamRelayStart: env.BLUN_TELEGRAM_TEAM_RELAY_START?.trim().toLowerCase() || "tail",
     teamRelayTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS || "750", 10) || 750,

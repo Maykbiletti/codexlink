@@ -149,8 +149,8 @@ async function handleRequest(req, res, config, file) {
 ensureStateLayout();
 const config = loadConfig();
 const file = relayFilePath(config);
-const host = process.env.BLUN_TELEGRAM_TEAM_RELAY_HOST || "127.0.0.1";
-const port = Number.parseInt(process.env.BLUN_TELEGRAM_TEAM_RELAY_PORT || "28787", 10) || 28787;
+const host = process.env.BLUN_TELEGRAM_TEAM_RELAY_HOST || config.teamRelayHost || "127.0.0.1";
+const port = Number.parseInt(process.env.BLUN_TELEGRAM_TEAM_RELAY_PORT || String(config.teamRelayPort || "28787"), 10) || 28787;
 
 const server = createServer((req, res) => {
   handleRequest(req, res, config, file).catch((error) => {
