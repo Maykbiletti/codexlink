@@ -20,11 +20,19 @@ async function telegramRequest(config, method, body) {
 
 export async function getUpdates(config, offset) {
   const timeout = Math.max(Number.parseInt(process.env.BLUN_TELEGRAM_GETUPDATES_TIMEOUT || "0", 10) || 0, 0);
-  return telegramRequest(config, "getUpdates", {
-    offset,
-    timeout,
-    allowed_updates: ["message"]
-  });
+  const rawAllowedUpdates = String(
+    process.env.BLUN_TELEGRAM_ALLOWED_UPDATES
+    || "message,edited_message,channel_post,edited_channel_post"
+  ).trim();
+  const allowedUpdates = rawAllowedUpdates
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const body = { offset, timeout };
+  if (allowedUpdates.length > 0 && rawAllowedUpdates.toLowerCase() !== "all") {
+    body.allowed_updates = allowedUpdates;
+  }
+  return telegramRequest(config, "getUpdates", body);
 }
 
 export async function getFileInfo(config, fileId) {

@@ -235,6 +235,11 @@ function shouldObserveAllGroupMessages(config) {
   return groupDeliveryMode(config) === "observe";
 }
 
+function shouldSubmitEveryAllowedMessage(config) {
+  const visibleConsoleMode = String(config?.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "").trim().toLowerCase();
+  return shouldDeliverAllGroupMessages(config) || visibleConsoleMode === "force";
+}
+
 function looksLikeUniversalAgentIntent(text) {
   const normalized = foldTriggerText(text);
   if (!normalized) {
@@ -662,6 +667,10 @@ function classifyInboundRelevance(config, inbound) {
     return "direct";
   }
 
+  if (isGroupChat && shouldDeliverAllGroupMessages(config)) {
+    return "direct";
+  }
+
   if (!isStatusBroadcast && isAgentAddressed(config, text)) {
     return "direct";
   }
@@ -1070,7 +1079,7 @@ function recoverRecentQueuedInboxEntriesInPlace(config, state, maxAgeMs = 5 * 60
     }
     const relevance = String(entry?.relevance || "").trim().toLowerCase();
     const chatType = String(entry?.chatType || "").trim().toLowerCase();
-    const directLike = chatType === "private" || ["direct", "lane", "escalation"].includes(relevance);
+    const directLike = chatType === "private" || ["direct", "lane", "escalation"].includes(relevance) || shouldSubmitEveryAllowedMessage(config);
     if (!directLike) {
       continue;
     }
@@ -1125,7 +1134,7 @@ function mergeQueueEntry(current, incoming) {
   merged.deliveredAt = pickIsoLater(current.deliveredAt, incoming.deliveredAt);
   merged.ts = pickIsoLater(current.ts, incoming.ts);
 
-  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance", "intent"]) {
+  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance", "intent", "updateType"]) {
     if (!merged[field]) {
       merged[field] = current[field] || incoming[field] || null;
     }
@@ -1470,11 +1479,12 @@ async function stageTelegramAttachment(config, inbound) {
   }
 }
 
-function normalizeInbound(message) {
+function normalizeInbound(message, updateType = "message") {
   const text = message.text ?? message.caption ?? "";
   const chatType = String(message.chat?.type || "unknown");
   const telegramThreadId = message.message_thread_id ? String(message.message_thread_id) : "";
   const chatId = String(message.chat.id);
+  const sender = message.from || message.sender_chat || {};
   return {
     chatId,
     messageId: String(message.message_id),
@@ -1486,13 +1496,14 @@ function normalizeInbound(message) {
       ? `${chatId}:dm`
       : `${chatId}:${telegramThreadId || "root"}`,
     groupTitle: message.chat?.title || "",
-    user: message.from?.username || message.from?.first_name || "unknown",
-    userId: message.from?.id ? String(message.from.id) : "",
+    user: sender.username || sender.title || sender.first_name || "unknown",
+    userId: sender.id ? String(sender.id) : "",
     text,
     attachment: pickTelegramAttachment(message),
     ts: nowIso(),
     intent: "message",
     relevance: "ambient",
+    updateType,
     status: "queued",
     attempts: 0,
     lastAttemptAt: null
@@ -1516,6 +1527,7 @@ function buildInboundRelayEvent(config, inbound, status = "seen") {
     senderIsBot: Boolean(inbound.senderIsBot),
     relevance: inbound.relevance || "ambient",
     intent: inbound.intent || "message",
+    updateType: inbound.updateType || "message",
     text: inbound.text || "",
     ts: inbound.ts || nowIso()
   };
@@ -1900,9 +1912,6 @@ function repairMojibake(text) {
 
 function shouldPublishInboundUiNotice(entry) {
   if (!entry) {
-    return false;
-  }
-  if (entry.senderIsBot) {
     return false;
   }
   const chatType = String(entry.chatType || "").toLowerCase();
@@ -2681,11 +2690,29 @@ export async function pollOnce() {
 
   for (const update of updates) {
     state.offset = Math.max(Number(state.offset || 0), Number(update.update_id) + 1);
-    if (!update.message) {
+    const message = update.message
+      || update.edited_message
+      || update.channel_post
+      || update.edited_channel_post
+      || null;
+    const updateType = update.message
+      ? "message"
+      : update.edited_message
+        ? "edited_message"
+        : update.channel_post
+          ? "channel_post"
+          : update.edited_channel_post
+            ? "edited_channel_post"
+            : "";
+    if (!message) {
       ignored += 1;
+      appendLog(
+        config.paths.activityFile,
+        `IGNORED_UPDATE_TYPE update=${update.update_id || "-"} keys=${Object.keys(update || {}).join(",") || "-"}`
+      );
       continue;
     }
-    const inbound = normalizeInbound(update.message);
+    const inbound = normalizeInbound(message, updateType);
     if (!isAllowedChat(config, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} user=${inbound.userId || "-"} message=${inbound.messageId}`);
@@ -2710,7 +2737,7 @@ export async function pollOnce() {
       continue;
     }
     await publishTeamRelayEvent(config, buildInboundRelayEvent(config, inbound, "accepted"));
-    if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient") {
+    if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient" && !shouldSubmitEveryAllowedMessage(config)) {
       ignored += 1;
       appendJsonl(config.paths.inboxFile, { ...inbound, status: "ignored_ambient" });
       appendLog(config.paths.activityFile, `IGNORED_AMBIENT chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
@@ -2789,7 +2816,7 @@ export async function consumeTeamRelayOnce() {
       appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_DUPLICATE id=${eventId} chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
-    if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient") {
+    if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient" && !shouldSubmitEveryAllowedMessage(config)) {
       ignored += 1;
       appendJsonl(config.paths.inboxFile, { ...inbound, status: "ignored_ambient_relay" });
       appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_AMBIENT id=${eventId} chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
@@ -2869,8 +2896,12 @@ function selectNextQueuedEntry(queue, options = {}) {
   const auto = Boolean(options.auto);
   const deferredMode = String(options.dispatchMode || "deferred").toLowerCase() !== "legacy";
   const observeInject = Boolean(options.observeInject);
+  const submitAllQueued = Boolean(options.submitAllQueued);
   const queued = Array.isArray(queue) ? queue.filter((item) => item?.status === "queued") : [];
   if (!auto || !deferredMode) {
+    return queued.sort(compareQueuedDispatchOrder)[0] || null;
+  }
+  if (submitAllQueued) {
     return queued.sort(compareQueuedDispatchOrder)[0] || null;
   }
   const eligible = queued.filter((item) => {
@@ -2935,7 +2966,8 @@ export async function injectNext(threadId, options = {}) {
   const next = selectNextQueuedEntry(state.queue || [], {
     auto,
     dispatchMode: config.dispatchMode,
-    observeInject: config.observeInject
+    observeInject: config.observeInject,
+    submitAllQueued: shouldSubmitEveryAllowedMessage(config)
   });
 
   if (!next) {
