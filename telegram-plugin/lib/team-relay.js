@@ -38,6 +38,14 @@ export function shouldSharePrivateRelay(config) {
   return /^(1|true|yes|on)$/i.test(String(config?.teamRelayPrivate || ""));
 }
 
+function relayFetchOptions(config, options = {}) {
+  const timeoutMs = Math.max(100, Number.parseInt(String(config?.teamRelayTimeoutMs || "750"), 10) || 750);
+  return {
+    ...options,
+    signal: AbortSignal.timeout(timeoutMs)
+  };
+}
+
 export function buildTeamRelayEventId(event) {
   const chatId = String(event?.chatId || "").trim();
   const messageId = String(event?.messageId || "").trim();
@@ -78,11 +86,11 @@ async function publishRelayUrl(config, event) {
     headers.authorization = `Bearer ${secret}`;
   }
 
-  const response = await fetch(url, {
+  const response = await fetch(url, relayFetchOptions(config, {
     method: "POST",
     headers,
     body: JSON.stringify(event)
-  });
+  }));
   if (!response.ok) {
     throw new Error(`team relay url returned HTTP ${response.status}`);
   }
@@ -111,7 +119,7 @@ async function readRelayUrlDelta(config, after) {
     headers.authorization = `Bearer ${secret}`;
   }
 
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, relayFetchOptions(config, { headers }));
   if (!response.ok) {
     throw new Error(`team relay url returned HTTP ${response.status}`);
   }

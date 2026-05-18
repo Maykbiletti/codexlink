@@ -326,7 +326,9 @@ function injectVisibleConsole(config, message) {
     "-Text",
     visibleText,
     "-ClearBefore",
-    "-Submit"
+    "-Submit",
+    "-SubmitDelayMs",
+    "120"
   ], {
     cwd: runtimeRoot,
     encoding: "utf8",

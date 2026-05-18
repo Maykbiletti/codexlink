@@ -112,11 +112,37 @@ Wenn waehrend einer laufenden Arbeit Telegram-Nachrichten gepuffert werden, blei
 
 Der automatische Progress-Hinweis ist bewusst defensiv: standardmaessig sendet Telegram nur finale Antworten plus bei laengeren echten Arbeitslaeufen einen neutralen Status. Interne Commentary-Texte werden nicht als zweite fachliche Antwort gespiegelt. Wer das alte Verhalten will, kann `BLUN_TELEGRAM_PROGRESS_RELAY=commentary` setzen; mit `off` werden Progress-Hinweise ganz deaktiviert.
 
-CodexLink injiziert Nachrichten standardmaessig ueber den App-Server in den aktiven Thread. Der alte Windows-Tastaturmodus, der Text sichtbar ins Eingabefeld schreibt, ist absichtlich deaktiviert, weil einzelne Terminals Enter nicht zuverlaessig absenden. Wer ihn fuer Debugging trotzdem erzwingen will, muss explizit `BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force` setzen.
+CodexLink injiziert Nachrichten standardmaessig ueber den App-Server in den aktiven Thread. Der Windows-Tastaturmodus kann explizit aktiviert werden, wenn Telegram-Nachrichten wirklich sichtbar in der originalen Codex-Konsole landen sollen:
+
+```text
+BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
+```
+
+In diesem Modus schreibt CodexLink die Nachricht ins sichtbare Eingabefeld, wartet kurz und sendet dann einen echten `Enter`/`VK_RETURN`. Die Antwort wird trotzdem weiter aus der Codex-Session getrackt und nach Telegram zurueckgesendet. Das ist der Modus, wenn Telegram exakt wie normale Konsoleneingabe wirken soll.
 
 Kurze Namens-Pings wie `Codex`, `Assistant` oder ein eigener Profilname werden standardmaessig ebenfalls als echte Nachricht in den aktiven Thread injiziert. Das macht Reachability-Tests sichtbar und vermeidet, dass Telegram wie ein separater Hintergrundbot wirkt. Wer den alten Ack-only-Modus fuer solche Pings braucht, kann `BLUN_TELEGRAM_PING_ACK_ONLY=1` setzen.
 
 Gruppen-Nachrichten werden standardmaessig ebenfalls an die aktive CLI geliefert. Das ist der beste Default fuer oeffentliche Setups und Single-Agent-Bots: Telegram ist nur der Transport, der sichtbare Agent entscheidet im Thread selbst, ob die Nachricht fuer ihn relevant ist. Universal-Trigger wie `/ask`, `/debug`, `@assistant`, `ai explain this`, `hilfe`, `erklaer`, `hjalp`, `ayuda`, `aide`, `aiuto`, `ajuda` oder `pomoc` werden zusaetzlich als direkte Agent-Intents erkannt.
+
+Der Otto-/breite-Gruppenmodus ist:
+
+```text
+BLUN_TELEGRAM_GROUP_DELIVERY=all
+BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
+```
+
+Damit nimmt der Poller jede Nachricht aus erlaubten Chats an, egal ob Human oder Bot. `message.from.is_bot` wird nur als `senderIsBot` gespeichert und nicht beim Empfang weggefiltert. Im Auto-Dispatcher bedeutet `all` jetzt auch wirklich: jede queued Message wird an die sichtbare Codex-Konsole submitted, auch Bot-Nachrichten, Nachrichten an andere Agents und normaler Gruppen-Kontext. Der Agent entscheidet danach im sichtbaren Thread, ob er antwortet oder die Nachricht nur als Kontext nutzt.
+
+Wichtig fuer diesen Modus:
+
+```text
+BLUN_TELEGRAM_ALLOWED_CHAT_ID=<private-user-id>,<group-id>
+BLUN_TELEGRAM_GROUP_DELIVERY=all
+BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
+BLUN_TELEGRAM_TEAM_RELAY_URL=
+```
+
+Eine kaputte `BLUN_TELEGRAM_TEAM_RELAY_URL` verursacht sonst Latenz, weil Publish/Read-Versuche auf den unerreichbaren Relay warten. Wenn kein gemeinsamer HTTP-Relay laeuft, die URL leer lassen. Fuer konfigurierte HTTP-Relays kann `BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS` gesetzt werden; Default ist kurz gehalten.
 
 Fuer echte Agent-Teams ist der empfohlene Modus:
 

@@ -589,6 +589,8 @@ if ($useRemoteAppServer) {
     $previousAppServerSnapshot = Try-GetJsonFile -Path (Join-Path $agentRuntimeDir "app-server.json")
     $previousBoundThreadId = ""
     $threadCandidates = @(
+      [Environment]::GetEnvironmentVariable("CODEX_THREAD_ID", "Process"),
+      [Environment]::GetEnvironmentVariable("BLUN_TELEGRAM_THREAD_ID", "Process"),
       $stateEnv["BLUN_TELEGRAM_THREAD_ID"],
       $(if ($null -ne $telegramState) { $telegramState.currentThreadId } else { "" }),
       $(if ($null -ne $previousRuntimeSnapshot) { $previousRuntimeSnapshot.thread_id } else { "" }),

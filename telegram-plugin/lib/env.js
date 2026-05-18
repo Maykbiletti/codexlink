@@ -103,6 +103,8 @@ export function loadConfig() {
     teamRelaySecret: env.BLUN_TELEGRAM_TEAM_RELAY_SECRET?.trim() || "",
     teamRelayPrivate: env.BLUN_TELEGRAM_TEAM_RELAY_PRIVATE?.trim() || "0",
     teamRelayStart: env.BLUN_TELEGRAM_TEAM_RELAY_START?.trim().toLowerCase() || "tail",
+    teamRelayTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS || "750", 10) || 750,
+    visibleConsoleInject: env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT?.trim().toLowerCase() || "",
     queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
     groupDeliveryMode: parseGroupDeliveryMode(

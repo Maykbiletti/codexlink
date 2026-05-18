@@ -2050,6 +2050,12 @@ function shouldTrackPendingReply(config, message) {
   return chatType === "group" || chatType === "supergroup";
 }
 
+function usesVisibleConsoleInject(config) {
+  return String(config?.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "")
+    .trim()
+    .toLowerCase() === "force";
+}
+
 function parseUnixSeconds(isoString) {
   const millis = Date.parse(isoString || "");
   if (Number.isNaN(millis)) {
@@ -2816,29 +2822,32 @@ export async function injectNext(threadId, options = {}) {
     appendLog(config.paths.activityFile, `ESCALATION_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
   }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
-    const openPendingReplies = countOpenPendingReplies(state, config);
-    if (openPendingReplies > 0) {
-      await maybeSendDeferredReceipt(config, state, next, "pending_reply");
-      saveStateForConfig(config, state);
-      return {
-        ok: false,
-        status: "deferred",
-        reason: "pending_reply",
-        pendingReplies: openPendingReplies
-      };
-    }
+    const delegateQueueToVisibleConsole = useAppServer && usesVisibleConsoleInject(config);
+    if (!delegateQueueToVisibleConsole) {
+      const openPendingReplies = countOpenPendingReplies(state, config);
+      if (openPendingReplies > 0) {
+        await maybeSendDeferredReceipt(config, state, next, "pending_reply");
+        saveStateForConfig(config, state);
+        return {
+          ok: false,
+          status: "deferred",
+          reason: "pending_reply",
+          pendingReplies: openPendingReplies
+        };
+      }
 
-    const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
-    if (sessionActivity.active) {
-      await maybeSendDeferredReceipt(config, state, next, "session_active");
-      saveStateForConfig(config, state);
-      return {
-        ok: false,
-        status: "deferred",
-        reason: "session_active",
-        quietMs: sessionActivity.quietMs,
-        readyInMs: Math.max(0, Number(sessionActivity.cooldownMs || 0) - Number(sessionActivity.quietMs || 0))
-      };
+      const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
+      if (sessionActivity.active) {
+        await maybeSendDeferredReceipt(config, state, next, "session_active");
+        saveStateForConfig(config, state);
+        return {
+          ok: false,
+          status: "deferred",
+          reason: "session_active",
+          quietMs: sessionActivity.quietMs,
+          readyInMs: Math.max(0, Number(sessionActivity.cooldownMs || 0) - Number(sessionActivity.quietMs || 0))
+        };
+      }
     }
   }
 

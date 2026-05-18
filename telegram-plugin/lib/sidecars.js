@@ -89,6 +89,8 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_TEAM_RELAY_SECRET: config.teamRelaySecret || "",
     BLUN_TELEGRAM_TEAM_RELAY_PRIVATE: config.teamRelayPrivate || "0",
     BLUN_TELEGRAM_TEAM_RELAY_START: config.teamRelayStart || "tail",
+    BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS: String(config.teamRelayTimeoutMs || 750),
+    BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT: config.visibleConsoleInject || "",
     BLUN_TELEGRAM_PLUGIN_MODE: config.pluginMode || "plugin",
     BLUN_CODEX_MODEL: config.model || "",
     BLUN_CODEX_REASONING_EFFORT: config.reasoningEffort || "",

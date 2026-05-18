@@ -6,14 +6,16 @@ param(
 
   [switch]$ClearBefore,
 
-  [switch]$Submit
+  [switch]$Submit,
+
+  [int]$SubmitDelayMs = 120
 )
 
 $ErrorActionPreference = "Stop"
 
 $typeName = "ConsoleInputWriter"
 $assemblyDir = Join-Path $env:TEMP "blun-codexlink"
-$assemblyPath = Join-Path $assemblyDir "console-input-writer-v4.dll"
+$assemblyPath = Join-Path $assemblyDir "console-input-writer-v5.dll"
 
 $source = @"
 using System;
@@ -71,7 +73,7 @@ public static class ConsoleInputWriter {
   [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
   private static extern bool WriteConsoleInputW(IntPtr hConsoleInput, INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsWritten);
 
-  public static void WriteText(int targetPid, string text, bool clearBefore, bool submit) {
+  public static void WriteText(int targetPid, string text, bool clearBefore, bool submit, int submitDelayMs) {
     FreeConsole();
     if (!AttachConsole((uint)targetPid)) {
       throw new InvalidOperationException("AttachConsole failed: " + Marshal.GetLastWin32Error());
@@ -95,7 +97,10 @@ public static class ConsoleInputWriter {
       }
 
       if (submit) {
-        WriteKey(input, '\r', VK_RETURN, SCAN_RETURN);
+        if (submitDelayMs > 0) {
+          System.Threading.Thread.Sleep(submitDelayMs);
+        }
+        WriteKey(input, (char)0, VK_RETURN, SCAN_RETURN);
       }
     } finally {
       CloseHandle(input);
@@ -148,4 +153,4 @@ if (-not ($typeName -as [type])) {
 }
 
 $normalizedText = $Text -replace "`r`n", " " -replace "`n", " " -replace "`r", " "
-[ConsoleInputWriter]::WriteText($TargetPid, $normalizedText, [bool]$ClearBefore, [bool]$Submit)
+[ConsoleInputWriter]::WriteText($TargetPid, $normalizedText, [bool]$ClearBefore, [bool]$Submit, $SubmitDelayMs)
