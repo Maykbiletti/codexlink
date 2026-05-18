@@ -122,6 +122,7 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_AGENT_NAME: config.agentName || "default",
     BLUN_TELEGRAM_STATE_DIR: config.paths.root,
     BLUN_TELEGRAM_BOT_TOKEN: config.botToken || "",
+    BLUN_TELEGRAM_ALLOWED_UPDATES: config.allowedUpdates || "",
     BLUN_TELEGRAM_ALLOWED_CHAT_ID: Array.isArray(config.allowedChatIds) ? config.allowedChatIds.join(",") : (config.allowedChatId || ""),
     BLUN_TELEGRAM_MENTION_NAMES: Array.isArray(config.mentionNames) ? config.mentionNames.join(",") : "",
     BLUN_TELEGRAM_OTHER_AGENT_NAMES: Array.isArray(config.otherAgentNames) ? config.otherAgentNames.join(",") : "",

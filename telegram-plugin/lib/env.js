@@ -83,6 +83,7 @@ export function loadConfig() {
     lane: env.BLUN_CODEX_LANE?.trim() || "",
     agentPrompt: env.BLUN_CODEX_AGENT_PROMPT?.trim() || "",
     botToken: env.BLUN_TELEGRAM_BOT_TOKEN?.trim() || env.TELEGRAM_BOT_TOKEN?.trim() || "",
+    allowedUpdates: env.BLUN_TELEGRAM_ALLOWED_UPDATES?.trim() || "",
     allowedChatId: allowedChatIds[0] || "",
     allowedChatIds,
     mentionNames,
