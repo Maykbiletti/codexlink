@@ -16,6 +16,22 @@ function readPid(path) {
   }
 }
 
+function readPidMeta(pidFile) {
+  try {
+    return JSON.parse(readFileSync(`${pidFile}.meta.json`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writePidMeta(pidFile, meta) {
+  try {
+    writeFileSync(`${pidFile}.meta.json`, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+  } catch {
+    // Metadata is a safety aid; sidecar ownership still falls back to pid.
+  }
+}
+
 function isPidAlive(pid) {
   if (!pid || pid <= 0) {
     return false;
@@ -28,29 +44,63 @@ function isPidAlive(pid) {
   }
 }
 
-function stopPid(pid) {
-  if (!isPidAlive(pid)) {
+function readProcessCommandLine(pid) {
+  if (!pid || pid <= 0 || process.platform !== "win32") {
+    return "";
+  }
+  try {
+    return String(execFileSync("powershell.exe", [
+      "-NoProfile",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}").CommandLine`
+    ], {
+      encoding: "utf8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"]
+    })).trim();
+  } catch {
+    return "";
+  }
+}
+
+function isOwnedSidecar(pid, scriptName, pidFile, config) {
+  const meta = readPidMeta(pidFile);
+  if (!meta) {
     return false;
   }
-  if (process.platform === "win32") {
-    try {
-      execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-      return true;
-    } catch {
-      return false;
-    }
+  if (Number(meta.pid || 0) !== Number(pid)) {
+    return false;
+  }
+  if (String(meta.scriptName || "") !== String(scriptName || "")) {
+    return false;
+  }
+  if (String(meta.agentName || "") !== String(config.agentName || "")) {
+    return false;
+  }
+  if (String(meta.stateDir || "") !== String(config.paths.root || "")) {
+    return false;
+  }
+
+  const commandLine = readProcessCommandLine(pid).toLowerCase();
+  if (commandLine && !commandLine.includes(String(scriptName || "").toLowerCase())) {
+    return false;
+  }
+  return true;
+}
+
+function stopOwnedSidecar(pid, scriptName, pidFile, config) {
+  if (!isPidAlive(pid)) {
+    return { stopped: true, reason: "not_running" };
+  }
+  if (!isOwnedSidecar(pid, scriptName, pidFile, config)) {
+    return { stopped: false, reason: "ownership_unverified" };
   }
   try {
     process.kill(pid, "SIGTERM");
   } catch {
-    return false;
+    return { stopped: false, reason: "sigterm_failed" };
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // Process may already be gone.
-  }
-  return true;
+  return { stopped: true, reason: "sigterm_sent" };
 }
 
 function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, options = {}) {
@@ -60,7 +110,11 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     if (!forceRestart) {
       return { started: false, pid: existingPid, reason: "already_running" };
     }
-    stopPid(existingPid);
+    const stopped = stopOwnedSidecar(existingPid, scriptName, pidFile, config);
+    if (!stopped.stopped) {
+      appendLog(config.paths.activityFile, `SIDECAR_RESTART_SKIPPED script=${scriptName} pid=${existingPid} reason=${stopped.reason}`);
+      return { started: false, pid: existingPid, reason: `restart_skipped_${stopped.reason}` };
+    }
   }
 
   const env = {
@@ -121,6 +175,13 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
   );
   child.unref();
   writeFileSync(pidFile, `${child.pid}\n`, "utf8");
+  writePidMeta(pidFile, {
+    pid: child.pid,
+    scriptName,
+    agentName: config.agentName || "default",
+    stateDir: config.paths.root,
+    startedAt: new Date().toISOString()
+  });
   return { started: true, pid: child.pid, reason: "spawned" };
 }
 

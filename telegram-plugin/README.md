@@ -142,3 +142,9 @@ Slash commands and `@` mentions are the recommended universal path because they 
 - `team-relay-consumer.js` only reads the shared relay and queues relevant group messages
 - `team-relay-server.js` stores and serves shared relay events for machines that cannot share one local file
 - none of them are allowed to invent an answer on their own
+
+Sidecar restarts are ownership-gated. CodexLink writes a small `.meta.json`
+next to each pid file and only stops a running sidecar when the pid, script,
+agent name and state directory match that metadata. If ownership cannot be
+verified, the restart is skipped and logged instead of killing a possibly
+unrelated Node/Claude/agent process.
