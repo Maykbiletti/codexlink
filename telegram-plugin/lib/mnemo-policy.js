@@ -81,11 +81,13 @@ function buildPolicyArgs(config, message, entry, project, extra = {}) {
     has_project_board: Boolean(entry.lastProjectBoardAt),
     has_chat_sync: Boolean(entry.lastChatSyncAt),
     has_memory_update: Boolean(entry.lastMemoryUpdateAt),
+    has_message_capture: Boolean(entry.lastMessageCaptureAt),
     minutes_since_brief_pull: ageMinutes(entry.lastBriefPullAt),
     minutes_since_recall: ageMinutes(entry.lastRecallAt),
     minutes_since_project_board: ageMinutes(entry.lastProjectBoardAt),
     minutes_since_chat_sync: ageMinutes(entry.lastChatSyncAt),
     minutes_since_memory_update: ageMinutes(entry.lastMemoryUpdateAt),
+    minutes_since_message_capture: ageMinutes(entry.lastMessageCaptureAt),
     message_ref: `${message.chatId || ""}:${message.messageId || ""}`,
     session_key: message.conversationKey || "",
     meta: {
@@ -96,6 +98,50 @@ function buildPolicyArgs(config, message, entry, project, extra = {}) {
     },
     ...extra
   };
+}
+
+async function captureMessage(config, message, entry, project) {
+  const stamp = nowIso();
+  const channel = message.chatType === "private" ? "telegram-dm" : "telegram";
+  const result = await callMnemoTool(config, "mem_capture_ingest", {
+    source: "codexlink",
+    direction: "inbound",
+    event_kind: "telegram_message",
+    actor: message.user || "unknown",
+    content: message.text || "",
+    text: message.text || "",
+    project,
+    ref_kind: "telegram_message",
+    ref_id: `${message.chatId || ""}:${message.messageId || ""}`,
+    thread_id: message.conversationKey || "",
+    channel,
+    remember: true,
+    promote_memory: true,
+    meta: {
+      agent_name: config.agentName || "agent",
+      chat_id: message.chatId || "",
+      message_id: message.messageId || "",
+      group_title: message.groupTitle || "",
+      sender_is_bot: Boolean(message.senderIsBot),
+      forced_by_runtime_policy: true
+    }
+  });
+  entry.lastMessageCaptureAt = stamp;
+  entry.lastMemoryUpdateAt = stamp;
+  entry.lastChatSyncAt = stamp;
+  return result;
+}
+
+async function recallForMessage(config, message, entry) {
+  const stamp = nowIso();
+  const result = await callMnemoTool(config, "mem_recall", {
+    agent_name: config.agentName || "agent",
+    query: message.text || "",
+    text: message.text || "",
+    limit: 8
+  });
+  entry.lastRecallAt = stamp;
+  return result;
 }
 
 async function runFullSync(config, message, entry, project) {
@@ -208,6 +254,8 @@ function buildContextBlock(sync) {
     `Policy status: ${sync.finalCheck && sync.finalCheck.status || sync.status || "unknown"}`,
     ...(sync.auditId ? [`Audit ID: ${sync.auditId}`] : []),
     `Project: ${sync.project || "unknown"}`,
+    `Message captured: ${sync.messageCaptured ? "yes" : "no"}`,
+    `Memory checked: ${sync.memoryChecked ? "yes" : "no"}`,
     `Full sync this turn: ${sync.fullSyncRan ? "yes" : "no"}`,
   ];
   if (sync.warningToken) lines.push(`Warning token: ${sync.warningToken}`);
@@ -235,8 +283,19 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
   let initialCheck = null;
   let finalCheck = null;
   let syncResults = null;
+  const immediateResults = {};
   let error = "";
   try {
+    try {
+      immediateResults.capture = await captureMessage(config, message, entry, project);
+    } catch (captureError) {
+      immediateResults.capture = { error: String(captureError.message || captureError) };
+    }
+    try {
+      immediateResults.recall = await recallForMessage(config, message, entry);
+    } catch (recallError) {
+      immediateResults.recall = { error: String(recallError.message || recallError) };
+    }
     initialCheck = await callMnemoTool(config, "mem_runtime_policy_check", buildPolicyArgs(config, message, entry, project));
     const mustSync = !initialCheck || initialCheck.status !== "ok" || initialCheck.full_sync_due;
     if (mustSync) {
@@ -268,7 +327,8 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
       next_actions: syncResults.project_board.next_actions && syncResults.project_board.next_actions.slice(0, 3)
     }, 700)
     : "";
-  const recallSummary = syncResults && syncResults.recall ? truncate(syncResults.recall, 700) : "";
+  const recallSource = immediateResults.recall || syncResults && syncResults.recall;
+  const recallSummary = recallSource ? truncate(recallSource, 700) : "";
   const sync = {
     enabled: true,
     project,
@@ -282,6 +342,8 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
     briefCount,
     boardSummary,
     recallSummary,
+    messageCaptured: Boolean(immediateResults.capture && !immediateResults.capture.error),
+    memoryChecked: Boolean(immediateResults.recall && !immediateResults.recall.error),
     error,
   };
   sync.promptBlock = buildContextBlock(sync);
