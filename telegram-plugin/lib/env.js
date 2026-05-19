@@ -142,6 +142,10 @@ export function loadConfig() {
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",
-    personality: env.BLUN_CODEX_PERSONALITY?.trim() || ""
+    personality: env.BLUN_CODEX_PERSONALITY?.trim() || "",
+    mnemoSyncEnabled: env.BLUN_MNEMO_SYNC_ENABLED !== "0",
+    mnemoHubUrl: env.BLUN_MNEMO_HUB_URL?.trim() || env.MNEMO_HUB_URL?.trim() || "https://listing.blun.ai/mnemo",
+    mnemoProject: env.BLUN_MNEMO_PROJECT?.trim() || env.BLUN_PROJECT?.trim() || "",
+    mnemoSyncTimeoutMs: Number.parseInt(env.BLUN_MNEMO_SYNC_TIMEOUT_MS || "2500", 10) || 2500
   };
 }

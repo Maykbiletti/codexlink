@@ -22,6 +22,7 @@ export function getPaths() {
     sessionsDir: join(codexHome, "sessions"),
     envFile: join(root, ".env"),
     stateFile: join(root, "state.json"),
+    mnemoSyncStateFile: join(root, "mnemo-sync-state.json"),
     inboxFile: join(root, "inbox.jsonl"),
     outboxFile: join(root, "outbox.jsonl"),
     activityFile: join(root, "activity.log"),

@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startOrSteerTextTurnOverWs } from "./app-server-client.js";
+import { runMnemoRuntimeSync } from "./mnemo-policy.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const runtimeRoot = join(here, "..", "..");
@@ -200,6 +201,10 @@ function buildPrompt(config, message) {
   const label = isBriefSummary ? "" : compactInboundLabel(message);
   const header = [buildAgentRuntimeContext(config), ""];
 
+  if (message.mnemoContextBlock) {
+    header.push(message.mnemoContextBlock.trim(), "");
+  }
+
   if (label) {
     header.push(label);
   }
@@ -238,6 +243,9 @@ function buildVisibleConsoleText(config, message) {
     parts.push(compactInboundLabel(message));
   }
   parts.push(compactText);
+  if (message.mnemoContextBlock) {
+    parts.push(message.mnemoContextBlock.trim());
+  }
   parts.push(...formatAttachmentInstructions(message));
   if (message.intent === "continue_nudge") {
     parts.push("Weiter-Signal: Bitte den laufenden Arbeitsfluss fortsetzen und nur antworten, wenn es ein konkretes Ergebnis, einen Blocker oder eine Entscheidung gibt.");
@@ -399,9 +407,29 @@ function buildTurnInput(config, message) {
 }
 
 export async function injectIntoThread(config, message, threadId) {
-  const turnInput = buildTurnInput(config, message);
+  let mnemoSync = { promptBlock: "" };
+  try {
+    mnemoSync = await runMnemoRuntimeSync(config, message, threadId);
+  } catch (error) {
+    mnemoSync = {
+      promptBlock: `\n[Mnemo Runtime Sync]\nPolicy status: error\nSync error: ${String(error.message || error).slice(0, 500)}\n[/Mnemo Runtime Sync]`
+    };
+  }
+  if (mnemoSync.blocked) {
+    return {
+      ok: false,
+      busy: false,
+      code: null,
+      signal: null,
+      responseText: "",
+      stdout: "",
+      stderr: `mnemo_runtime_policy_blocked audit_id=${mnemoSync.auditId || "-"} status=${mnemoSync.status || "block"}`
+    };
+  }
+  const promptMessage = Object.assign({}, message, { mnemoContextBlock: mnemoSync.promptBlock || "" });
+  const turnInput = buildTurnInput(config, promptMessage);
   if (config.appServerWsUrl) {
-    const consoleResult = injectVisibleConsole(config, message);
+    const consoleResult = injectVisibleConsole(config, promptMessage);
     if (consoleResult.ok) {
       return {
         ok: true,
