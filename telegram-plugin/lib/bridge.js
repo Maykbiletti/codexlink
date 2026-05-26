@@ -772,6 +772,9 @@ function isReplyAwaitingOutcome(entry) {
   if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted"].includes(status)) {
     return false;
   }
+  if (entry.sentAt && !hasResponseMessageIds(entry)) {
+    return false;
+  }
   return !hasResponseMessageIds(entry);
 }
 
