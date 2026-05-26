@@ -1836,6 +1836,7 @@ function shouldSendFallbackProgress(config, entry, sessionPath) {
   const sourceText = entry.sourceText || entry.text || "";
   const looksLikeWork = intent === "continue_nudge"
     || relevance === "escalation"
+    || isAgentAddressed(config, sourceText)
     || looksLikeWorkContextText(sourceText);
   if (!looksLikeWork) {
     return false;
