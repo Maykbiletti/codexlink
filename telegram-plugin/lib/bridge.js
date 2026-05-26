@@ -6,6 +6,7 @@ import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
 import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
+import { logMnemoOutboundReceipt } from "./mnemo-policy.js";
 
 function loadState(config) {
   const state = loadJson(config.paths.stateFile, defaultState());
@@ -756,7 +757,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "suppressed_private_reply"].includes(String(entry.status || ""));
+    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "suppressed_private_reply"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -1100,6 +1101,15 @@ function looksLikeBotSender(entry) {
   return /_bot$/i.test(String(entry?.user || "").trim());
 }
 
+function isTrustedBotSender(config, entry) {
+  if (!looksLikeBotSender(entry)) {
+    return false;
+  }
+  const sender = foldTriggerText(entry?.user || "");
+  const trustedBots = Array.isArray(config?.trustedBotSenders) ? config.trustedBotSenders : [];
+  return trustedBots.map((value) => foldTriggerText(value)).includes(sender);
+}
+
 function shouldReplyToTeamBotSender(config, entry) {
   if (!looksLikeBotSender(entry)) {
     return true;
@@ -1107,12 +1117,33 @@ function shouldReplyToTeamBotSender(config, entry) {
   if (!isGroupChatEntry(entry)) {
     return false;
   }
+  if (isTrustedBotSender(config, entry)) {
+    return true;
+  }
   const text = String(entry?.sourceText || entry?.text || "");
   const relevance = String(entry?.relevance || "").trim().toLowerCase();
   if (relevance === "escalation") {
     return true;
   }
   if (["direct", "lane"].includes(relevance) && isAgentAddressed(config, text)) {
+    return true;
+  }
+  return looksLikeContinueNudge(text, {});
+}
+
+function shouldAcceptBotRelayEntry(config, entry) {
+  if (!looksLikeBotSender(entry)) {
+    return true;
+  }
+  if (isTrustedBotSender(config, entry)) {
+    return true;
+  }
+  const text = String(entry?.sourceText || entry?.text || "");
+  const relevance = String(entry?.relevance || "").trim().toLowerCase();
+  if (relevance === "escalation") {
+    return true;
+  }
+  if (isAgentAddressed(config, text)) {
     return true;
   }
   return looksLikeContinueNudge(text, {});
@@ -1607,6 +1638,9 @@ function normalizeTeamRelayInbound(config, state, event) {
   const continueContext = buildContinueContext(state, inbound);
   inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
   inbound.relevance = classifyInboundRelevance(config, inbound);
+  if (!shouldAcceptBotRelayEntry(config, inbound)) {
+    return null;
+  }
   if (targetMatch.specific && inbound.relevance !== "escalation") {
     inbound.relevance = "direct";
   } else if (scope && config.lane && normalizeRelayAgentToken(scope) === normalizeRelayAgentToken(config.lane) && inbound.relevance === "ambient") {
@@ -2539,6 +2573,17 @@ async function sendOutboundChunks(config, state, options) {
     appendJsonl(config.paths.outboxFile, outbound);
     appendLog(config.paths.activityFile, `OUT_${source.toUpperCase()} chat=${chatId} reply_to=${outbound.replyToMessageId || "-"} thread=${telegramThreadId || "-"} message=${outbound.messageId}: ${chunk.replace(/\s+/g, " ").slice(0, 180)}`);
     await publishTeamRelayEvent(config, buildOutboundRelayEvent(config, outbound, contextEntry));
+    try {
+      const mnemoReceipt = await logMnemoOutboundReceipt(config, outbound, contextEntry);
+      if (mnemoReceipt?.enabled) {
+        appendLog(
+          config.paths.activityFile,
+          `MNEMO_OUTBOUND_RECEIPT chat=${chatId} message=${outbound.messageId} ok=${mnemoReceipt.ok ? 1 : 0} ref=${mnemoReceipt.ref_id || "-"}`
+        );
+      }
+    } catch (error) {
+      appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RECEIPT_ERROR chat=${chatId} message=${outbound.messageId}: ${error}`);
+    }
     messageIds.push(outbound.messageId);
     lastOutbound = outbound;
   }
@@ -2651,6 +2696,11 @@ export async function pollOnce() {
     const continueContext = buildContinueContext(state, inbound);
     inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
     inbound.relevance = classifyInboundRelevance(config, inbound);
+    if (!shouldAcceptBotRelayEntry(config, inbound)) {
+      ignored += 1;
+      appendLog(config.paths.activityFile, `IGNORED_BOT_RELAY chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+      continue;
+    }
     if (hasKnownInboundMessage(state, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED_DUPLICATE chat=${inbound.chatId} message=${inbound.messageId}`);
@@ -2826,7 +2876,7 @@ function selectNextQueuedEntry(queue, options = {}) {
   const eligible = queued.filter((item) => {
     const relevance = String(item.relevance || "").toLowerCase();
     const chatType = String(item.chatType || "").toLowerCase();
-    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane" || relevance === "observe";
+    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane";
   });
   return eligible.sort(compareQueuedDispatchOrder)[0] || null;
 }
@@ -2932,7 +2982,7 @@ export async function injectNext(threadId, options = {}) {
     || ""
   ).trim();
   let resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId, {
-    forcePreferred: Boolean(explicitThreadId)
+    forcePreferred: Boolean(explicitThreadId || config.currentThreadId)
   });
   if (!resolvedThreadId) {
     throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
@@ -3078,8 +3128,12 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
     } else {
       const pendingReply = buildPendingReplyEntry(next, resolvedThreadId, next.turnId, sessionPath, sessionOffset);
+      if (looksLikeBotSender(next) && shouldReplyToTeamBotSender(config, next)) {
+        pendingReply.trustedTeamBotReply = true;
+      }
       state.pendingReplies = mergePendingReplyLists(state.pendingReplies || [], [pendingReply]);
-      appendLog(config.paths.activityFile, `REPLY_PENDING thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
+      const noTurnSuffix = next.turnId ? "" : " no_turn=1";
+      appendLog(config.paths.activityFile, `REPLY_PENDING thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}${noTurnSuffix}`);
     }
   }
   state.lastInjectAt = nowIso();
@@ -3120,7 +3174,7 @@ export async function relayRepliesOnce() {
     if (entry.sentAt || entry.status === "error") {
       continue;
     }
-    if (!looksLikeBotSender(entry) || shouldReplyToTeamBotSender(config, entry)) {
+    if (!looksLikeBotSender(entry) || entry.trustedTeamBotReply === true || shouldReplyToTeamBotSender(config, entry)) {
       continue;
     }
     entry.status = "ignored_bot";
