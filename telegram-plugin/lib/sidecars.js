@@ -201,7 +201,7 @@ export function ensureBackgroundSidecars(config) {
     config.paths.pollerStdoutFile,
     config.paths.pollerStderrFile,
     config,
-    { forceRestart: true }
+    { forceRestart: config.sidecarForceRestart }
   );
   const dispatcher = ensureSidecar(
     "dispatcher.js",
@@ -209,7 +209,7 @@ export function ensureBackgroundSidecars(config) {
     config.paths.dispatcherStdoutFile,
     config.paths.dispatcherStderrFile,
     config,
-    { forceRestart: true }
+    { forceRestart: config.sidecarForceRestart }
   );
   const responder = ensureSidecar(
     "responder.js",
@@ -217,7 +217,7 @@ export function ensureBackgroundSidecars(config) {
     config.paths.responderStdoutFile,
     config.paths.responderStderrFile,
     config,
-    { forceRestart: true }
+    { forceRestart: config.sidecarForceRestart }
   );
   const teamRelay = teamRelayConsumes(config)
     ? ensureSidecar(
@@ -226,7 +226,7 @@ export function ensureBackgroundSidecars(config) {
       config.paths.teamRelayStdoutFile,
       config.paths.teamRelayStderrFile,
       config,
-      { forceRestart: true }
+      { forceRestart: config.sidecarForceRestart }
     )
     : { started: false, pid: 0, reason: "disabled" };
 

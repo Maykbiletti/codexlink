@@ -2,6 +2,10 @@
 *.bak-*
 **/*.bak
 **/*.bak-*
+**/.otto-backups/
+**/.otto-backups/**
+telegram-plugin/.otto-backups/
+telegram-plugin/.otto-backups/**
 profiles/*.json
 !profiles/default.json
 .codex/

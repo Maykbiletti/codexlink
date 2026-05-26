@@ -94,6 +94,11 @@ export function loadConfig() {
     || env.BLUN_CODEX_OTHER_AGENTS
     || ""
   );
+  const trustedBotSenders = parseMentionNames(
+    env.BLUN_TELEGRAM_TRUSTED_BOT_SENDERS
+    || env.BLUN_TELEGRAM_TRUSTED_BOTS
+    || ""
+  );
   return {
     paths,
     agentName: env.BLUN_TELEGRAM_AGENT_NAME?.trim() || env.TELEGRAM_AGENT_NAME?.trim() || "default",
@@ -106,6 +111,7 @@ export function loadConfig() {
     allowedChatIds,
     mentionNames,
     otherAgentNames,
+    trustedBotSenders,
     codexBin: env.BLUN_TELEGRAM_CODEX_BIN?.trim() || "codex",
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
@@ -140,6 +146,7 @@ export function loadConfig() {
     privateDmGroupGuard: !/^(0|false|no|off)$/i.test(String(env.BLUN_TELEGRAM_PRIVATE_DM_GROUP_GUARD || "1")),
     privateReplyMode: env.BLUN_TELEGRAM_PRIVATE_REPLY_MODE?.trim().toLowerCase() || "auto",
     pluginMode: env.BLUN_TELEGRAM_PLUGIN_MODE?.trim() || "inherit",
+    sidecarForceRestart: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_SIDECAR_FORCE_RESTART || ""),
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",
     personality: env.BLUN_CODEX_PERSONALITY?.trim() || "",

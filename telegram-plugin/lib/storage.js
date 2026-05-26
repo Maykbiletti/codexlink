@@ -34,7 +34,7 @@ export function saveJson(path, value) {
   const base = basename(path);
   let lastError = null;
 
-  for (let attempt = 0; attempt < 6; attempt += 1) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
     const tempPath = join(dir, `.${base}.${process.pid}.${Date.now()}.${attempt}.tmp`);
     try {
       writeFileSync(tempPath, text, "utf8");
@@ -47,8 +47,22 @@ export function saveJson(path, value) {
       } catch {
         // Ignore cleanup failures for temp files.
       }
-      if (attempt < 5) {
-        sleepSync(25 * (attempt + 1));
+      if (attempt < 29) {
+        sleepSync(Math.min(1000, 35 * (attempt + 1)));
+      }
+    }
+  }
+
+  if (process.platform === "win32") {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        writeFileSync(path, text, "utf8");
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 9) {
+          sleepSync(Math.min(1000, 80 * (attempt + 1)));
+        }
       }
     }
   }

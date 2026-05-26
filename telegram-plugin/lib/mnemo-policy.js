@@ -68,6 +68,127 @@ async function callMnemoTool(config, name, args) {
   }
 }
 
+export async function logMnemoOutboundReceipt(config, outbound, contextEntry = null) {
+  if (!config?.mnemoSyncEnabled) {
+    return { ok: true, enabled: false, reason: "disabled" };
+  }
+
+  const chatId = String(outbound?.chatId || "").trim();
+  const messageId = String(outbound?.messageId || "").trim();
+  const text = String(outbound?.text || "").trim();
+  if (!chatId || !messageId || !text) {
+    return { ok: false, enabled: true, reason: "incomplete_outbound" };
+  }
+
+  const chatType = String(contextEntry?.chatType || "").trim().toLowerCase()
+    || (chatId.startsWith("-") ? "supergroup" : "private");
+  const channel = chatType === "private" ? "telegram-dm" : "telegram";
+  const project = inferProject(config, {
+    text,
+    groupTitle: contextEntry?.groupTitle || "",
+    conversationKey: contextEntry?.conversationKey || `${chatId}:${outbound.telegramThreadId || "root"}`
+  });
+  const refId = `${chatId}:${messageId}`;
+  const actor = String(config.agentName || config.displayName || "agent").trim() || "agent";
+  const threadId = String(contextEntry?.conversationKey || `${chatId}:${outbound.telegramThreadId || "root"}`).trim();
+  const meta = {
+    agent_name: config.agentName || "",
+    display_name: config.displayName || "",
+    chat_id: chatId,
+    message_id: messageId,
+    reply_to_message_id: outbound.replyToMessageId || "",
+    telegram_thread_id: outbound.telegramThreadId || "",
+    group_title: contextEntry?.groupTitle || "",
+    source: outbound.source || "manual",
+    source_turn_id: outbound.sourceTurnId || "",
+    sender_is_bot: true
+  };
+
+  const results = {};
+  try {
+    results.turn_finish = await callMnemoTool(config, "mem_runtime_turn_finish", {
+      runtime_name: "codexlink",
+      agent_name: config.agentName || "agent",
+      channel,
+      project,
+      board: project.includes("wizard2") ? "wizard2-bridge" : "",
+      thread_id: threadId,
+      session_key: threadId,
+      chat_id: chatId,
+      message_id: messageId,
+      message_ref: refId,
+      ref_kind: "telegram_message",
+      ref_id: refId,
+      source: "codexlink",
+      actor,
+      speaker: actor,
+      recipient: contextEntry?.user || "",
+      reply_to_message_id: outbound.replyToMessageId || "",
+      response: text,
+      content: text,
+      text,
+      promote_memory: true,
+      promote_transcript: true,
+      remember: true,
+      telegram: true,
+      meta
+    });
+    return {
+      ok: Boolean(results.turn_finish && results.turn_finish.ok),
+      enabled: true,
+      project,
+      ref_id: refId,
+      results
+    };
+  } catch (turnFinishError) {
+    const messageText = String(turnFinishError && turnFinishError.message || turnFinishError || "");
+    if (!/mem_runtime_turn_finish|unknown tool|not[_ -]?found|404/i.test(messageText)) {
+      throw turnFinishError;
+    }
+    results.turn_finish = { ok: false, fallback: true, error: messageText };
+  }
+
+  results.capture = await callMnemoTool(config, "mem_capture_ingest", {
+    source: "codexlink",
+    direction: "outbound",
+    event_kind: "telegram_message",
+    actor,
+    content: text,
+    text,
+    project,
+    ref_kind: "telegram_message",
+    ref_id: refId,
+    thread_id: threadId,
+    channel,
+    remember: true,
+    promote_memory: true,
+    meta
+  });
+
+  results.event_log = await callMnemoTool(config, "mem_event_log", {
+    source: "codexlink",
+    direction: "outbound",
+    actor,
+    channel,
+    event_kind: "telegram_message",
+    status: "sent",
+    content: text,
+    project,
+    ref_kind: "telegram_message",
+    ref_id: refId,
+    thread_id: threadId,
+    payload: {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_to_message_id: outbound.replyToMessageId || "",
+      source: outbound.source || "manual"
+    },
+    meta
+  });
+
+  return { ok: true, enabled: true, project, ref_id: refId, results };
+}
+
 function buildPolicyArgs(config, message, entry, project, extra = {}) {
   return {
     runtime_name: "codexlink",
@@ -97,6 +218,49 @@ function buildPolicyArgs(config, message, entry, project, extra = {}) {
       source: "codexlink-user-prompt-submit"
     },
     ...extra
+  };
+}
+
+function buildTurnBeginArgs(config, message, entry, project, threadId) {
+  const channel = message.chatType === "private" ? "telegram-dm" : "telegram";
+  const ref = `${message.chatId || ""}:${message.messageId || ""}`;
+  return {
+    runtime_name: "codexlink",
+    agent_name: config.agentName || "agent",
+    channel,
+    project,
+    board: entry.board || "",
+    thread_id: threadId || message.conversationKey || "default",
+    session_key: message.conversationKey || "",
+    chat_id: String(message.chatId || ""),
+    message_id: String(message.messageId || ""),
+    message_ref: ref,
+    ref_kind: "telegram_message",
+    ref_id: ref,
+    source: "codexlink",
+    direction: "inbound",
+    actor: message.user || "unknown",
+    user: message.user || "unknown",
+    user_id: String(message.userId || ""),
+    content: message.text || "",
+    text: message.text || "",
+    message: message.text || "",
+    recall_query: message.text || "",
+    recall_limit: 8,
+    brief_limit: 20,
+    board_limit: 12,
+    promote_memory: true,
+    promote_transcript: true,
+    remember: true,
+    telegram: true,
+    meta: {
+      group_title: message.groupTitle || "",
+      telegram_thread_id: message.telegramThreadId || "",
+      sender_is_bot: Boolean(message.senderIsBot),
+      relevance: message.relevance || "",
+      conversation_key: message.conversationKey || "",
+      source: "codexlink-user-prompt-submit"
+    }
   };
 }
 
@@ -246,6 +410,32 @@ async function runFullSync(config, message, entry, project) {
   return results;
 }
 
+function syncFromTurnBegin(result, project) {
+  const policy = result && result.policy_check || {};
+  const recallRows = result && result.recall && Array.isArray(result.recall.rows) ? result.recall.rows : [];
+  const fullSync = result && result.full_sync || {};
+  const blocked = result && (result.response_allowed === false || result.allowed === false || result.status === "block");
+  return {
+    enabled: true,
+    project,
+    turnResult: result,
+    initialCheck: policy,
+    finalCheck: policy,
+    auditId: result && result.audit_id || policy.audit_id || null,
+    status: result && result.status || policy.status || "ok",
+    warningToken: result && result.warning_token || policy.warning_token || null,
+    blocked,
+    fullSyncRan: Boolean(result && result.full_sync_ran),
+    briefCount: Number.isFinite(Number(fullSync.brief_pull_count)) ? Number(fullSync.brief_pull_count) : null,
+    boardSummary: fullSync.project_board_loaded ? "loaded" : "",
+    recallSummary: recallRows.length ? truncate(recallRows.slice(0, 5), 700) : "",
+    messageCaptured: Boolean(result && result.capture && result.capture.ok),
+    memoryChecked: Boolean(result && result.recall && result.recall.ok),
+    error: result && result.error || "",
+    promptBlock: result && result.context_block || ""
+  };
+}
+
 function buildContextBlock(sync) {
   if (!sync || !sync.enabled) return "";
   const lines = [
@@ -280,6 +470,38 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
     entry.lastMessageId = message.messageId || "";
   }
   const project = inferProject(config, message);
+  try {
+    const turnResult = await callMnemoTool(config, "mem_runtime_turn_begin", buildTurnBeginArgs(config, message, entry, project, threadId));
+    const stamp = nowIso();
+    if (turnResult && turnResult.capture && turnResult.capture.ok) {
+      entry.lastMessageCaptureAt = stamp;
+      entry.lastMemoryUpdateAt = stamp;
+      entry.lastChatSyncAt = stamp;
+    }
+    if (turnResult && turnResult.recall && turnResult.recall.ok) {
+      entry.lastRecallAt = stamp;
+    }
+    if (turnResult && turnResult.full_sync_ran) {
+      entry.lastBriefPullAt = stamp;
+      entry.lastProjectBoardAt = stamp;
+      entry.lastFullSyncAt = stamp;
+      entry.board = turnResult.board || entry.board || "wizard2-bridge";
+    }
+    if (Number.isFinite(Number(turnResult && turnResult.message_count_since_full_sync))) {
+      entry.messageCountSinceFullSync = Number(turnResult.message_count_since_full_sync);
+    }
+    state.conversations[key] = entry;
+    writeJson(config.paths.mnemoSyncStateFile, state);
+    const sync = syncFromTurnBegin(turnResult, project);
+    sync.promptBlock = sync.promptBlock || buildContextBlock(sync);
+    return sync;
+  } catch (turnBeginError) {
+    const messageText = String(turnBeginError && turnBeginError.message || turnBeginError || "");
+    if (!/mem_runtime_turn_begin|unknown tool|not[_ -]?found|404/i.test(messageText)) {
+      throw turnBeginError;
+    }
+  }
+
   let initialCheck = null;
   let finalCheck = null;
   let syncResults = null;
