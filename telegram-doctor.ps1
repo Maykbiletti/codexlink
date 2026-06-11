@@ -403,9 +403,27 @@ if (Test-AllowedChatIdsFormat -Value $activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
 }
 Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "warn" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No allowlist set. Telegram currently accepts any chat the bot can see." })
 
-Add-Check -List $checks -Name "app_server_ws" -Status $(if ($status.active_ws) { "ok" } else { "warn" }) -Detail $(if ($status.active_ws) { $status.active_ws } else { "No active websocket recorded." })
+$wsReachabilityKnown = $null -ne $status.active_ws_reachable
+$wsReachable = -not $wsReachabilityKnown -or [bool]$status.active_ws_reachable
+$wsStatus = if ($status.active_ws -and $wsReachable) { "ok" } else { "warn" }
+$wsDetail = if ($status.active_ws -and $wsReachable) {
+  [string]$status.active_ws
+} elseif ($status.active_ws) {
+  ([string]$status.active_ws) + " (not reachable)"
+} else {
+  "No active websocket recorded."
+}
+Add-Check -List $checks -Name "app_server_ws" -Status $wsStatus -Detail $wsDetail
 Add-Check -List $checks -Name "dispatch_mode" -Status $(if ($status.dispatch_mode -eq "deferred") { "ok" } else { "warn" }) -Detail ("mode=" + [string]$status.dispatch_mode + " cooldown_ms=" + [string]$status.idle_cooldown_ms + " pending_reply_timeout_ms=" + [string]$status.pending_reply_timeout_ms)
-Add-Check -List $checks -Name "bound_thread" -Status $(if ($status.active_thread_id) { "ok" } else { "warn" }) -Detail $(if ($status.active_thread_id) { $status.active_thread_id } else { "No active thread bound yet." })
+$threadStatus = if ($status.active_thread_id -and $wsReachable) { "ok" } else { "warn" }
+$threadDetail = if ($status.active_thread_id -and $wsReachable) {
+  [string]$status.active_thread_id
+} elseif ($status.active_thread_id) {
+  ([string]$status.active_thread_id) + " (websocket not reachable)"
+} else {
+  "No active thread bound yet."
+}
+Add-Check -List $checks -Name "bound_thread" -Status $threadStatus -Detail $threadDetail
 $loadedThreads = @($status.loaded_threads | Where-Object { $_ })
 $threadVisibilityStatus = "ok"
 $threadVisibilityDetail = "loaded=" + [string]$loadedThreads.Count

@@ -124,6 +124,7 @@ $currentRuntime = Try-ReadJson -Path (Join-Path $runtimeDir "current-remote-runt
 $state = Try-ReadJson -Path (Join-Path $stateDir "state.json")
 $envFile = Read-DotEnvFile -Path (Join-Path $stateDir ".env")
 $loadedThreads = @()
+$activeWsReachable = $false
 $ambientQueueTtlMs = if ($envFile["BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS"]) { [int]$envFile["BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS"] } else { 600000 }
 $queue = @($state.queue)
 $staleAmbientQueued = @($queue | Where-Object {
@@ -249,10 +250,18 @@ if ($currentRuntime) {
 if ($envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"] -and $telegramPluginRoot) {
   try {
     $bootstrapScript = Join-Path $telegramPluginRoot "app-server-cli.js"
-    $loaded = & node $bootstrapScript "list-loaded" "--ws-url" $envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"] | ConvertFrom-Json
-    $loadedThreads = @($loaded.data)
+    $loadedRaw = & node $bootstrapScript "list-loaded" "--ws-url" $envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"] 2>$null
+    if ($LASTEXITCODE -eq 0 -and $loadedRaw) {
+      $loaded = $loadedRaw | ConvertFrom-Json
+      $loadedThreads = @($loaded.data | Where-Object { $_ })
+      $activeWsReachable = $true
+    } else {
+      $loadedThreads = @()
+      $activeWsReachable = $false
+    }
   } catch {
     $loadedThreads = @()
+    $activeWsReachable = $false
   }
 }
 
@@ -261,6 +270,7 @@ $result = [ordered]@{
   state_dir = $stateDir
   plugin_root = $telegramPluginRoot
   active_ws = $envFile["BLUN_TELEGRAM_APP_SERVER_WS_URL"]
+  active_ws_reachable = $activeWsReachable
   dispatch_mode = $dispatchMode
   group_delivery = $groupDeliveryMode
   team_relay_mode = $teamRelayMode

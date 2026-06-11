@@ -83,6 +83,38 @@ for ($i = 0; $i -lt $parsedArgs.Count; $i++) {
       $skipTelegramSetup = $true
       continue
     }
+    "telegram-status" {
+      $commandArgs = @("-Profile", $profile)
+      if ($i -lt ($parsedArgs.Count - 1)) {
+        $commandArgs += @($parsedArgs[($i + 1)..($parsedArgs.Count - 1)])
+      }
+      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-status.ps1") @commandArgs
+      exit $LASTEXITCODE
+    }
+    "telegram-doctor" {
+      $commandArgs = @("-Profile", $profile)
+      if ($i -lt ($parsedArgs.Count - 1)) {
+        $commandArgs += @($parsedArgs[($i + 1)..($parsedArgs.Count - 1)])
+      }
+      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-doctor.ps1") @commandArgs
+      exit $LASTEXITCODE
+    }
+    "doctor" {
+      $commandArgs = @("-Profile", $profile)
+      if ($i -lt ($parsedArgs.Count - 1)) {
+        $commandArgs += @($parsedArgs[($i + 1)..($parsedArgs.Count - 1)])
+      }
+      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-doctor.ps1") @commandArgs
+      exit $LASTEXITCODE
+    }
+    "telegram-setup" {
+      $commandArgs = @("-Profile", $profile)
+      if ($i -lt ($parsedArgs.Count - 1)) {
+        $commandArgs += @($parsedArgs[($i + 1)..($parsedArgs.Count - 1)])
+      }
+      & powershell -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot "telegram-setup.ps1") @commandArgs
+      exit $LASTEXITCODE
+    }
     "telegram-plugin" {
       $telegramMode = "plugin"
       continue
