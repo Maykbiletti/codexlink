@@ -296,6 +296,129 @@ async function captureMessage(config, message, entry, project) {
   return result;
 }
 
+function telegramLiveCaptureEnabled(config) {
+  if (!config || !config.mnemoSyncEnabled || !config.mnemoHubUrl) {
+    return false;
+  }
+  return config.mnemoTelegramCaptureEnabled !== false;
+}
+
+function telegramThreadIdForCapture(message) {
+  const chatId = String(message?.chatId || "").trim();
+  const thread = String(message?.telegramThreadId || "").trim();
+  const key = String(message?.conversationKey || "").trim();
+  if (key) return key;
+  if (!chatId) return "telegram:unknown";
+  if (String(message?.chatType || "").toLowerCase() === "private") {
+    return `${chatId}:dm`;
+  }
+  return `${chatId}:${thread || "root"}`;
+}
+
+function telegramChannelForCapture(message) {
+  const chatId = String(message?.chatId || "").trim();
+  if (String(message?.chatType || "").toLowerCase() === "private") {
+    return `telegram-dm:${chatId || "unknown"}`;
+  }
+  return `telegram-chat:${chatId || "unknown"}`;
+}
+
+function telegramActorIdForCapture(message) {
+  return String(
+    message?.userId
+      || message?.user_id
+      || message?.fromUserId
+      || message?.sourceAgent
+      || message?.user
+      || "unknown"
+  ).trim();
+}
+
+function telegramContentForCapture(message) {
+  const text = String(message?.text || "").trim();
+  if (text) return text;
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  if (attachments.length > 0) {
+    const names = attachments
+      .map((attachment) => attachment?.originalName || attachment?.safeName || attachment?.kind || "attachment")
+      .filter(Boolean)
+      .slice(0, 3)
+      .join(", ");
+    return `Telegram attachment${names ? `: ${names}` : ""}`;
+  }
+  if (message?.attachment) {
+    return `Telegram attachment: ${message.attachment.originalName || message.attachment.safeName || message.attachment.kind || "attachment"}`;
+  }
+  return "Telegram message";
+}
+
+function telegramImportanceForCapture(message) {
+  const relevance = String(message?.relevance || "").toLowerCase();
+  if (relevance === "escalation") return 7;
+  if (relevance === "direct" || relevance === "lane") return 5;
+  if (String(message?.chatType || "").toLowerCase() === "private") return 4;
+  return 2;
+}
+
+export async function captureTelegramLive(config, message, options = {}) {
+  if (!telegramLiveCaptureEnabled(config)) {
+    return { ok: true, skipped: true, reason: "telegram_live_capture_disabled" };
+  }
+  if (!message) {
+    return { ok: false, error: "message required" };
+  }
+
+  const stamp = String(message.ts || message.occurredAt || nowIso()).trim();
+  const chatId = String(message.chatId || "").trim();
+  const messageId = String(message.messageId || message.message_id || "").trim();
+  const threadId = telegramThreadIdForCapture(message);
+  const actor = String(message.user || message.actor || message.sourceAgent || "unknown").trim() || "unknown";
+  const actorId = telegramActorIdForCapture(message);
+  const project = options.project || inferProject(config, message);
+  const refId = messageId ? `${chatId || "unknown"}:${messageId}` : `telegram:${threadId}:${stamp}`;
+  const content = telegramContentForCapture(message);
+
+  return await callMnemoTool(config, "mem_capture_ingest", {
+    source: "telegram",
+    channel: telegramChannelForCapture(message),
+    direction: "inbound",
+    event_kind: "telegram_message",
+    actor,
+    actor_id: actorId,
+    speaker: actor,
+    content,
+    text: content,
+    project,
+    ref_kind: "telegram_message",
+    ref_id: refId,
+    source_ref: `tg:${refId}`,
+    dedupe_key: `telegram:${refId}`,
+    thread_id: threadId,
+    session_id: threadId,
+    occurred_at: stamp,
+    promote_transcript: true,
+    promote_memory: false,
+    remember: false,
+    importance: telegramImportanceForCapture(message),
+    meta: {
+      agent_name: config.agentName || "agent",
+      capture_path: options.path || "codexlink-live",
+      chat_id: chatId,
+      chat_type: message.chatType || "",
+      message_id: messageId,
+      group_title: message.groupTitle || "",
+      telegram_thread_id: message.telegramThreadId || "",
+      conversation_key: message.conversationKey || threadId,
+      user_id: actorId,
+      sender_is_bot: Boolean(message.senderIsBot),
+      relevance: message.relevance || "",
+      intent: message.intent || "",
+      update_type: message.updateType || "",
+      attachment_count: Array.isArray(message.attachments) ? message.attachments.length : (message.attachment ? 1 : 0)
+    }
+  });
+}
+
 async function recallForMessage(config, message, entry) {
   const stamp = nowIso();
   const result = await callMnemoTool(config, "mem_recall", {

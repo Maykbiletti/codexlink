@@ -6,7 +6,7 @@ import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
 import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
-import { logMnemoOutboundReceipt } from "./mnemo-policy.js";
+import { captureTelegramLive, logMnemoOutboundReceipt } from "./mnemo-policy.js";
 
 function loadState(config) {
   const state = loadJson(config.paths.stateFile, defaultState());
@@ -66,6 +66,26 @@ function hasKnownInboundMessage(state, inbound) {
     ...(state.queue || []),
     ...(state.pendingReplies || [])
   ].some((entry) => queueKey(entry) === key);
+}
+
+async function captureInboundForMnemo(config, inbound, path) {
+  try {
+    const result = await captureTelegramLive(config, inbound, { path });
+    if (result && result.skipped) {
+      appendLog(config.paths.activityFile, `MNEMO_TELEGRAM_CAPTURE_SKIPPED path=${path} reason=${result.reason || "unknown"}`);
+    } else if (result && result.ok) {
+      appendLog(
+        config.paths.activityFile,
+        `MNEMO_TELEGRAM_CAPTURE_OK path=${path} status=${result.status || "ok"} chat=${inbound.chatId} message=${inbound.messageId} thread=${inbound.conversationKey || "-"}`
+      );
+    } else {
+      appendLog(config.paths.activityFile, `MNEMO_TELEGRAM_CAPTURE_FAIL path=${path} error=${String(result && result.error || "unknown").slice(0, 220)}`);
+    }
+    return result;
+  } catch (error) {
+    appendLog(config.paths.activityFile, `MNEMO_TELEGRAM_CAPTURE_ERROR path=${path} error=${String(error?.message || error).slice(0, 220)}`);
+    return { ok: false, error: String(error?.message || error) };
+  }
 }
 
 function pendingReplyKey(entry) {
@@ -2710,6 +2730,7 @@ export async function pollOnce() {
       appendLog(config.paths.activityFile, `IGNORED_DUPLICATE chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    await captureInboundForMnemo(config, inbound, "poller");
     await publishTeamRelayEvent(config, buildInboundRelayEvent(config, inbound, "accepted"));
     if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient" && !shouldSubmitEveryAllowedMessage(config)) {
       ignored += 1;
@@ -2790,6 +2811,7 @@ export async function consumeTeamRelayOnce() {
       appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_DUPLICATE id=${eventId} chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
+    await captureInboundForMnemo(config, inbound, "team-relay");
     if (String(inbound.chatType || "") !== "private" && String(inbound.relevance || "") === "ambient" && !shouldSubmitEveryAllowedMessage(config)) {
       ignored += 1;
       appendJsonl(config.paths.inboxFile, { ...inbound, status: "ignored_ambient_relay" });

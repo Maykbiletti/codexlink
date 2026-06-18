@@ -153,6 +153,7 @@ export function loadConfig() {
     mnemoSyncEnabled: env.BLUN_MNEMO_SYNC_ENABLED !== "0",
     mnemoHubUrl: env.BLUN_MNEMO_HUB_URL?.trim() || env.MNEMO_HUB_URL?.trim() || "https://listing.blun.ai/mnemo",
     mnemoProject: env.BLUN_MNEMO_PROJECT?.trim() || env.BLUN_PROJECT?.trim() || "",
-    mnemoSyncTimeoutMs: Number.parseInt(env.BLUN_MNEMO_SYNC_TIMEOUT_MS || "2500", 10) || 2500
+    mnemoSyncTimeoutMs: Number.parseInt(env.BLUN_MNEMO_SYNC_TIMEOUT_MS || "2500", 10) || 2500,
+    mnemoTelegramCaptureEnabled: !/^(0|false|no|off)$/i.test(env.BLUN_MNEMO_TELEGRAM_CAPTURE_ENABLED || "1")
   };
 }
