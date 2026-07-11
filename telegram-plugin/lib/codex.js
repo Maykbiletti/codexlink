@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startOrSteerTextTurnOverWs } from "./app-server-client.js";
+import { startQueuedTextTurnOverWs } from "./app-server-client.js";
 import { runMnemoRuntimeSync } from "./mnemo-policy.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -199,17 +199,18 @@ function buildPrompt(config, message) {
   const compactText = compactInboundText(message);
   const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
   const label = isBriefSummary ? "" : compactInboundLabel(message);
-  const header = [buildAgentRuntimeContext(config), ""];
-
-  if (message.mnemoContextBlock) {
-    header.push(message.mnemoContextBlock.trim(), "");
-  }
+  const header = [];
 
   if (label) {
     header.push(label);
   }
   header.push(compactText);
+  const agentGroupContextBlock = String(message.agentGroupContextBlock || "").trim();
+  if (agentGroupContextBlock) {
+    header.push("", agentGroupContextBlock);
+  }
   header.push(...formatAttachmentInstructions(message));
+  return header.join("\n");
 
   if (message.intent === "continue_nudge") {
     header.push(
@@ -245,6 +246,9 @@ function buildVisibleConsoleText(config, message) {
   parts.push(compactText);
   if (message.mnemoContextBlock) {
     parts.push(message.mnemoContextBlock.trim());
+  }
+  if (message.agentGroupContextBlock) {
+    parts.push(String(message.agentGroupContextBlock).trim());
   }
   parts.push(...formatAttachmentInstructions(message));
   if (message.intent === "continue_nudge") {
@@ -317,7 +321,7 @@ function visibleConsoleSubmitDelayMs(config, visibleText) {
   return Math.min(safeMax, Math.max(configuredMin, 700, lengthDelay + lineDelay));
 }
 
-function injectVisibleConsole(config, message) {
+function injectVisibleConsole(config, message, options = {}) {
   const skipReason = getVisibleConsoleSkipReason(config, message);
   if (skipReason) {
     return { ok: false, skipped: true, reason: skipReason };
@@ -338,9 +342,10 @@ function injectVisibleConsole(config, message) {
   if (!visibleText) {
     return { ok: false, skipped: true, reason: "empty" };
   }
+  const submit = options.submit !== false;
   const submitDelayMs = visibleConsoleSubmitDelayMs(config, visibleText);
 
-  const result = spawnSync("powershell.exe", [
+  const args = [
     "-NoProfile",
     "-ExecutionPolicy",
     "Bypass",
@@ -350,11 +355,17 @@ function injectVisibleConsole(config, message) {
     String(frontendPid),
     "-Text",
     visibleText,
-    "-ClearBefore",
-    "-Submit",
-    "-SubmitDelayMs",
-    String(submitDelayMs)
-  ], {
+    "-ClearBefore"
+  ];
+  if (submit) {
+    args.push(
+      "-Submit",
+      "-SubmitDelayMs",
+      String(submitDelayMs)
+    );
+  }
+
+  const result = spawnSync("powershell.exe", args, {
     cwd: runtimeRoot,
     encoding: "utf8",
     windowsHide: true,
@@ -366,7 +377,8 @@ function injectVisibleConsole(config, message) {
       ok: true,
       frontendPid,
       visibleText,
-      submitDelayMs
+      submitDelayMs,
+      submit
     };
   }
 
@@ -406,44 +418,92 @@ function buildTurnInput(config, message) {
   };
 }
 
-export async function injectIntoThread(config, message, threadId) {
-  let mnemoSync = { promptBlock: "" };
+function isEnabledValue(value) {
+  return value === true || /^(1|true|yes|on)$/i.test(String(value || ""));
+}
+
+function shouldHardBlockMnemoInject(config) {
+  return isEnabledValue(config?.mnemoHardBlockInject)
+    || isEnabledValue(config?.mnemoRuntimeEnforcement)
+    || isEnabledValue(process.env.BLUN_MNEMO_HARD_BLOCK_INJECT)
+    || isEnabledValue(process.env.BLUN_MNEMO_RUNTIME_ENFORCEMENT);
+}
+
+function shouldHardBlockMnemoSyncFailure(config) {
+  return isEnabledValue(config?.mnemoHardBlockSyncFailure)
+    || isEnabledValue(config?.mnemoRuntimeEnforcement)
+    || isEnabledValue(process.env.BLUN_MNEMO_HARD_BLOCK_SYNC_FAILURE)
+    || isEnabledValue(process.env.BLUN_MNEMO_RUNTIME_ENFORCEMENT);
+}
+
+function isMnemoSyncFailure(sync) {
+  const status = String(sync?.status || "").trim().toLowerCase();
+  return status === "timeout"
+    || status === "error"
+    || Boolean(sync?.error)
+    || /Policy status:\s*(timeout|error)/i.test(String(sync?.promptBlock || ""));
+}
+
+function buildMnemoHardBlockInjectResult(sync, reason) {
+  const status = sync?.status || (sync?.blocked ? "block" : "unknown");
+  const auditId = sync?.auditId || "-";
+  const detail = String(sync?.error || "").replace(/\s+/g, " ").slice(0, 300);
+  return {
+    ok: false,
+    busy: false,
+    code: null,
+    signal: null,
+    responseText: "",
+    stdout: "",
+    stderr: [
+      "mnemo_runtime_hard_block",
+      `reason=${reason || "policy"}`,
+      `audit_id=${auditId}`,
+      `status=${status}`,
+      detail ? `detail=${detail}` : ""
+    ].filter(Boolean).join(" ")
+  };
+}
+
+function resolveMnemoPromptTimeoutMs(config) {
+  const configured = Number.parseInt(String(config?.mnemoPromptTimeoutMs || process.env.BLUN_MNEMO_PROMPT_TIMEOUT_MS || "0"), 10);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+  return 12000;
+}
+
+function buildMnemoPromptTimeoutResult(timeoutMs) {
+  return {
+    promptBlock: `\n[Mnemo Runtime Sync]\nPolicy status: timeout\nSync error: mnemo_sync_timeout_after_${timeoutMs}ms\n[/Mnemo Runtime Sync]`,
+    status: "timeout",
+    blocked: false
+  };
+}
+
+async function runMnemoRuntimeSyncForPrompt(config, message, threadId) {
+  const timeoutMs = resolveMnemoPromptTimeoutMs(config);
+  let timer = null;
   try {
-    mnemoSync = await runMnemoRuntimeSync(config, message, threadId);
-  } catch (error) {
-    mnemoSync = {
-      promptBlock: `\n[Mnemo Runtime Sync]\nPolicy status: error\nSync error: ${String(error.message || error).slice(0, 500)}\n[/Mnemo Runtime Sync]`
-    };
+    return await Promise.race([
+      runMnemoRuntimeSync(config, message, threadId),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(buildMnemoPromptTimeoutResult(timeoutMs)), timeoutMs);
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
-  if (mnemoSync.blocked) {
-    return {
-      ok: false,
-      busy: false,
-      code: null,
-      signal: null,
-      responseText: "",
-      stdout: "",
-      stderr: `mnemo_runtime_policy_blocked audit_id=${mnemoSync.auditId || "-"} status=${mnemoSync.status || "block"}`
-    };
-  }
-  const promptMessage = Object.assign({}, message, { mnemoContextBlock: mnemoSync.promptBlock || "" });
+}
+
+export async function injectIntoThread(config, message, threadId) {
+  const promptMessage = Object.assign({}, message, { mnemoContextBlock: "" });
   const turnInput = buildTurnInput(config, promptMessage);
   if (config.appServerWsUrl) {
-    const consoleResult = injectVisibleConsole(config, promptMessage);
-    if (consoleResult.ok) {
-      return {
-        ok: true,
-        busy: false,
-        turnId: "",
-        code: 0,
-        signal: null,
-        responseText: `console_injected thread=${threadId} frontend_pid=${consoleResult.frontendPid}`,
-        stdout: "",
-        stderr: ""
-      };
-    }
-
-    const result = await startOrSteerTextTurnOverWs({
+    const result = await startQueuedTextTurnOverWs({
       wsUrl: config.appServerWsUrl,
       threadId,
       text: turnInput.prompt,
@@ -454,15 +514,29 @@ export async function injectIntoThread(config, message, threadId) {
       timeoutMs: config.resumeTimeoutMs
     });
 
+    if (result.ok) {
+      const action = result.steered ? "turn_steered" : "turn_queued";
+      return {
+        ok: true,
+        busy: result.busy,
+        turnId: result.turnId || "",
+        code: 0,
+        signal: null,
+        responseText: `${action} thread=${threadId} console_skip=ws_only${result.queuedBehindActiveTurn ? " behind_active_turn=1" : ""}`,
+        stdout: "",
+        stderr: "",
+        queuedBehindActiveTurn: Boolean(result.queuedBehindActiveTurn),
+        activeTurnId: result.activeTurnId || ""
+      };
+    }
+
     return {
-      ok: result.ok,
+      ok: false,
       busy: result.busy,
       turnId: result.turnId || "",
-      code: result.ok ? 0 : null,
+      code: null,
       signal: null,
-      responseText: result.ok
-        ? `${result.steered ? "turn_steered" : "turn_started"} thread=${threadId} console_${consoleResult.skipped ? "skip" : "fail"}=${consoleResult.reason || "unknown"}`
-        : "",
+      responseText: "",
       stdout: "",
       stderr: result.error ? String(result.error.message || result.error) : ""
     };

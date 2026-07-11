@@ -877,6 +877,19 @@ if ($useRemoteAppServer) {
               }
               $threadScore = $threadCreatedAtMs
             }
+            $threadIsSubAgent = $false
+            if ($null -ne $thread) {
+              if ($thread.parentThreadId -or $thread.forkedFromId) {
+                $threadIsSubAgent = $true
+              } elseif ($thread.source -and $thread.source -isnot [string] -and $thread.source.PSObject.Properties.Name -contains "subAgent") {
+                $threadIsSubAgent = $true
+              }
+            }
+            if ($threadIsSubAgent) {
+              $threadScore -= 5000000000000000
+            } else {
+              $threadScore += 5000000000000000
+            }
             $threadSource = ""
             $threadStatusType = ""
             if ($null -ne $thread -and $null -ne $thread.source) {

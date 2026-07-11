@@ -286,6 +286,88 @@ export async function startTextTurnOverWs(options) {
   }
 }
 
+export async function getActiveTurnIdOverWs(options) {
+  const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 10000 });
+  try {
+    const response = await client.request("thread/turns/list", {
+      threadId: options.threadId,
+      limit: options.limit || 8,
+      itemsView: "notLoaded"
+    }, { timeoutMs: Math.min(options.timeoutMs || 10000, 5000) });
+    return {
+      ok: true,
+      activeTurnId: extractActiveTurnId(response),
+      response
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      activeTurnId: "",
+      error
+    };
+  } finally {
+    await client.close();
+  }
+}
+
+export async function startQueuedTextTurnOverWs(options) {
+  const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
+  try {
+    const input = Array.isArray(options.input) && options.input.length > 0
+      ? normalizeUserInput(options.input)
+      : buildTextInput(options.text);
+
+    let activeTurnId = "";
+    try {
+      const turnsResponse = await client.request("thread/turns/list", {
+        threadId: options.threadId,
+        limit: 8,
+        itemsView: "notLoaded"
+      }, { timeoutMs: Math.min(options.timeoutMs || 20000, 5000) });
+      activeTurnId = extractActiveTurnId(turnsResponse);
+    } catch {
+      activeTurnId = "";
+    }
+
+    const response = await client.request("turn/start", {
+      threadId: options.threadId,
+      input,
+      model: options.model || null,
+      effort: options.effort || null,
+      personality: options.personality || null,
+      responsesapiClientMetadata: {
+        source: "telegram",
+        delivery: "runtime_turn_queue"
+      }
+    }, { timeoutMs: options.timeoutMs || 20000 });
+
+    return {
+      ok: true,
+      busy: false,
+      queuedBehindActiveTurn: Boolean(activeTurnId),
+      steered: false,
+      turnId: extractTurnId(response),
+      activeTurnId,
+      response
+    };
+  } catch (error) {
+    const details = `${error?.message || error}`.toLowerCase();
+    const busy = details.includes("active turn")
+      || details.includes("cannot accept")
+      || details.includes("already running")
+      || details.includes("busy");
+
+    return {
+      ok: false,
+      busy,
+      steered: false,
+      error
+    };
+  } finally {
+    await client.close();
+  }
+}
+
 export async function startOrSteerTextTurnOverWs(options) {
   const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
   try {
@@ -303,6 +385,16 @@ export async function startOrSteerTextTurnOverWs(options) {
       activeTurnId = extractActiveTurnId(turnsResponse);
     } catch {
       activeTurnId = "";
+    }
+
+    if (activeTurnId && options.steerActiveTurn === false) {
+      return {
+        ok: false,
+        busy: true,
+        steered: false,
+        turnId: activeTurnId,
+        error: makeError("Active turn is still running; wait for an idle turn/start.")
+      };
     }
 
     if (activeTurnId) {

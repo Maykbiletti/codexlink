@@ -427,12 +427,9 @@ Add-Check -List $checks -Name "bound_thread" -Status $threadStatus -Detail $thre
 $loadedThreads = @($status.loaded_threads | Where-Object { $_ })
 $threadVisibilityStatus = "ok"
 $threadVisibilityDetail = "loaded=" + [string]$loadedThreads.Count
-if ($loadedThreads.Count -gt 1) {
+if ($status.active_thread_id -and $loadedThreads.Count -gt 0 -and -not ($loadedThreads -contains ([string]$status.active_thread_id))) {
   $threadVisibilityStatus = "warn"
-  $threadVisibilityDetail = "multiple loaded threads: " + (($loadedThreads | ForEach-Object { [string]$_ }) -join ",") + ". Run telegram-doctor --fix, then restart telegram-plugin."
-} elseif ($status.active_thread_id -and $loadedThreads.Count -eq 1 -and ([string]$loadedThreads[0]) -ne ([string]$status.active_thread_id)) {
-  $threadVisibilityStatus = "warn"
-  $threadVisibilityDetail = "bound thread differs from loaded visible thread. Run telegram-doctor --fix, then restart telegram-plugin."
+  $threadVisibilityDetail = "bound thread is not loaded. Run telegram-doctor --fix, then restart telegram-plugin."
 }
 Add-Check -List $checks -Name "thread_visibility" -Status $threadVisibilityStatus -Detail $threadVisibilityDetail
 Add-Check -List $checks -Name "frontend_owner" -Status $(if ($status.frontend_owner_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.frontend_owner_pid + " alive=" + [string]$status.frontend_owner_alive)
@@ -493,7 +490,7 @@ if ($status.last_outbound) {
   Add-Check -List $checks -Name "last_outbound" -Status "warn" -Detail "No outbound Telegram message recorded yet."
 }
 
-Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " observe=" + $status.observe_queue_depth + " ambient=" + $status.ambient_queue_depth + " parked=" + $status.parked_queue_depth + " submitted=" + $status.submitted_depth + " pending_replies=" + $status.pending_reply_depth + " expired_pending_replies=" + $status.expired_pending_reply_depth)
+Add-Check -List $checks -Name "queue" -Status $(if (([int]$status.queue_depth -eq 0) -and ([int]$status.injecting_depth -eq 0) -and ([int]$status.pending_reply_depth -eq 0)) { "ok" } else { "warn" }) -Detail ("queued=" + $status.queue_depth + " observe=" + $status.observe_queue_depth + " ambient=" + $status.ambient_queue_depth + " parked=" + $status.parked_queue_depth + " submitted=" + $status.submitted_depth + " injecting=" + $status.injecting_depth + " oldest_injecting_ms=" + $status.oldest_injecting_age_ms + " pending_replies=" + $status.pending_reply_depth + " expired_pending_replies=" + $status.expired_pending_reply_depth)
 
 $result = [ordered]@{
   profile = $status.profile

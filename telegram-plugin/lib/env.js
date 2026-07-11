@@ -35,6 +35,20 @@ function parseMentionNames(rawValue) {
   ));
 }
 
+const defaultOtherAgentNames = [
+  "angel",
+  "angeliathebot",
+  "angelia",
+  "otto",
+  "ottomayksbot",
+  "dieter",
+  "dieterthe_bot",
+  "fredrik",
+  "fredrikblunbot",
+  "kimi",
+  "gemma"
+];
+
 function parseGroupDeliveryMode(rawValue) {
   const value = String(rawValue || "").trim().toLowerCase();
   if (["mention", "mentions", "addressed", "strict"].includes(value)) {
@@ -89,11 +103,14 @@ export function loadConfig() {
     || env.BLUN_TELEGRAM_AGENT_NAME
     || ""
   );
-  const otherAgentNames = parseMentionNames(
+  const configuredOtherAgentNames = parseMentionNames(
     env.BLUN_TELEGRAM_OTHER_AGENT_NAMES
     || env.BLUN_CODEX_OTHER_AGENTS
     || ""
   );
+  const otherAgentNames = configuredOtherAgentNames.length
+    ? configuredOtherAgentNames
+    : defaultOtherAgentNames;
   const trustedBotSenders = parseMentionNames(
     env.BLUN_TELEGRAM_TRUSTED_BOT_SENDERS
     || env.BLUN_TELEGRAM_TRUSTED_BOTS
@@ -116,6 +133,10 @@ export function loadConfig() {
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
     resumeTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_RESUME_TIMEOUT_MS || "15000", 10) || 15000,
+    pollIntervalMs: Number.parseInt(env.BLUN_TELEGRAM_POLL_INTERVAL_MS || "700", 10) || 700,
+    injectIntervalMs: Number.parseInt(env.BLUN_TELEGRAM_INJECT_INTERVAL_MS || "700", 10) || 700,
+    getUpdatesTimeout: Number.parseInt(env.BLUN_TELEGRAM_GETUPDATES_TIMEOUT || "0", 10) || 0,
+    activeTurnRetryMs: Number.parseInt(env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "750", 10) || 750,
     idleCooldownMs: Number.parseInt(env.BLUN_TELEGRAM_IDLE_COOLDOWN_MS || "3000", 10) || 3000,
     ambientQueueTtlMs: Number.parseInt(env.BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS || "600000", 10) || 600000,
     pendingReplyTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS || "1800000", 10) || 1800000,
@@ -153,7 +174,12 @@ export function loadConfig() {
     mnemoSyncEnabled: env.BLUN_MNEMO_SYNC_ENABLED !== "0",
     mnemoHubUrl: env.BLUN_MNEMO_HUB_URL?.trim() || env.MNEMO_HUB_URL?.trim() || "https://listing.blun.ai/mnemo",
     mnemoProject: env.BLUN_MNEMO_PROJECT?.trim() || env.BLUN_PROJECT?.trim() || "",
-    mnemoSyncTimeoutMs: Number.parseInt(env.BLUN_MNEMO_SYNC_TIMEOUT_MS || "2500", 10) || 2500,
+    mnemoHardBlockInject: /^(1|true|yes|on)$/i.test(env.BLUN_MNEMO_HARD_BLOCK_INJECT || ""),
+    mnemoHardBlockSyncFailure: /^(1|true|yes|on)$/i.test(env.BLUN_MNEMO_HARD_BLOCK_SYNC_FAILURE || ""),
+    mnemoRuntimeEnforcement: /^(1|true|yes|on)$/i.test(env.BLUN_MNEMO_RUNTIME_ENFORCEMENT || ""),
+    mnemoPromptTimeoutMs: Number.parseInt(env.BLUN_MNEMO_PROMPT_TIMEOUT_MS || "0", 10) || 0,
+    mnemoSyncTimeoutMs: Number.parseInt(env.BLUN_MNEMO_SYNC_TIMEOUT_MS || "15000", 10) || 15000,
+    mnemoSyncRetryAttempts: Number.parseInt(env.BLUN_MNEMO_SYNC_RETRY_ATTEMPTS || "3", 10) || 3,
     mnemoTelegramCaptureEnabled: !/^(0|false|no|off)$/i.test(env.BLUN_MNEMO_TELEGRAM_CAPTURE_ENABLED || "1")
   };
 }

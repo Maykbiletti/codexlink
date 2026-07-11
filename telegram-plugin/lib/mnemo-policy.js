@@ -1,4 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join, resolve } from "node:path";
 
 function nowIso() {
   return new Date().toISOString();
@@ -29,6 +31,242 @@ function truncate(value, max = 1200) {
   return raw.length > max ? `${raw.slice(0, max)}...[truncated]` : raw;
 }
 
+function compactText(value, max = 120) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+const DEFAULT_CONTEXT_RECALL_LIMIT = 30;
+const DEFAULT_CONTEXT_RECALL_ROW_CHARS = 420;
+const FAST_RECALL_STOPWORDS = new Set([
+  "der", "die", "das", "den", "dem", "und", "oder", "aber", "mit", "fuer", "von", "vom", "zur", "zum", "ist", "sind", "war", "was", "wie", "ich", "du", "wir", "ihr", "sie", "ein", "eine", "einer", "einen", "nicht", "noch", "auch", "auf", "aus", "bei", "nach", "dass",
+  "the", "and", "or", "for", "with", "from", "that", "this", "what", "when", "where", "why", "how"
+]);
+let fastRecallDbModule = null;
+
+function contextRecallLimit(config) {
+  const configured = Number(
+    config?.mnemoRecallLimit ||
+    process.env.BLUN_MNEMO_RECALL_LIMIT ||
+    process.env.MNEMO_RUNTIME_TURN_RECALL_LIMIT ||
+    0
+  );
+  return Math.min(50, Math.max(1, Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_CONTEXT_RECALL_LIMIT));
+}
+
+function fastRecallEnabled(config) {
+  const raw = process.env.BLUN_MNEMO_FAST_RECALL ?? process.env.MNEMO_FAST_RECALL ?? "";
+  if (/^(0|false|no|off)$/i.test(String(raw).trim())) return false;
+  return Boolean(config?.mnemoSyncEnabled !== false);
+}
+
+function mnemoCoreDir() {
+  const explicit = process.env.BLUN_MNEMO_CORE_DIR || process.env.MNEMO_CORE_DIR || "";
+  if (explicit && existsSync(explicit)) return explicit;
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  return home ? join(home, "mnemo", "packages", "core") : "";
+}
+
+function fastRecallDbPath() {
+  const explicit = process.env.BLUN_MNEMO_DB || process.env.MNEMO_DB || "";
+  if (explicit) return explicit;
+  const core = mnemoCoreDir();
+  return core ? join(core, "mnemo.db") : "";
+}
+
+function loadFastRecallDbModule() {
+  if (fastRecallDbModule) return fastRecallDbModule;
+  const core = mnemoCoreDir();
+  const requireFromCore = createRequire(core ? resolve(core, "daemon.js") : import.meta.url);
+  fastRecallDbModule = requireFromCore("better-sqlite3");
+  return fastRecallDbModule;
+}
+
+function fastRecallTokens(query) {
+  const original = String(query || "");
+  const raw = original.toLowerCase();
+  const folded = raw.normalize ? raw.normalize("NFKD").replace(/[\u0300-\u036f]/g, "") : raw;
+  const tokens = [];
+  const seen = new Set();
+  const priority = new Set(["fredrik", "moller", "moeller", "mokker", "marketing", "head", "investor", "pitch", "scania", "elevenlabs", "telegram", "userid", "user", "api", "blun"]);
+  for (const text of [raw, folded]) {
+    for (const match of text.match(/[\p{L}\p{N}_]{3,}/gu) || []) {
+      const token = match.toLowerCase();
+      if (FAST_RECALL_STOPWORDS.has(token) || seen.has(token)) continue;
+      seen.add(token);
+      let score = 0;
+      if (priority.has(token)) score += 20;
+      if (/\d/.test(token)) score += 8;
+      if (token.length >= 8) score += 3;
+      if (token.length >= 12) score += 2;
+      tokens.push({ token: token.slice(0, 48), score, index: tokens.length });
+    }
+  }
+  return tokens
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index))
+    .slice(0, 12)
+    .map((item) => item.token);
+}
+
+function fastRecallFtsQuery(query) {
+  const tokens = fastRecallTokens(query);
+  return tokens.length ? tokens.map((token) => `${token}*`).join(" OR ") : "";
+}
+
+function fastRecallNoise(row) {
+  const actor = typeof row === "object" && row ? String(row.actor || "").toLowerCase() : "";
+  const topic = typeof row === "object" && row ? String(row.topic || "").toLowerCase() : "";
+  const kind = typeof row === "object" && row ? String(row.kind || row.surface || "").toLowerCase() : "";
+  const preview = (typeof row === "string" ? row : String(row?.preview || row?.content || row?.text || JSON.stringify(row || ""))).toLowerCase();
+  const transportSmoke = preview.includes("[botdoctor smoke]")
+    || preview.includes("botdoctor smoke")
+    || preview.includes("nur stiller transporttest")
+    || preview.includes("transport-smoke: nur stiller inject-test")
+    || (preview.includes("transport-smoke") && preview.includes("keine antwort"))
+    || (preview.includes("keine antwort noetig") && preview.includes("transport"))
+    || (preview.includes("keine antwort nötig") && preview.includes("transport"));
+  if (transportSmoke) {
+    return true;
+  }
+  if (actor === "mcp-tool" || actor === "http-tool") return true;
+  if (topic === "tool_call" || topic === "tool_result" || topic.includes("tool_call") || topic.includes("tool_result")) return true;
+  if (topic.includes("capture_validation_failed") || topic.includes("memory_insert") || topic.includes("transcript_insert") || topic.includes("runtime_message")) return true;
+  if (kind === "tool_call" || kind === "tool_result") return true;
+  if (preview.includes('"query"') && preview.includes("mem_recall")) return true;
+  if (preview.includes('"runtime_turn_key"') || preview.includes('"validation_errors"')) return true;
+  if (preview.includes('"source":"diagnostic:auto-recall"')) return true;
+  if (preview.includes("finding291-smoke-debug")) return true;
+  if (preview.includes("smoke-fast-")) return true;
+  return false;
+}
+
+function dedupeRecallRows(rows, limit) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rows || []) {
+    if (!row || fastRecallNoise(row)) continue;
+    const key = `${row.surface || row.kind || "memory"}:${row.ref_id || row.id || row.preview}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function fastLocalRecall(config, message, limit = DEFAULT_CONTEXT_RECALL_LIMIT) {
+  if (!fastRecallEnabled(config)) return null;
+  const dbPath = fastRecallDbPath();
+  const ftsQuery = fastRecallFtsQuery(message?.text || "");
+  if (!dbPath || !existsSync(dbPath) || !ftsQuery) return null;
+  const maxRows = Math.max(1, Math.min(Number(limit) || DEFAULT_CONTEXT_RECALL_LIMIT, 50));
+  let db = null;
+  try {
+    const Database = loadFastRecallDbModule();
+    db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 800 });
+    db.pragma("query_only = ON");
+    db.pragma("busy_timeout = 800");
+    const memoryRows = db.prepare(`
+      SELECT 'memory' AS surface, CAST(m.id AS TEXT) AS ref_id,
+             m.kind, m.actor, m.occurred_at, m.topic, m.importance,
+             substr(m.text, 1, 400) AS preview,
+             bm25(memory_fts) AS bm25,
+             'local_memory_fts' AS match_mode
+      FROM memory_fts
+      JOIN memory m ON m.id = memory_fts.rowid
+      WHERE memory_fts MATCH ?
+      ORDER BY bm25 ASC, m.occurred_at DESC
+      LIMIT ?
+    `).all(ftsQuery, maxRows * 2);
+    const journalRows = db.prepare(`
+      SELECT scope AS surface, scope AS kind, ref_id,
+             agent_name AS actor, '' AS occurred_at,
+             COALESCE(summary, '') AS topic,
+             substr(COALESCE(content, summary, ''), 1, 400) AS preview,
+             bm25(mnemo_search_fts) AS bm25,
+             'local_journal_fts' AS match_mode
+      FROM mnemo_search_fts
+      WHERE mnemo_search_fts MATCH ?
+      ORDER BY bm25 ASC
+      LIMIT ?
+    `).all(ftsQuery, maxRows * 2);
+    const rows = dedupeRecallRows([...memoryRows, ...journalRows]
+      .sort((a, b) => (Number(a.bm25 ?? 999) - Number(b.bm25 ?? 999))), maxRows);
+    return { ok: true, local: true, query: ftsQuery, count: rows.length, rows };
+  } catch (error) {
+    return { ok: false, local: true, error: String(error.message || error), count: 0, rows: [] };
+  } finally {
+    try { if (db) db.close(); } catch {}
+  }
+}
+
+function recallRowsFrom(source) {
+  if (!source) return [];
+  if (Array.isArray(source)) return source;
+  if (Array.isArray(source.rows)) return source.rows;
+  if (Array.isArray(source.results)) return source.results;
+  if (Array.isArray(source.memories)) return source.memories;
+  if (Array.isArray(source.items)) return source.items;
+  if (source.recall && Array.isArray(source.recall.rows)) return source.recall.rows;
+  if (source.result) return recallRowsFrom(source.result);
+  return [];
+}
+
+function recallRowText(row, index) {
+  const ref = row?.ref_id || row?.id || row?.memory_id || row?.event_id || "";
+  const head = [
+    ref ? `#${ref}` : `#${index + 1}`,
+    row?.surface || row?.kind || row?.topic || "",
+    row?.actor || row?.speaker || "",
+    row?.occurred_at || row?.created_at || row?.ts || "",
+  ].filter(Boolean).join(" ");
+  const body = row?.preview || row?.snippet || row?.text || row?.content || row?.summary || "";
+  return `- ${head}: ${compactText(body, DEFAULT_CONTEXT_RECALL_ROW_CHARS)}`.trim();
+}
+
+function formatRecallSummary(source, limit = DEFAULT_CONTEXT_RECALL_LIMIT) {
+  const rows = recallRowsFrom(source).filter((row) => row && !fastRecallNoise(row));
+  if (!rows.length) return "";
+  const capped = rows.slice(0, limit);
+  return [
+    `Recall hits injected: ${capped.length}${rows.length > capped.length ? `/${rows.length}` : ""}`,
+    "Relevant memories:",
+    ...capped.map((row, index) => recallRowText(row, index)),
+  ].join("\n");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(attempt) {
+  const base = Math.min(5000, 350 * Math.pow(2, Math.max(0, attempt - 1)));
+  return Math.floor(base + Math.random() * Math.min(250, base));
+}
+
+function retryableStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function retryableFetchError(error) {
+  const name = String(error && error.name || "");
+  const msg = String(error && error.message || "");
+  return name === "AbortError"
+    || /operation was aborted|timeout|timed out|fetch failed|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT|socket hang up/i.test(msg);
+}
+
+function mnemoToolTimeoutMs(config) {
+  const configured = Number(config.mnemoSyncTimeoutMs || 0);
+  return Number.isFinite(configured) && configured > 0 ? configured : 15000;
+}
+
+function mnemoToolRetryAttempts(config) {
+  const configured = Number(config.mnemoSyncRetryAttempts || 0);
+  return Math.max(1, Number.isFinite(configured) && configured > 0 ? configured : 3);
+}
+
 function inferProject(config, message) {
   if (config.mnemoProject) return config.mnemoProject;
   const text = [message.text, message.groupTitle, message.conversationKey].filter(Boolean).join(" ").toLowerCase();
@@ -49,23 +287,36 @@ function syncKey(config, message, threadId) {
 async function callMnemoTool(config, name, args) {
   const base = String(config.mnemoHubUrl || "").replace(/\/+$/, "");
   if (!base) throw new Error("mnemo hub url missing");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.mnemoSyncTimeoutMs || 2500);
-  try {
-    const res = await fetch(`${base}/tool/${name}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(args || {}),
-      signal: controller.signal
-    });
-    const text = await res.text();
-    let body = {};
-    try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
-    if (!res.ok) throw new Error(`${name} HTTP ${res.status}: ${truncate(body, 600)}`);
-    return body && Object.prototype.hasOwnProperty.call(body, "result") ? body.result : body;
-  } finally {
-    clearTimeout(timer);
+  let lastError = null;
+  const attempts = mnemoToolRetryAttempts(config);
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), mnemoToolTimeoutMs(config));
+    try {
+      const res = await fetch(`${base}/tool/${name}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(args || {}),
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      const text = await res.text();
+      let body = {};
+      try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
+      if (res.ok) {
+        return body && Object.prototype.hasOwnProperty.call(body, "result") ? body.result : body;
+      }
+      const error = new Error(`${name} HTTP ${res.status}: ${truncate(body, 600)}`);
+      if (!retryableStatus(res.status) || attempt >= attempts) throw error;
+      lastError = error;
+    } catch (error) {
+      clearTimeout(timer);
+      if (!retryableFetchError(error) || attempt >= attempts) throw error;
+      lastError = error;
+    }
+    await sleep(retryDelayMs(attempt));
   }
+  throw lastError || new Error(`${name} failed`);
 }
 
 export async function logMnemoOutboundReceipt(config, outbound, contextEntry = null) {
@@ -231,6 +482,7 @@ function buildTurnBeginArgs(config, message, entry, project, threadId) {
     project,
     board: entry.board || "",
     thread_id: threadId || message.conversationKey || "default",
+    session_id: message.conversationKey || threadId || "default",
     session_key: message.conversationKey || "",
     chat_id: String(message.chatId || ""),
     message_id: String(message.messageId || ""),
@@ -246,6 +498,9 @@ function buildTurnBeginArgs(config, message, entry, project, threadId) {
     text: message.text || "",
     message: message.text || "",
     recall_query: message.text || "",
+    recall_enabled: true,
+    runtime_recall: true,
+    light_mode: false,
     recall_limit: 8,
     brief_limit: 20,
     board_limit: 12,
@@ -262,6 +517,68 @@ function buildTurnBeginArgs(config, message, entry, project, threadId) {
       source: "codexlink-user-prompt-submit"
     }
   };
+}
+
+function runtimeRecallCount(result) {
+  const count = Number(result?.recall?.count);
+  if (Number.isFinite(count)) return count;
+  if (Array.isArray(result?.recall?.rows)) {
+    return result.recall.rows.filter((row) => row && !fastRecallNoise(row)).length;
+  }
+  return 0;
+}
+
+async function ensureUserPromptHealthReceipt(config, message, project, threadId, turnResult) {
+  if (!config?.mnemoSyncEnabled || !turnResult || typeof turnResult !== "object") return null;
+  if (turnResult.hook_status || turnResult.user_prompt_hook || turnResult.userPromptHook) {
+    return turnResult.hook_status || turnResult.user_prompt_hook || turnResult.userPromptHook;
+  }
+
+  const ref = `${message.chatId || ""}:${message.messageId || ""}`;
+  const sessionId = message.conversationKey || threadId || "default";
+  const priorRecallOk = turnResult.recall?.ok == null ? null : Boolean(turnResult.recall.ok);
+  const promptCaptureOk = turnResult.capture?.ok == null ? null : Boolean(turnResult.capture.ok);
+  const blockers = Array.isArray(turnResult.blockers) ? turnResult.blockers.map((entry) => String(entry || "").trim()).filter(Boolean) : [];
+  const ok = priorRecallOk !== false && promptCaptureOk !== false && blockers.length === 0;
+  try {
+    const receipt = await callMnemoTool(config, "mem_action_log", {
+      agent_name: config.agentName || "agent",
+      action_kind: "mnemo_runtime_hook",
+      target: "UserPromptSubmit",
+      status: ok ? "ok" : "error",
+      topic: "runtime_hook",
+      session_id: sessionId,
+      payload: {
+        hook_event: "UserPromptSubmit",
+        project,
+        ok,
+        runtime_turn_gate: true,
+        runtime_name: "codexlink",
+        audit_id: turnResult.audit_id || null,
+        prior_recall_ok: priorRecallOk,
+        prior_count: runtimeRecallCount(turnResult),
+        prompt_capture_ok: promptCaptureOk,
+        transcript_sync_ok: promptCaptureOk,
+        transcript_count: promptCaptureOk ? 1 : 0,
+        full_sync_ran: Boolean(turnResult.full_sync_ran),
+        blockers
+      },
+      meta: {
+        hook: "codexlink-runtime-fallback",
+        runtime_name: "codexlink",
+        runtime_turn_key: turnResult.turn_key || null,
+        message_ref: ref || null,
+        channel: message.chatType === "private" ? "telegram-dm" : "telegram",
+        chat_id: String(message.chatId || "") || null,
+        message_id: String(message.messageId || "") || null
+      }
+    });
+    turnResult.hook_status = receipt;
+    return receipt;
+  } catch (error) {
+    turnResult.hook_status_error = String(error && error.message || error);
+    return null;
+  }
 }
 
 async function captureMessage(config, message, entry, project) {
@@ -551,12 +868,36 @@ function syncFromTurnBegin(result, project) {
     fullSyncRan: Boolean(result && result.full_sync_ran),
     briefCount: Number.isFinite(Number(fullSync.brief_pull_count)) ? Number(fullSync.brief_pull_count) : null,
     boardSummary: fullSync.project_board_loaded ? "loaded" : "",
-    recallSummary: recallRows.length ? truncate(recallRows.slice(0, 5), 700) : "",
+    recallSummary: formatRecallSummary(recallRows),
     messageCaptured: Boolean(result && result.capture && result.capture.ok),
     memoryChecked: Boolean(result && result.recall && result.recall.ok),
     error: result && result.error || "",
     promptBlock: result && result.context_block || ""
   };
+}
+
+function syncFromFastRecallFallback(project, fastRecallResult, messageText) {
+  const recallRows = fastRecallResult && Array.isArray(fastRecallResult.rows) ? fastRecallResult.rows : [];
+  const sync = {
+    enabled: true,
+    project,
+    initialCheck: { status: "degraded" },
+    finalCheck: { status: "degraded" },
+    auditId: null,
+    status: "degraded",
+    warningToken: "mnemo_turn_begin_timeout_fast_recall",
+    blocked: false,
+    fullSyncRan: false,
+    briefCount: null,
+    boardSummary: "",
+    recallSummary: formatRecallSummary(fastRecallResult),
+    messageCaptured: false,
+    memoryChecked: recallRows.length > 0,
+    error: "",
+    timeoutReason: String(messageText || "").slice(0, 300)
+  };
+  sync.promptBlock = buildContextBlock(sync);
+  return sync;
 }
 
 function buildContextBlock(sync) {
@@ -575,7 +916,10 @@ function buildContextBlock(sync) {
   if (sync.blocked) lines.push("Runtime policy blocked this response because required Mnemo context could not be loaded.");
   if (sync.briefCount != null) lines.push(`Pending briefs seen: ${sync.briefCount}`);
   if (sync.boardSummary) lines.push(`Project board: ${sync.boardSummary}`);
-  if (sync.recallSummary) lines.push(`Recall: ${sync.recallSummary}`);
+  if (sync.recallSummary) {
+    lines.push("Recall:");
+    lines.push(...String(sync.recallSummary).split(/\r?\n/));
+  }
   if (sync.error) lines.push(`Sync error: ${truncate(sync.error, 500)}`);
   lines.push("[/Mnemo Runtime Sync]");
   return lines.join("\n");
@@ -593,8 +937,14 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
     entry.lastMessageId = message.messageId || "";
   }
   const project = inferProject(config, message);
+  const fastRecallResult = fastLocalRecall(config, message, contextRecallLimit(config));
   try {
     const turnResult = await callMnemoTool(config, "mem_runtime_turn_begin", buildTurnBeginArgs(config, message, entry, project, threadId));
+    if (fastRecallResult && fastRecallResult.ok && (fastRecallResult.rows || []).length) {
+      turnResult.recall = fastRecallResult;
+      turnResult.context_block = "";
+    }
+    await ensureUserPromptHealthReceipt(config, message, project, threadId, turnResult);
     const stamp = nowIso();
     if (turnResult && turnResult.capture && turnResult.capture.ok) {
       entry.lastMessageCaptureAt = stamp;
@@ -616,10 +966,40 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
     state.conversations[key] = entry;
     writeJson(config.paths.mnemoSyncStateFile, state);
     const sync = syncFromTurnBegin(turnResult, project);
-    sync.promptBlock = sync.promptBlock || buildContextBlock(sync);
+    if (fastRecallResult && fastRecallResult.ok && (fastRecallResult.rows || []).length) {
+      sync.recallSummary = formatRecallSummary(fastRecallResult);
+      sync.memoryChecked = true;
+      sync.promptBlock = buildContextBlock(sync);
+    } else {
+      sync.promptBlock = sync.promptBlock || buildContextBlock(sync);
+    }
     return sync;
   } catch (turnBeginError) {
     const messageText = String(turnBeginError && turnBeginError.message || turnBeginError || "");
+    const turnBeginTimedOut = /abort|timeout|timed out|operation was aborted|ETIMEDOUT/i.test(messageText);
+    if (turnBeginTimedOut) {
+      const stamp = nowIso();
+      entry.lastTurnBeginErrorAt = stamp;
+      entry.lastTurnBeginError = messageText.slice(0, 300);
+      if (fastRecallResult && fastRecallResult.ok && (fastRecallResult.rows || []).length) {
+        entry.lastRecallAt = stamp;
+      }
+      const timeoutTurnResult = {
+        recall: fastRecallResult && fastRecallResult.ok ? fastRecallResult : null,
+        full_sync_ran: false,
+        blockers: ["mem_runtime_turn_begin_timeout"],
+        turn_key: key,
+        warning_token: "mnemo_turn_begin_timeout_fast_recall"
+      };
+      await ensureUserPromptHealthReceipt({
+        ...config,
+        mnemoSyncRetryAttempts: 1,
+        mnemoSyncTimeoutMs: Math.min(mnemoToolTimeoutMs(config), 5000)
+      }, message, project, threadId, timeoutTurnResult).catch(() => null);
+      state.conversations[key] = entry;
+      writeJson(config.paths.mnemoSyncStateFile, state);
+      return syncFromFastRecallFallback(project, fastRecallResult, messageText);
+    }
     if (!/mem_runtime_turn_begin|unknown tool|not[_ -]?found|404/i.test(messageText)) {
       throw turnBeginError;
     }
@@ -637,7 +1017,7 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
       immediateResults.capture = { error: String(captureError.message || captureError) };
     }
     try {
-      immediateResults.recall = await recallForMessage(config, message, entry);
+      immediateResults.recall = fastRecallResult || await recallForMessage(config, message, entry);
     } catch (recallError) {
       immediateResults.recall = { error: String(recallError.message || recallError) };
     }
@@ -673,7 +1053,7 @@ export async function runMnemoRuntimeSync(config, message, threadId) {
     }, 700)
     : "";
   const recallSource = immediateResults.recall || syncResults && syncResults.recall;
-  const recallSummary = recallSource ? truncate(recallSource, 700) : "";
+  const recallSummary = recallSource ? formatRecallSummary(recallSource) : "";
   const sync = {
     enabled: true,
     project,

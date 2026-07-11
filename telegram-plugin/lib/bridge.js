@@ -1,6 +1,6 @@
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
+import { getActiveTurnIdOverWs, listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { loadConfig } from "./env.js";
 import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
@@ -13,8 +13,221 @@ function loadState(config) {
   return scrubIdleBriefArtifactsInPlace(state);
 }
 
+let mnemoOutboundRetryDrainScheduled = false;
+
+function mnemoOutboundRetryFile(config) {
+  return join(config.paths.root, "mnemo-outbound-retry.jsonl");
+}
+
+function slimReceiptContextEntry(entry) {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  return {
+    chatId: entry.chatId || "",
+    chatType: entry.chatType || "",
+    conversationKey: entry.conversationKey || "",
+    groupTitle: entry.groupTitle || "",
+    messageId: entry.messageId || "",
+    replyToMessageId: entry.replyToMessageId || "",
+    telegramThreadId: entry.telegramThreadId || "",
+    threadId: entry.threadId || "",
+    turnId: entry.turnId || "",
+    user: entry.user || ""
+  };
+}
+
+function compactError(error) {
+  return String(error?.message || error || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
+}
+
+function retryDelayForAttempts(attempts) {
+  const count = Math.max(1, Number(attempts || 1));
+  return Math.min(10 * 60 * 1000, 30 * 1000 * Math.pow(2, Math.min(5, count - 1)));
+}
+
+function readMnemoOutboundRetries(config) {
+  const path = mnemoOutboundRetryFile(config);
+  if (!existsSync(path)) {
+    return [];
+  }
+  try {
+    return readFileSync(path, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry && entry.id && entry.outbound);
+  } catch (error) {
+    appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RETRY_READ_ERROR ${compactError(error)}`);
+    return [];
+  }
+}
+
+function writeMnemoOutboundRetries(config, retries) {
+  const path = mnemoOutboundRetryFile(config);
+  const rows = (retries || [])
+    .filter((entry) => entry && entry.id && entry.outbound)
+    .map((entry) => JSON.stringify(entry));
+  writeFileSync(path, rows.length ? `${rows.join("\n")}\n` : "", "utf8");
+}
+
+function enqueueMnemoOutboundRetry(config, outbound, contextEntry, error, attempts = 0) {
+  const id = `${outbound?.chatId || ""}:${outbound?.messageId || ""}`;
+  if (!id || id === ":") {
+    return;
+  }
+  const nextAttempts = Math.max(1, Number(attempts || 0) + 1);
+  const record = {
+    id,
+    queuedAt: nowIso(),
+    attempts: nextAttempts,
+    nextAttemptAt: new Date(Date.now() + retryDelayForAttempts(nextAttempts)).toISOString(),
+    outbound,
+    contextEntry: slimReceiptContextEntry(contextEntry),
+    error: compactError(error)
+  };
+  appendJsonl(mnemoOutboundRetryFile(config), record);
+  appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RECEIPT_QUEUED chat=${outbound.chatId} message=${outbound.messageId} attempts=${nextAttempts} next=${record.nextAttemptAt}`);
+}
+
+async function deliverMnemoOutboundReceipt(config, outbound, contextEntry, origin = "async", timeoutMs = 5000) {
+  const receiptConfig = {
+    ...config,
+    mnemoSyncRetryAttempts: 1,
+    mnemoSyncTimeoutMs: Math.max(1000, timeoutMs)
+  };
+  const mnemoReceipt = await logMnemoOutboundReceipt(receiptConfig, outbound, contextEntry);
+  if (mnemoReceipt?.enabled) {
+    appendLog(
+      config.paths.activityFile,
+      `MNEMO_OUTBOUND_RECEIPT${origin === "retry" ? "_RETRY" : ""} chat=${outbound.chatId} message=${outbound.messageId} ok=${mnemoReceipt.ok ? 1 : 0} ref=${mnemoReceipt.ref_id || "-"}`
+    );
+  }
+  return mnemoReceipt;
+}
+
+function scheduleMnemoOutboundReceipt(config, outbound, contextEntry) {
+  const timer = setTimeout(async () => {
+    try {
+      await deliverMnemoOutboundReceipt(config, outbound, contextEntry, "async", 5000);
+      scheduleMnemoOutboundRetryDrain(config);
+    } catch (error) {
+      appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RECEIPT_ERROR chat=${outbound.chatId} message=${outbound.messageId}: ${compactError(error)}`);
+      enqueueMnemoOutboundRetry(config, outbound, contextEntry, error);
+      scheduleMnemoOutboundRetryDrain(config);
+    }
+  }, 0);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+}
+
+async function drainMnemoOutboundRetries(config, limit = 2) {
+  const raw = readMnemoOutboundRetries(config);
+  if (!raw.length) {
+    return { ok: true, attempted: 0, remaining: 0 };
+  }
+  const latestById = new Map();
+  for (const entry of raw) {
+    latestById.set(entry.id, entry);
+  }
+  const now = Date.now();
+  const retries = Array.from(latestById.values());
+  const due = retries
+    .filter((entry) => Date.parse(String(entry.nextAttemptAt || "")) <= now)
+    .slice(0, limit);
+  if (!due.length) {
+    return { ok: true, attempted: 0, remaining: retries.length };
+  }
+
+  const delivered = new Set();
+  for (const entry of due) {
+    try {
+      await deliverMnemoOutboundReceipt(config, entry.outbound, entry.contextEntry, "retry", 5000);
+      delivered.add(entry.id);
+    } catch (error) {
+      entry.attempts = Math.max(1, Number(entry.attempts || 0) + 1);
+      entry.nextAttemptAt = new Date(Date.now() + retryDelayForAttempts(entry.attempts)).toISOString();
+      entry.error = compactError(error);
+      appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RECEIPT_RETRY_ERROR chat=${entry.outbound.chatId} message=${entry.outbound.messageId} attempts=${entry.attempts}: ${entry.error}`);
+    }
+  }
+
+  const remaining = retries.filter((entry) => !delivered.has(entry.id));
+  try {
+    writeMnemoOutboundRetries(config, remaining);
+  } catch (error) {
+    appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RETRY_WRITE_ERROR ${compactError(error)}`);
+  }
+  return { ok: true, attempted: due.length, delivered: delivered.size, remaining: remaining.length };
+}
+
+function scheduleMnemoOutboundRetryDrain(config) {
+  if (mnemoOutboundRetryDrainScheduled) {
+    return;
+  }
+  mnemoOutboundRetryDrainScheduled = true;
+  const timer = setTimeout(async () => {
+    mnemoOutboundRetryDrainScheduled = false;
+    try {
+      await drainMnemoOutboundRetries(config);
+    } catch (error) {
+      appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RETRY_DRAIN_ERROR ${compactError(error)}`);
+    }
+  }, 1000);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+}
+
+function sleepStateLock(ms) {
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+
+function withStateLock(config, callback) {
+  const lockPath = `${config.paths.stateFile}.lock`;
+  const deadline = Date.now() + 15000;
+  let descriptor = null;
+
+  while (descriptor === null) {
+    try {
+      descriptor = openSync(lockPath, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > 60000) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for Telegram state lock: ${lockPath}`);
+      }
+      sleepStateLock(25);
+    }
+  }
+
+  try {
+    return callback();
+  } finally {
+    try { closeSync(descriptor); } catch {}
+    try { unlinkSync(lockPath); } catch {}
+  }
+}
+
 function saveStateForConfig(config, state) {
-  saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(state));
+  withStateLock(config, () => {
+    const latestState = loadState(config);
+    const mergedState = mergeStateSnapshots(latestState, state);
+    saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(mergedState));
+  });
 }
 
 function persistActiveThreadBinding(config, threadId) {
@@ -581,6 +794,84 @@ function looksLikeStatusBroadcast(text) {
   return /^[a-z][a-z0-9_-]{1,24}\s+~?\s*\d{1,2}\s+\d{2}\b/u.test(normalized);
 }
 
+function looksLikeTransportQueueGateToken(text) {
+  return /^tq(?:\d{1,3}|-[a-z])(?:\b|$|[\s:.-])/i.test(String(text || "").trim());
+}
+
+function looksLikeAgentCollectionRequest(config, inbound) {
+  const text = String(inbound?.text || "");
+  if (!text || String(inbound?.chatType || "") === "private") {
+    return false;
+  }
+  if (!isAgentAddressed(config, text)) {
+    return false;
+  }
+  const normalized = foldTriggerText(text);
+  return /\b(?:alle|jeder|agent|agenten|otto|angel|dieter|fredrik|nachricht|nachrichten|schreibt|schreiben|feuert|test|serie|tq|wiederhole|wiederholen|pending|queue|turnqueue|turn\s*queue)\b/u.test(normalized);
+}
+
+function getAgentCollectionWindow(state) {
+  const window = state?.agentCollectionWindow;
+  if (!window || typeof window !== "object") {
+    return null;
+  }
+  const expiresAt = Date.parse(String(window.expiresAt || ""));
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    return null;
+  }
+  if (Number(window.remaining || 0) <= 0) {
+    return null;
+  }
+  return window;
+}
+
+function armAgentCollectionWindow(config, state, inbound) {
+  if (!looksLikeAgentCollectionRequest(config, inbound)) {
+    return false;
+  }
+  const now = Date.now();
+  state.agentCollectionWindow = {
+    chatId: String(inbound.chatId || "").trim(),
+    startedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 1000 * 120).toISOString(),
+    sourceMessageId: String(inbound.messageId || "").trim(),
+    remaining: 32
+  };
+  appendLog(config.paths.activityFile, `AGENT_COLLECTION_ARMED source=${inbound.messageId || "-"} chat=${inbound.chatId || "-"} remaining=32`);
+  return true;
+}
+
+function promoteByAgentCollectionWindow(config, state, inbound) {
+  const window = getAgentCollectionWindow(state);
+  if (!window) {
+    if (state?.agentCollectionWindow) {
+      state.agentCollectionWindow = null;
+    }
+    return false;
+  }
+  if (String(inbound?.chatId || "").trim() !== String(window.chatId || "").trim()) {
+    return false;
+  }
+  if (String(inbound?.messageId || "").trim() === String(window.sourceMessageId || "").trim()) {
+    return false;
+  }
+  if (String(inbound?.chatType || "") === "private") {
+    return false;
+  }
+  inbound.relevance = "direct";
+  inbound.agentCollectionPromoted = true;
+  inbound.agentCollectionSourceMessageId = String(window.sourceMessageId || "").trim();
+  window.remaining = Math.max(0, Number(window.remaining || 0) - 1);
+  appendLog(
+    config.paths.activityFile,
+    `AGENT_COLLECTION_PROMOTED source=${window.sourceMessageId || "-"} message=${inbound.messageId || "-"} user=${inbound.user || "-"} remaining=${window.remaining}`
+  );
+  if (window.remaining <= 0) {
+    state.agentCollectionWindow = null;
+  }
+  return true;
+}
+
 function isAgentAddressed(config, text) {
   const normalized = foldTriggerText(text);
   if (!normalized) {
@@ -665,6 +956,10 @@ function isOtherAgentAddressed(config, text) {
 }
 
 function classifyInboundRelevance(config, inbound) {
+  if (isCatchupQueueEntry(inbound)) {
+    return "direct";
+  }
+
   const text = String(inbound.text || "");
   const isStatusBroadcast = looksLikeStatusBroadcast(text);
   const isGroupChat = String(inbound.chatType || "") !== "private";
@@ -673,16 +968,20 @@ function classifyInboundRelevance(config, inbound) {
     return "direct";
   }
 
-  if (!isStatusBroadcast && isAgentAddressed(config, text)) {
+  if (isGroupChat && looksLikeTransportQueueGateToken(text)) {
     return "direct";
   }
 
-  if (!isStatusBroadcast && looksLikeUniversalAgentIntent(text)) {
+  if (!isStatusBroadcast && isAgentAddressed(config, text)) {
     return "direct";
   }
 
   if (!isStatusBroadcast && isOtherAgentAddressed(config, text)) {
     return isGroupChat && shouldObserveAllGroupMessages(config) ? "observe" : "ambient";
+  }
+
+  if (!isStatusBroadcast && looksLikeUniversalAgentIntent(text)) {
+    return "direct";
   }
 
   if (String(inbound.chatType || "") === "private") {
@@ -726,7 +1025,7 @@ function statusWeight(status) {
     case "injecting":
       return 2;
     case "parked":
-      return 0;
+      return 3;
     case "queued":
     default:
       return 1;
@@ -741,6 +1040,78 @@ function pickIsoLater(left, right) {
     return left || null;
   }
   return left >= right ? left : right;
+}
+
+function hasRuntimeTurnQueueResult(entry) {
+  return /^turn_(?:queued|steered)\b/i.test(String(entry?.responsePreview || ""))
+    || Boolean(entry?.turnId && (entry?.deliveredAt || entry?.injectFinishedAt));
+}
+
+function queueEvidenceTime(entry) {
+  const candidates = [
+    entry?.deliveredAt,
+    entry?.injectFinishedAt,
+    entry?.lastAttemptAt,
+    entry?.submittedAt,
+    entry?.requeuedAt,
+    entry?.parkedAt,
+    entry?.ts
+  ];
+  let latest = 0;
+  for (const candidate of candidates) {
+    const millis = Date.parse(candidate || "");
+    if (!Number.isNaN(millis) && millis > latest) {
+      latest = millis;
+    }
+  }
+  return latest;
+}
+
+function isIntentionalQueueReentry(entry) {
+  return String(entry?.status || "") === "queued" && Boolean(entry?.requeuedAt || entry?.requeueReason);
+}
+
+function isCatchupQueueEntry(entry) {
+  return Boolean(entry) && (
+    String(entry?.intent || "").trim().toLowerCase() === "catchup"
+    || String(entry?.updateType || "").trim().toLowerCase() === "catchup"
+    || String(entry?.messageId || "").startsWith("catchup-")
+  );
+}
+
+function selectQueueMergeAnchor(current, incoming) {
+  const currentCatchup = isCatchupQueueEntry(current);
+  const incomingCatchup = isCatchupQueueEntry(incoming);
+  if (currentCatchup !== incomingCatchup) {
+    return incomingCatchup ? incoming : current;
+  }
+
+  const currentRuntimeQueue = hasRuntimeTurnQueueResult(current);
+  const incomingRuntimeQueue = hasRuntimeTurnQueueResult(incoming);
+  if (currentRuntimeQueue !== incomingRuntimeQueue) {
+    return incomingRuntimeQueue ? incoming : current;
+  }
+
+  const currentReentry = isIntentionalQueueReentry(current);
+  const incomingReentry = isIntentionalQueueReentry(incoming);
+  if (currentReentry !== incomingReentry) {
+    const currentEvidence = queueEvidenceTime(current);
+    const incomingEvidence = queueEvidenceTime(incoming);
+    if (currentReentry && currentEvidence >= incomingEvidence) {
+      return current;
+    }
+    if (incomingReentry && incomingEvidence >= currentEvidence) {
+      return incoming;
+    }
+  }
+
+  const currentWeight = statusWeight(current?.status);
+  const incomingWeight = statusWeight(incoming?.status);
+  if (currentWeight !== incomingWeight) {
+    return incomingWeight > currentWeight ? incoming : current;
+  }
+
+  return queueEvidenceTime(incoming) >= queueEvidenceTime(current) ? incoming : current;
 }
 
 function pickLatestRecord(current, incoming) {
@@ -777,7 +1148,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "suppressed_private_reply"].includes(String(entry.status || ""));
+    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "no_reply_completed", "suppressed_private_reply"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -790,7 +1161,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted"].includes(status)) {
+  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "no_reply_completed"].includes(status)) {
     return false;
   }
   if (entry.sentAt && !hasResponseMessageIds(entry)) {
@@ -962,7 +1333,8 @@ function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
     if (!entry || entry.status !== "queued") {
       continue;
     }
-    if (String(entry.relevance || "") !== "ambient") {
+    const relevance = String(entry.relevance || "").trim().toLowerCase();
+    if (relevance !== "ambient" && relevance !== "observe") {
       continue;
     }
     if (isoAgeMs(entry.ts) < ttlMs) {
@@ -971,7 +1343,7 @@ function parkExpiredAmbientQueueEntriesInPlace(config, queue) {
     entry.status = "parked";
     entry.parkedAt = nowIso();
     if (!entry.responsePreview) {
-      entry.responsePreview = `[ambient parked after ${ttlMs}ms]`;
+      entry.responsePreview = `[${relevance} parked after ${ttlMs}ms]`;
     }
     parked += 1;
   }
@@ -986,7 +1358,15 @@ function reclassifyQueuedEntriesInPlace(config, queue) {
     if (!entry || entry.status !== "queued") {
       continue;
     }
+    if (isCatchupQueueEntry(entry)) {
+      entry.relevance = "direct";
+      continue;
+    }
     const previous = String(entry.relevance || "").trim().toLowerCase();
+    const chatType = String(entry.chatType || "").trim().toLowerCase();
+    if (chatType === "private" || ["direct", "lane", "escalation"].includes(previous)) {
+      continue;
+    }
     const next = classifyInboundRelevance(config, entry);
     if (next === previous) {
       continue;
@@ -1034,27 +1414,69 @@ function mergeQueueEntry(current, incoming) {
     return { ...current };
   }
 
+  const anchor = selectQueueMergeAnchor(current, incoming);
+  const other = anchor === incoming ? current : incoming;
   const merged = {
-    ...current,
-    ...incoming
+    ...other,
+    ...anchor
   };
 
-  if (statusWeight(current.status) > statusWeight(incoming.status)) {
-    merged.status = current.status;
-  } else if (statusWeight(incoming.status) > statusWeight(current.status)) {
-    merged.status = incoming.status;
+  const completedBusyRetry = current.status === "injecting"
+    && incoming.status === "queued"
+    && Boolean(incoming.retryAfterAt);
+  if (completedBusyRetry) {
+    merged.status = "queued";
+  } else {
+    merged.status = anchor.status || incoming.status || current.status;
   }
 
   merged.attempts = Math.max(Number(current.attempts || 0), Number(incoming.attempts || 0));
   merged.lastAttemptAt = pickIsoLater(current.lastAttemptAt, incoming.lastAttemptAt);
   merged.submittedAt = pickIsoLater(current.submittedAt, incoming.submittedAt);
   merged.deliveredAt = pickIsoLater(current.deliveredAt, incoming.deliveredAt);
+  merged.requeuedAt = pickIsoLater(current.requeuedAt, incoming.requeuedAt);
+  merged.parkedAt = pickIsoLater(current.parkedAt, incoming.parkedAt);
+  merged.injectStartedAt = pickIsoLater(current.injectStartedAt, incoming.injectStartedAt);
+  merged.injectFinishedAt = pickIsoLater(current.injectFinishedAt, incoming.injectFinishedAt);
+  merged.retryAfterAt = pickIsoLater(current.retryAfterAt, incoming.retryAfterAt);
   merged.ts = pickIsoLater(current.ts, incoming.ts);
 
-  for (const field of ["threadId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance", "intent", "updateType"]) {
-    if (!merged[field]) {
-      merged[field] = current[field] || incoming[field] || null;
+  for (const field of ["threadId", "turnId", "activeTurnId", "responsePreview", "stderr", "stdout", "chatType", "conversationKey", "groupTitle", "telegramThreadId", "senderIsBot", "relevance", "intent", "updateType"]) {
+    merged[field] = anchor[field] ?? other[field] ?? null;
+  }
+
+  const runtimeQueueSource = hasRuntimeTurnQueueResult(incoming) ? incoming : (hasRuntimeTurnQueueResult(current) ? current : null);
+  if (runtimeQueueSource) {
+    merged.status = "delivered";
+    merged.relevance = "direct";
+    merged.threadId = runtimeQueueSource.threadId || merged.threadId || null;
+    merged.turnId = runtimeQueueSource.turnId || merged.turnId || null;
+    merged.responsePreview = runtimeQueueSource.responsePreview;
+    merged.retryAfterAt = null;
+  }
+
+  if (isCatchupQueueEntry(current) || isCatchupQueueEntry(incoming) || isCatchupQueueEntry(merged)) {
+    const mergedStatus = String(merged.status || "").trim().toLowerCase();
+    const deliveredCatchup = Boolean(merged.turnId || merged.deliveredAt || merged.injectFinishedAt);
+    if (deliveredCatchup) {
+      merged.status = "delivered";
+    } else if (!["injecting", "submitted", "delivered", "error", "expired", "suppressed_ack", "suppressed_private_reply"].includes(mergedStatus)) {
+      merged.status = "queued";
     }
+    merged.relevance = "direct";
+    merged.intent = "catchup";
+    merged.updateType = "catchup";
+    merged.parkedAt = null;
+    merged.catchupForMessageId = incoming.catchupForMessageId || current.catchupForMessageId || merged.catchupForMessageId || null;
+    merged.catchupObserveRefs = Array.from(new Set([
+      ...(Array.isArray(current.catchupObserveRefs) ? current.catchupObserveRefs : []),
+      ...(Array.isArray(incoming.catchupObserveRefs) ? incoming.catchupObserveRefs : []),
+      ...(Array.isArray(merged.catchupObserveRefs) ? merged.catchupObserveRefs : [])
+    ]));
+  }
+
+  if (["delivered", "error", "parked", "submitted"].includes(String(merged.status || "").toLowerCase())) {
+    merged.retryAfterAt = null;
   }
 
   return merged;
@@ -1124,6 +1546,12 @@ function looksLikeBotSender(entry) {
   return /_bot$/i.test(String(entry?.user || "").trim());
 }
 
+function isTransportSmokeEntry(entry) {
+  const scope = String(entry?.scope || "").trim().toLowerCase();
+  const sourceText = String(entry?.sourceText || entry?.text || "").trim().toLowerCase();
+  return scope === "transport-smoke" || sourceText.startsWith("[botdoctor smoke]");
+}
+
 function isTrustedBotSender(config, entry) {
   if (!looksLikeBotSender(entry)) {
     return false;
@@ -1144,6 +1572,9 @@ function shouldReplyToTeamBotSender(config, entry) {
     return true;
   }
   const text = String(entry?.sourceText || entry?.text || "");
+  if (looksLikeTransportQueueGateToken(text)) {
+    return true;
+  }
   const relevance = String(entry?.relevance || "").trim().toLowerCase();
   if (relevance === "escalation") {
     return true;
@@ -1294,7 +1725,7 @@ function mergeStateSnapshots(currentState, incomingState) {
   };
 
   merged.offset = Math.max(Number(currentState.offset || 0), Number(incomingState.offset || 0));
-  merged.queue = mergeQueueLists(currentState.queue || [], incomingState.queue || []);
+  merged.queue = compactQueueHistory(mergeQueueLists(currentState.queue || [], incomingState.queue || []));
   merged.pendingReplies = mergePendingReplyLists(currentState.pendingReplies || [], incomingState.pendingReplies || []);
   merged.replyOffsets = {
     ...(currentState.replyOffsets || {}),
@@ -1309,11 +1740,27 @@ function mergeStateSnapshots(currentState, incomingState) {
     merged.queue
   );
   merged.lastOutbound = pickLatestRecord(currentState.lastOutbound || null, incomingState.lastOutbound || null);
-  merged.lastUiNotice = pickLatestRecord(currentState.lastUiNotice || null, incomingState.lastUiNotice || null);
+  merged.lastUiNotice = null;
   merged.lastPollAt = pickIsoLater(currentState.lastPollAt, incomingState.lastPollAt);
   merged.lastInjectAt = pickIsoLater(currentState.lastInjectAt, incomingState.lastInjectAt);
   merged.currentThreadId = incomingState.currentThreadId || currentState.currentThreadId || "";
   return merged;
+}
+
+function compactQueueHistory(queue) {
+  const configured = Number.parseInt(process.env.BLUN_TELEGRAM_QUEUE_HISTORY_LIMIT || "500", 10);
+  const historyLimit = Number.isFinite(configured) && configured >= 50 ? configured : 500;
+  const terminalStatuses = new Set(["delivered", "expired", "ignored_bot", "suppressed_ack", "stale_thread"]);
+  const active = [];
+  const terminal = [];
+  for (const entry of queue || []) {
+    if (terminalStatuses.has(String(entry?.status || "").toLowerCase())) {
+      terminal.push(entry);
+    } else {
+      active.push(entry);
+    }
+  }
+  return [...active, ...terminal.slice(-historyLimit)];
 }
 
 const IMAGE_EXTENSIONS = new Set([".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"]);
@@ -1661,6 +2108,9 @@ function normalizeTeamRelayInbound(config, state, event) {
   const continueContext = buildContinueContext(state, inbound);
   inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
   inbound.relevance = classifyInboundRelevance(config, inbound);
+  if (!armAgentCollectionWindow(config, state, inbound)) {
+    promoteByAgentCollectionWindow(config, state, inbound);
+  }
   if (!shouldAcceptBotRelayEntry(config, inbound)) {
     return null;
   }
@@ -1801,6 +2251,7 @@ function assertNoPrivateDmGroupLeak(config, state, options = {}, contextEntry = 
 }
 
 function shouldSendDeferredReceipt(config, entry, reason) {
+  return false;
   if (!config?.queueNoticeEnabled) {
     return false;
   }
@@ -1824,7 +2275,7 @@ function shouldSendDeferredReceipt(config, entry, reason) {
   if (chatType === "private" && isPrivateReplySuppressed(config)) {
     return false;
   }
-  return chatType === "private" || relevance === "direct" || relevance === "lane";
+  return chatType === "private";
 }
 
 function shouldSendTypingIndicator(config, entry) {
@@ -2096,6 +2547,73 @@ async function maybeSendDeferredReceipt(config, state, entry, reason) {
   }
 }
 
+function shouldSendRuntimeQueueNotice(config, entry, result) {
+  return false;
+  const mode = String(process.env.BLUN_TELEGRAM_RUNTIME_QUEUE_NOTICE || "1").trim().toLowerCase();
+  if (["0", "false", "no", "off"].includes(mode)) {
+    return false;
+  }
+  if (!entry || entry.senderIsBot) {
+    return false;
+  }
+  if (entry.intent === "continue_nudge") {
+    return false;
+  }
+  if (entry.runtimeQueueNoticeSentAt) {
+    return false;
+  }
+  const queuedBehindActiveTurn = Boolean(result?.queuedBehindActiveTurn)
+    || /\bbehind_active_turn=1\b/.test(String(result?.responseText || ""));
+  if (!queuedBehindActiveTurn) {
+    return false;
+  }
+  const relevance = String(entry.relevance || "").toLowerCase();
+  const chatType = String(entry.chatType || "").toLowerCase();
+  if (chatType === "private" && isPrivateReplySuppressed(config)) {
+    return false;
+  }
+  return chatType === "private";
+}
+
+function buildRuntimeQueueNoticeText() {
+  return "In der Turnqueue. Läuft nach dem aktuellen Turn.";
+}
+
+async function maybeSendRuntimeQueueNotice(config, state, entry, result) {
+  if (!shouldSendRuntimeQueueNotice(config, entry, result)) {
+    return false;
+  }
+
+  try {
+    await sendOutboundChunks(config, state, {
+      chatId: entry.chatId,
+      text: buildRuntimeQueueNoticeText(entry),
+      replyToMessageId: entry.messageId,
+      telegramThreadId: entry.telegramThreadId,
+      source: "queue_notice"
+    });
+    const sentAt = nowIso();
+    entry.runtimeQueueNoticeSentAt = sentAt;
+    entry.runtimeQueueNoticeReason = "behind_active_turn";
+    state.lastRuntimeQueueNoticeAt = sentAt;
+    markMatchingQueueEntriesInPlace(state, entry, {
+      runtimeQueueNoticeSentAt: sentAt,
+      runtimeQueueNoticeReason: entry.runtimeQueueNoticeReason
+    });
+    appendLog(
+      config.paths.activityFile,
+      `RUNTIME_QUEUE_NOTICE chat=${entry.chatId} message=${entry.messageId} reason=${entry.runtimeQueueNoticeReason}`
+    );
+    return true;
+  } catch (error) {
+    appendLog(
+      config.paths.activityFile,
+      `RUNTIME_QUEUE_NOTICE_ERROR chat=${entry.chatId} message=${entry.messageId}: ${String(error?.message || error).slice(0, 220)}`
+    );
+    return false;
+  }
+}
+
 function readJsonlDelta(path, offset, carry = "") {
   if (!path || !existsSync(path)) {
     return { nextOffset: 0, carry, items: [] };
@@ -2198,7 +2716,7 @@ function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionO
     sessionOffset: Number(sessionOffset || 0),
     chatId: String(message.chatId || "").trim(),
     messageId: String(message.messageId || "").trim(),
-    replyToMessageId: String(message.messageId || "").trim(),
+    replyToMessageId: String(message.replyToMessageId || message.messageId || "").trim(),
     telegramThreadId: normalizeTelegramThreadId(message.telegramThreadId),
     chatType: String(message.chatType || "").trim(),
     senderIsBot: Boolean(message.senderIsBot),
@@ -2207,6 +2725,8 @@ function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionO
     user: String(message.user || "").trim(),
     sourceText: String(message.text || ""),
     intent: String(message.intent || "message").trim(),
+    catchupForMessageId: String(message.catchupForMessageId || "").trim(),
+    catchupObserveRefs: Array.isArray(message.catchupObserveRefs) ? message.catchupObserveRefs : [],
     createdAt: nowIso(),
     status: "pending",
     sentAt: null,
@@ -2223,6 +2743,9 @@ function shouldTrackPendingReply(config, message) {
     return false;
   }
   if (looksLikeBotSender(message) && !shouldReplyToTeamBotSender(config, message)) {
+    return false;
+  }
+  if (looksLikeAckOnly(message.text)) {
     return false;
   }
   const intent = String(message.intent || "message").trim().toLowerCase();
@@ -2408,14 +2931,28 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
     const runtimeThreadId = String(runtimeOwner?.runtime?.thread_id || "").trim();
     const runtimeStartedAtMs = parseRuntimeStartedAtMs(runtimeOwner?.runtime);
     const pinnedThreadId = String(preferredThreadId || config.currentThreadId || runtimeThreadId || "").trim();
-    if (options.forcePreferred && pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
-      if (state.currentThreadId !== pinnedThreadId) {
-        state.currentThreadId = pinnedThreadId;
-        saveStateForConfig(config, state);
-        appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD_PINNED thread=${pinnedThreadId}`);
+    if (pinnedThreadId && loadedIds.includes(pinnedThreadId)) {
+      try {
+        const pinnedResult = await readThreadOverWs({
+          wsUrl: config.appServerWsUrl,
+          threadId: pinnedThreadId,
+          timeoutMs: 5000
+        });
+        const pinnedThread = pinnedResult?.response?.result?.thread || {};
+        const pinnedIsSubAgent = Boolean(pinnedThread.parentThreadId || pinnedThread.forkedFromId || pinnedThread.source?.subAgent);
+        if (!pinnedIsSubAgent) {
+          if (state.currentThreadId !== pinnedThreadId) {
+            state.currentThreadId = pinnedThreadId;
+            saveStateForConfig(config, state);
+            appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD_PINNED thread=${pinnedThreadId}`);
+          }
+          persistActiveThreadBinding(config, pinnedThreadId);
+          return pinnedThreadId;
+        }
+        appendLog(config.paths.activityFile, `REMOTE_ACTIVE_THREAD_UNPIN_SUBAGENT thread=${pinnedThreadId}`);
+      } catch {
+        // Fall through to root-aware scoring.
       }
-      persistActiveThreadBinding(config, pinnedThreadId);
-      return pinnedThreadId;
     }
 
     let bestThreadId = loadedIds[loadedIds.length - 1];
@@ -2434,7 +2971,9 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
         if (createdAtMs > 0) {
           score = createdAtMs;
         }
-        const source = String(thread.source || "").toLowerCase();
+        const isSubAgent = Boolean(thread.parentThreadId || thread.forkedFromId || thread.source?.subAgent);
+        score += isSubAgent ? -5000000000000000 : 5000000000000000;
+        const source = typeof thread.source === "string" ? thread.source.toLowerCase() : "";
         const statusType = String(thread.status?.type || "").toLowerCase();
         if (source === "cli" && statusType === "active") {
           score += 4000000000000000;
@@ -2597,17 +3136,7 @@ async function sendOutboundChunks(config, state, options) {
     appendJsonl(config.paths.outboxFile, outbound);
     appendLog(config.paths.activityFile, `OUT_${source.toUpperCase()} chat=${chatId} reply_to=${outbound.replyToMessageId || "-"} thread=${telegramThreadId || "-"} message=${outbound.messageId}: ${chunk.replace(/\s+/g, " ").slice(0, 180)}`);
     await publishTeamRelayEvent(config, buildOutboundRelayEvent(config, outbound, contextEntry));
-    try {
-      const mnemoReceipt = await logMnemoOutboundReceipt(config, outbound, contextEntry);
-      if (mnemoReceipt?.enabled) {
-        appendLog(
-          config.paths.activityFile,
-          `MNEMO_OUTBOUND_RECEIPT chat=${chatId} message=${outbound.messageId} ok=${mnemoReceipt.ok ? 1 : 0} ref=${mnemoReceipt.ref_id || "-"}`
-        );
-      }
-    } catch (error) {
-      appendLog(config.paths.activityFile, `MNEMO_OUTBOUND_RECEIPT_ERROR chat=${chatId} message=${outbound.messageId}: ${error}`);
-    }
+    scheduleMnemoOutboundReceipt(config, outbound, contextEntry);
     messageIds.push(outbound.messageId);
     lastOutbound = outbound;
   }
@@ -2720,6 +3249,9 @@ export async function pollOnce() {
     const continueContext = buildContinueContext(state, inbound);
     inbound.intent = looksLikeContinueNudge(inbound.text, continueContext) ? "continue_nudge" : "message";
     inbound.relevance = classifyInboundRelevance(config, inbound);
+    if (!armAgentCollectionWindow(config, state, inbound)) {
+      promoteByAgentCollectionWindow(config, state, inbound);
+    }
     if (!shouldAcceptBotRelayEntry(config, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED_BOT_RELAY chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
@@ -2747,13 +3279,6 @@ export async function pollOnce() {
     await stageTelegramAttachment(config, inbound);
     state.queue.push(inbound);
     state.lastInbound = inbound;
-    if (shouldPublishInboundUiNotice(inbound)) {
-      state.lastUiNotice = {
-        ts: nowIso(),
-        kind: "inbound",
-        text: formatCompactInboundUiNotice(inbound)
-      };
-    }
     appendJsonl(config.paths.inboxFile, inbound);
     appendLog(config.paths.activityFile, `IN chat=${inbound.chatId} message=${inbound.messageId} relevance=${inbound.relevance} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
     captured += 1;
@@ -2821,13 +3346,6 @@ export async function consumeTeamRelayOnce() {
 
     state.queue.push(inbound);
     state.lastInbound = inbound;
-    if (shouldPublishInboundUiNotice(inbound)) {
-      state.lastUiNotice = {
-        ts: nowIso(),
-        kind: "inbound",
-        text: formatCompactInboundUiNotice(inbound)
-      };
-    }
     appendJsonl(config.paths.inboxFile, inbound);
     appendLog(config.paths.activityFile, `TEAM_RELAY_IN id=${eventId} chat=${inbound.chatId} message=${inbound.messageId} relevance=${inbound.relevance} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
     captured += 1;
@@ -2888,11 +3406,36 @@ function compareQueuedDispatchOrder(left, right) {
   return String(left?.messageId || "").localeCompare(String(right?.messageId || ""));
 }
 
+async function resolveRuntimeActiveTurnId(config, threadId) {
+  const wsUrl = String(config?.appServerWsUrl || "").trim();
+  const resolvedThreadId = String(threadId || "").trim();
+  if (!wsUrl || !resolvedThreadId) {
+    return "";
+  }
+  try {
+    const result = await getActiveTurnIdOverWs({
+      wsUrl,
+      threadId: resolvedThreadId,
+      timeoutMs: Math.min(Number(config.resumeTimeoutMs || 10000) || 10000, 5000)
+    });
+    return result?.ok ? String(result.activeTurnId || "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+function isQueueRetryReady(item) {
+  const retryAt = Date.parse(String(item?.retryAfterAt || ""));
+  return !Number.isFinite(retryAt) || retryAt <= Date.now();
+}
+
 function selectNextQueuedEntry(queue, options = {}) {
   const auto = Boolean(options.auto);
   const deferredMode = String(options.dispatchMode || "deferred").toLowerCase() !== "legacy";
   const submitAllQueued = Boolean(options.submitAllQueued);
-  const queued = Array.isArray(queue) ? queue.filter((item) => item?.status === "queued") : [];
+  const queued = Array.isArray(queue)
+    ? queue.filter((item) => item?.status === "queued" && isQueueRetryReady(item))
+    : [];
   if (!auto || !deferredMode) {
     return queued.sort(compareQueuedDispatchOrder)[0] || null;
   }
@@ -2910,6 +3453,218 @@ function selectNextQueuedEntry(queue, options = {}) {
 function isGroupChatEntry(entry) {
   const chatType = String(entry?.chatType || "").trim().toLowerCase();
   return chatType === "group" || chatType === "supergroup";
+}
+
+function parseTelegramEntryTimeMs(entry) {
+  const raw = String(entry?.ts || entry?.createdAt || entry?.receivedAt || entry?.lastSeenAt || "").trim();
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function shouldAttachAgentGroupContext(message) {
+  if (!message || isTransportSmokeEntry(message)) {
+    return false;
+  }
+  const relevance = String(message.relevance || "").toLowerCase();
+  const chatType = String(message.chatType || "").toLowerCase();
+  if (relevance === "observe") {
+    return false;
+  }
+  return relevance === "direct" || relevance === "lane" || relevance === "escalation" || chatType === "private";
+}
+
+function isAgentGroupObserveContextEntry(entry) {
+  if (!entry) {
+    return false;
+  }
+  const relevance = String(entry.relevance || "").toLowerCase();
+  if (relevance !== "observe") {
+    return false;
+  }
+  const status = String(entry.status || "").toLowerCase();
+  if (status && status !== "queued" && status !== "parked") {
+    return false;
+  }
+  const chatType = String(entry.chatType || "").toLowerCase();
+  if (chatType === "private") {
+    return false;
+  }
+  if (entry.observeContextSurfacedAt || isTransportSmokeEntry(entry)) {
+    return false;
+  }
+  const text = String(entry.sourceText || entry.text || "").replace(/\s+/g, " ").trim();
+  return Boolean(text);
+}
+
+function compactAgentGroupContextText(entry, maxChars = 320) {
+  const raw = String(entry?.sourceText || entry?.text || "").replace(/\s+/g, " ").trim();
+  if (raw.length <= maxChars) {
+    return raw;
+  }
+  return `${raw.slice(0, Math.max(0, maxChars - 1)).trim()}...`;
+}
+
+function collectAgentGroupContextEntries(queue, lead, maxEntries = 12) {
+  if (!shouldAttachAgentGroupContext(lead)) {
+    return [];
+  }
+  const explicitRefs = Array.isArray(lead?.catchupObserveRefs)
+    ? lead.catchupObserveRefs.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  if (explicitRefs.length) {
+    const byId = new Map((Array.isArray(queue) ? queue : [])
+      .map((entry) => [String(entry?.messageId || "").trim(), entry])
+      .filter(([id, entry]) => id && entry));
+    return explicitRefs
+      .map((id) => byId.get(id))
+      .filter((entry) => {
+        if (!entry || isTransportSmokeEntry(entry)) {
+          return false;
+        }
+        const chatType = String(entry.chatType || "").toLowerCase();
+        if (chatType === "private") {
+          return false;
+        }
+        const text = String(entry.sourceText || entry.text || "").replace(/\s+/g, " ").trim();
+        return Boolean(text);
+      })
+      .slice(0, Math.max(1, maxEntries));
+  }
+  const leadMs = parseTelegramEntryTimeMs(lead) || Date.now();
+  const minMs = leadMs - (6 * 60 * 60 * 1000);
+  return (Array.isArray(queue) ? queue : [])
+    .filter(isAgentGroupObserveContextEntry)
+    .filter((entry) => {
+      const entryMs = parseTelegramEntryTimeMs(entry);
+      if (!entryMs) {
+        return true;
+      }
+      return entryMs >= minMs && entryMs <= leadMs + 15000;
+    })
+    .sort((left, right) => parseTelegramEntryTimeMs(left) - parseTelegramEntryTimeMs(right))
+    .slice(-Math.max(1, maxEntries));
+}
+
+function attachAgentGroupContextBlock(config, state, message) {
+  const configuredMax = Number.parseInt(String(message?.agentGroupContextMaxEntries || ""), 10);
+  const maxEntries = Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : 12;
+  const entries = collectAgentGroupContextEntries(state?.queue || [], message, maxEntries);
+  if (!entries.length) {
+    return message;
+  }
+  const lines = [
+    "[Agentgruppen-Kontext: mitgelesene Gruppenmeldungen seit dem letzten Alfred-Turn. Nur als Kontext nutzen; nicht einzeln beantworten.]"
+  ];
+  for (const entry of entries) {
+    const stamp = String(entry.ts || entry.createdAt || "").trim();
+    const user = String(entry.user || "Telegram").trim() || "Telegram";
+    const id = String(entry.messageId || "").trim();
+    const prefix = `${stamp ? `[${stamp}] ` : ""}${user}${id ? ` #${id}` : ""}:`;
+    lines.push(`- ${prefix} ${compactAgentGroupContextText(entry)}`);
+  }
+  message.agentGroupContextBlock = lines.join("\n");
+  message.agentGroupContextQueueKeys = entries.map((entry) => queueKey(entry)).filter(Boolean);
+  appendLog(
+    config.paths.activityFile,
+    `OBSERVE_CONTEXT_ATTACH message=${message.messageId || "-"} count=${entries.length} refs=${entries.map((entry) => entry.messageId).filter(Boolean).join(",")}`
+  );
+  return message;
+}
+
+function markAgentGroupContextSurfacedInPlace(state, message, surfacedAt = nowIso()) {
+  const keys = new Set(Array.isArray(message?.agentGroupContextQueueKeys) ? message.agentGroupContextQueueKeys : []);
+  if (!keys.size) {
+    return 0;
+  }
+  let count = 0;
+  for (const entry of Array.isArray(state?.queue) ? state.queue : []) {
+    if (!entry || !keys.has(queueKey(entry))) {
+      continue;
+    }
+    entry.observeContextSurfacedAt = surfacedAt;
+    entry.observeContextSurfacedByMessageId = String(message?.messageId || "").trim() || null;
+    count += 1;
+  }
+  return count;
+}
+
+function collectCatchupObserveEntries(state, sourceEntry, maxEntries = 24) {
+  const sourceMs = Date.parse(String(sourceEntry?.createdAt || sourceEntry?.ts || sourceEntry?.sentAt || ""));
+  const minMs = Number.isFinite(sourceMs) ? sourceMs : 0;
+  const sourceChatId = String(sourceEntry?.chatId || "").trim();
+  return (Array.isArray(state?.queue) ? state.queue : [])
+    .filter(isAgentGroupObserveContextEntry)
+    .filter((entry) => {
+      if (sourceChatId && String(entry.chatId || "").trim() !== sourceChatId) {
+        return false;
+      }
+      const entryMs = parseTelegramEntryTimeMs(entry);
+      return !minMs || !entryMs || entryMs > minMs;
+    })
+    .sort((left, right) => parseTelegramEntryTimeMs(left) - parseTelegramEntryTimeMs(right))
+    .slice(0, Math.max(1, maxEntries));
+}
+
+function hasCatchupQueuedForSource(state, sourceEntry) {
+  const sourceMessageId = String(sourceEntry?.messageId || "").trim();
+  if (!sourceMessageId) {
+    return false;
+  }
+  return (Array.isArray(state?.queue) ? state.queue : []).some((entry) => {
+    if (String(entry?.catchupForMessageId || "").trim() !== sourceMessageId) {
+      return false;
+    }
+    const status = String(entry?.status || "").toLowerCase();
+    return !["error", "expired", "ignored_bot", "suppressed_ack", "suppressed_private_reply"].includes(status);
+  });
+}
+
+function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
+  if (!sourceEntry || String(sourceEntry.intent || "").toLowerCase() === "catchup") {
+    return 0;
+  }
+  if (hasCatchupQueuedForSource(state, sourceEntry)) {
+    return 0;
+  }
+  const entries = collectCatchupObserveEntries(state, sourceEntry, 24);
+  if (!entries.length) {
+    return 0;
+  }
+  const now = nowIso();
+  const sourceMessageId = String(sourceEntry.messageId || "").trim();
+  const catchup = {
+    chatId: String(sourceEntry.chatId || "").trim(),
+    messageId: `catchup-${sourceMessageId}-${Date.now()}`,
+    replyToMessageId: String(sourceEntry.replyToMessageId || sourceEntry.messageId || "").trim(),
+    telegramThreadId: normalizeTelegramThreadId(sourceEntry.telegramThreadId),
+    chatType: String(sourceEntry.chatType || "").trim(),
+    conversationKey: String(sourceEntry.conversationKey || "").trim(),
+    groupTitle: String(sourceEntry.groupTitle || "").trim(),
+    user: "codexlink",
+    userId: "codexlink",
+    senderIsBot: false,
+    text: [
+      "Catch-up nach direktem Telegram-Auftrag:",
+      "Seit Start des letzten Alfred-Turns sind weitere Gruppenmeldungen eingetroffen.",
+      "Verarbeite sie ueber den Agentgruppen-Kontext. Wenn der letzte Auftrag Wiederholen/Test war, liefere die fehlenden Meldungen vollstaendig nach; sonst antworte nur bei konkretem Mehrwert."
+    ].join(" "),
+    sourceText: "CodexLink catch-up turn for parked group messages.",
+    relevance: "direct",
+    intent: "catchup",
+    status: "queued",
+    ts: now,
+    createdAt: now,
+    updateType: "catchup",
+    catchupForMessageId: sourceMessageId,
+    catchupObserveRefs: entries.map((entry) => String(entry.messageId || "").trim()).filter(Boolean),
+    agentGroupContextMaxEntries: 24
+  };
+  state.queue.push(catchup);
+  appendLog(
+    config.paths.activityFile,
+    `CATCHUP_QUEUED source=${sourceMessageId || "-"} message=${catchup.messageId} count=${entries.length} refs=${catchup.catchupObserveRefs.join(",")}`
+  );
+  return entries.length;
 }
 
 export async function injectNext(threadId, options = {}) {
@@ -2936,7 +3691,7 @@ export async function injectNext(threadId, options = {}) {
   }
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
-  const letCodexQueueVisibleMessages = auto && useAppServer && usesVisibleConsoleInject(config);
+  const useRuntimeTurnQueue = auto && useAppServer && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy";
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
     return {
@@ -2958,6 +3713,35 @@ export async function injectNext(threadId, options = {}) {
       ok: true,
       status: auto ? "deferred" : "empty",
       reason: auto ? "no_eligible_message" : undefined
+    };
+  }
+
+  if (isTransportSmokeEntry(next)) {
+    next.status = "delivered";
+    next.deliveredAt = nowIso();
+    next.threadId = null;
+    next.turnId = null;
+    next.responsePreview = "transport_smoke_skipped";
+    next.stderr = "";
+    next.stdout = "";
+    markMatchingQueueEntriesInPlace(state, next, {
+      status: next.status,
+      deliveredAt: next.deliveredAt,
+      threadId: next.threadId,
+      turnId: next.turnId,
+      responsePreview: next.responsePreview,
+      stderr: next.stderr,
+      stdout: next.stdout,
+      injectFinishedAt: next.deliveredAt
+    });
+    appendLog(config.paths.activityFile, `TRANSPORT_SMOKE_SKIPPED chat=${next.chatId} message=${next.messageId}`);
+    const latestState = loadState(config);
+    saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+    return {
+      ok: true,
+      status: "delivered",
+      reason: "transport_smoke_skipped",
+      message: next
     };
   }
 
@@ -3023,12 +3807,20 @@ export async function injectNext(threadId, options = {}) {
   if (bypassDeferredGate) {
     appendLog(config.paths.activityFile, `ESCALATION_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
   }
-  if (letCodexQueueVisibleMessages && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
-    appendLog(config.paths.activityFile, `CODEX_QUEUE_BYPASS chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
-  }
-  if (auto && !bypassDeferredGate && !letCodexQueueVisibleMessages && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
+  if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
-    if (openPendingReplies > 0) {
+    if (openPendingReplies > 0 && !useRuntimeTurnQueue) {
+        const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
+      const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
+      next.status = "queued";
+      next.lastAttemptAt = nowIso();
+      next.retryAfterAt = retryAfterAt;
+      markMatchingQueueEntriesInPlace(state, next, {
+        status: next.status,
+        lastAttemptAt: next.lastAttemptAt,
+        retryAfterAt
+      });
+      appendLog(config.paths.activityFile, `PENDING_REPLY_DEFER message=${next.messageId} open=${openPendingReplies} retry_after=${retryAfterAt}`);
       await maybeSendDeferredReceipt(config, state, next, "pending_reply");
       saveStateForConfig(config, state);
       return {
@@ -3039,19 +3831,53 @@ export async function injectNext(threadId, options = {}) {
       };
     }
 
-    const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
-    if (sessionActivity.active) {
-      await maybeSendDeferredReceipt(config, state, next, "session_active");
+    if (!useRuntimeTurnQueue) {
+      const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
+      if (sessionActivity.active) {
+        await maybeSendDeferredReceipt(config, state, next, "session_active");
+        saveStateForConfig(config, state);
+        return {
+          ok: false,
+          status: "deferred",
+          reason: "session_active",
+          quietMs: sessionActivity.quietMs,
+          readyInMs: Math.max(0, Number(sessionActivity.cooldownMs || 0) - Number(sessionActivity.quietMs || 0))
+        };
+      }
+    }
+  }
+  if (useRuntimeTurnQueue && !bypassDeferredGate) {
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
+    const activeTurnId = await resolveRuntimeActiveTurnId(config, resolvedThreadId);
+    if (activeTurnId) {
+      const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
+      const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
+      const checkedAt = nowIso();
+      next.status = "queued";
+      next.lastAttemptAt = checkedAt;
+      next.retryAfterAt = retryAfterAt;
+      next.activeTurnId = activeTurnId;
+      next.responsePreview = "waiting_for_active_turn";
+      markMatchingQueueEntriesInPlace(state, next, {
+        status: next.status,
+        lastAttemptAt: next.lastAttemptAt,
+        retryAfterAt,
+        activeTurnId,
+        responsePreview: next.responsePreview
+      });
+      appendLog(config.paths.activityFile, `RUNTIME_TURN_DEFER message=${next.messageId} active_turn=${activeTurnId} retry_after=${retryAfterAt}`);
       saveStateForConfig(config, state);
       return {
         ok: false,
         status: "deferred",
-        reason: "session_active",
-        quietMs: sessionActivity.quietMs,
-        readyInMs: Math.max(0, Number(sessionActivity.cooldownMs || 0) - Number(sessionActivity.quietMs || 0))
+        reason: "runtime_active_turn",
+        activeTurnId,
+        retryAfterAt,
+        message: next
       };
     }
   }
+  next = attachAgentGroupContextBlock(config, state, next);
 
   let promoted = 0;
   if (!useAppServer) {
@@ -3069,11 +3895,13 @@ export async function injectNext(threadId, options = {}) {
   next.lastAttemptAt = nowIso();
   next.status = "injecting";
   next.injectStartedAt = next.lastAttemptAt;
+  next.retryAfterAt = null;
   markMatchingQueueEntriesInPlace(state, next, {
     status: "injecting",
     attempts: next.attempts,
     lastAttemptAt: next.lastAttemptAt,
-    injectStartedAt: next.injectStartedAt
+    injectStartedAt: next.injectStartedAt,
+    retryAfterAt: null
   });
   let sessionPath = "";
   let sessionOffset = 0;
@@ -3115,13 +3943,22 @@ export async function injectNext(threadId, options = {}) {
   }
   if (result.busy) {
     const promotedThisAttempt = useAppServer ? false : promoteVisibleQueuedEntry(config, state, resolvedThreadId, next);
+    const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
+    const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
     next.status = promotedThisAttempt ? "submitted" : "queued";
+    next.retryAfterAt = retryAfterAt;
     markMatchingQueueEntriesInPlace(state, next, {
       status: next.status,
-      injectFinishedAt: nowIso()
+      injectFinishedAt: nowIso(),
+      retryAfterAt
     });
     appendLog(config.paths.activityFile, `INJECT_BUSY thread=${resolvedThreadId} message=${next.messageId}`);
     const latestState = loadState(config);
+    markMatchingQueueEntriesInPlace(latestState, next, {
+      status: next.status,
+      injectFinishedAt: next.injectFinishedAt || nowIso(),
+      retryAfterAt
+    });
     saveStateForConfig(config, mergeStateSnapshots(latestState, state));
     return {
       ok: false,
@@ -3133,6 +3970,7 @@ export async function injectNext(threadId, options = {}) {
 
   next.status = result.ok ? "delivered" : "error";
   next.deliveredAt = nowIso();
+  next.retryAfterAt = null;
   next.threadId = resolvedThreadId;
   next.turnId = String(result.turnId || "").trim() || null;
   next.responsePreview = result.responseText.slice(0, 400);
@@ -3146,9 +3984,16 @@ export async function injectNext(threadId, options = {}) {
     responsePreview: next.responsePreview,
     stderr: next.stderr,
     stdout: next.stdout,
-    injectFinishedAt: next.deliveredAt
+    injectFinishedAt: next.deliveredAt,
+    retryAfterAt: null
   };
   markMatchingDeliveryStateInPlace(state, next, injectResultUpdates);
+  if (result.ok) {
+    const surfaced = markAgentGroupContextSurfacedInPlace(state, next, next.deliveredAt);
+    if (surfaced > 0) {
+      appendLog(config.paths.activityFile, `OBSERVE_CONTEXT_SURFACED message=${next.messageId || "-"} count=${surfaced}`);
+    }
+  }
   if (useAppServer && result.ok) {
     if (!shouldTrackPendingReply(config, next)) {
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
@@ -3162,10 +4007,14 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `REPLY_PENDING thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}${noTurnSuffix}`);
     }
   }
+  await maybeSendRuntimeQueueNotice(config, state, next, result);
   state.lastInjectAt = nowIso();
   state.lastAutoDispatchAt = auto ? state.lastInjectAt : state.lastAutoDispatchAt;
   const latestState = loadState(config);
   markMatchingDeliveryStateInPlace(latestState, next, injectResultUpdates);
+  if (result.ok) {
+    markAgentGroupContextSurfacedInPlace(latestState, next, next.deliveredAt);
+  }
   saveStateForConfig(config, mergeStateSnapshots(latestState, state));
   const injectPreview = normalizeWhitespace(result.responseText || result.stderr || "").slice(0, 220);
   if (injectPreview) {
@@ -3184,6 +4033,7 @@ export async function injectNext(threadId, options = {}) {
 
 export async function relayRepliesOnce() {
   const config = loadConfig();
+  scheduleMnemoOutboundRetryDrain(config);
   const state = loadState(config);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
@@ -3259,6 +4109,14 @@ export async function relayRepliesOnce() {
           timestamp: String(item?.timestamp || "").trim()
         }))
         .filter((item) => item.message);
+      const turnCompletions = delta.items
+        .filter((item) => item?.type === "event_msg" && item?.payload?.type === "task_complete")
+        .map((item) => ({
+          turnId: String(item?.payload?.turn_id || "").trim(),
+          message: String(item?.payload?.last_agent_message || "").trim(),
+          timestamp: String(item?.timestamp || "").trim()
+        }))
+        .filter((item) => item.turnId || item.timestamp);
       const finalAnswers = delta.items
         .filter((item) => item?.type === "event_msg" && item?.payload?.type === "agent_message" && String(item?.payload?.phase || "").trim().toLowerCase() === "final_answer")
         .map((item) => ({
@@ -3281,11 +4139,12 @@ export async function relayRepliesOnce() {
           timestamp: String(item?.timestamp || "").trim()
         }))
         .filter((item) => item.timestamp);
-      sessionSignals.set(entry.sessionPath, { completions, finalAnswers, commentaries, aborts });
+      sessionSignals.set(entry.sessionPath, { completions, turnCompletions, finalAnswers, commentaries, aborts });
     }
 
-    const signals = sessionSignals.get(entry.sessionPath) || { completions: [], finalAnswers: [], commentaries: [], aborts: [] };
+    const signals = sessionSignals.get(entry.sessionPath) || { completions: [], turnCompletions: [], finalAnswers: [], commentaries: [], aborts: [] };
     const completions = signals.completions || [];
+    const turnCompletions = signals.turnCompletions || [];
     const finalAnswers = signals.finalAnswers || [];
     const commentaries = signals.commentaries || [];
     const aborts = signals.aborts || [];
@@ -3393,6 +4252,31 @@ export async function relayRepliesOnce() {
       match = match || completions.find((item) => item.timestamp >= entry.createdAt && !usedTurnIds.has(item.turnId));
     }
     if (!match) {
+      const completedTurn = turnCompletions.find((item) => {
+        if (item.timestamp && item.timestamp < entry.createdAt) {
+          return false;
+        }
+        return !entry.turnId || !item.turnId || item.turnId === entry.turnId;
+      });
+      if (completedTurn) {
+        entry.sentAt = nowIso();
+        entry.status = "no_reply_completed";
+        entry.turnId = entry.turnId || completedTurn.turnId || "";
+        entry.lastSignalAt = entry.sentAt;
+        entry.responsePreview = "[turn completed without reply]";
+        markMatchingQueueEntriesInPlace(state, entry, {
+          status: "delivered",
+          deliveredAt: entry.sentAt,
+          threadId: entry.threadId,
+          turnId: entry.turnId,
+          responsePreview: entry.responsePreview
+        });
+        if (entry.turnId) {
+          usedTurnIds.add(entry.turnId);
+        }
+        appendLog(config.paths.activityFile, `REPLY_NONE_COMPLETED thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId}`);
+        enqueueCatchupTurnIfNeeded(config, state, entry);
+      }
       continue;
     }
 
@@ -3428,6 +4312,7 @@ export async function relayRepliesOnce() {
     });
     usedTurnIds.add(match.turnId);
     appendLog(config.paths.activityFile, `REPLY_SENT thread=${entry.threadId} turn=${entry.turnId || "-"} chat=${entry.chatId} source_message=${entry.messageId} outbound=${outboundResult.messageIds.join(",")}`);
+    enqueueCatchupTurnIfNeeded(config, state, entry);
     delivered += 1;
   }
 

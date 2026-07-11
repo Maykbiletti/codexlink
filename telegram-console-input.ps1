@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 
 $typeName = "ConsoleInputWriter"
 $assemblyDir = Join-Path $env:TEMP "blun-codexlink"
-$assemblyPath = Join-Path $assemblyDir "console-input-writer-v6.dll"
+$assemblyPath = Join-Path $assemblyDir "console-input-writer-v8.dll"
 
 $source = @"
 using System;

@@ -53,6 +53,7 @@ public static class BlunEmbeddedQueueTitleWatcherQueueOnlyV2
     private static string _lastUiKind = "";
     private static int _lastOverlayTop = -1;
     private static int _lastOverlayWidth = 0;
+    private static DateTimeOffset _lastTickErrorLogAt = DateTimeOffset.MinValue;
     private static string _logFile = "";
     private static readonly object Gate = new object();
 
@@ -93,9 +94,14 @@ public static class BlunEmbeddedQueueTitleWatcherQueueOnlyV2
             TryWriteNotice(notice);
             TryWriteUiNotice(uiKind, uiNotice);
         }
-        catch
+        catch (Exception error)
         {
-            WriteLog("TICK_ERROR");
+            var now = DateTimeOffset.UtcNow;
+            if ((now - _lastTickErrorLogAt).TotalSeconds >= 60)
+            {
+                _lastTickErrorLogAt = now;
+                WriteLog("TICK_ERROR " + Normalize(error.GetType().Name + ": " + error.Message, 220));
+            }
         }
     }
 
@@ -282,7 +288,10 @@ public static class BlunEmbeddedQueueTitleWatcherQueueOnlyV2
             return;
         }
 
-        var serializer = new JavaScriptSerializer();
+        var serializer = new JavaScriptSerializer
+        {
+            MaxJsonLength = int.MaxValue
+        };
         var root = serializer.DeserializeObject(raw) as Dictionary<string, object>;
         if (root == null || !root.ContainsKey("queue"))
         {
