@@ -140,17 +140,18 @@ blun-codex telegram-plugin --print-only
 ## Queue Behavior
 
 Every allowed Telegram message is persisted before dispatch. The runtime daemon
-claims one eligible item, starts it with app-server `turn/start`, and leaves all
-later items queued while that turn is active. Normal inbound work never uses
-`turn/steer`, keyboard injection, or `codex exec resume`.
+then writes it into the visible Codex TUI composer and submits it with the same
+`Enter` path as direct CLI input. While a turn is active, the installed Codex
+TUI owns the normal pending-input behavior and displays the message in its own
+runtime queue.
 
-The persistent app-server event stream is the dispatch gate. A message can
-leave `queued` only after the bound thread reports `idle`; `active`, an unknown
-status, or a disconnected event stream fails closed. After `turn/start`, the
-next item remains locked until the matching `turn/completed` event has arrived
-and the thread is idle again. This gives Telegram turns the same serial
-follow-up behavior as CLI input without trying to write into the TUI's private
-composer buffer.
+Normal inbound work does not call app-server `turn/start`, `turn/steer`, or
+`codex exec resume`. The app-server API has no endpoint for the TUI's private
+composer queue, so the default `tui_composer` transport uses the visible Windows
+console. The persistent app-server event stream remains responsible for turn
+lifecycle, reply correlation, recovery, and approvals. Each injected message
+contains a CodexLink queue id so a manual CLI turn cannot consume the wrong
+Telegram reply slot.
 
 The lifecycle is:
 
@@ -160,6 +161,10 @@ received -> queued -> injecting -> submitted -> replied
 
 Failed submissions return to `queued` with backoff. App-server overloads use
 exponential backoff with jitter. Queue state survives CLI and MCP restarts.
+
+`BLUN_CODEXLINK_INPUT_TRANSPORT=app_server` restores the compatibility
+`turn/start` transport, but that mode cannot use or display the TUI's private
+pending-input queue.
 
 You can inspect the queue at any time:
 

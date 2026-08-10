@@ -1,9 +1,25 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { startTextTurnWhenIdleOverWs } from "./app-server-client.js";
 
+const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const RUNTIME_QUEUE_MARKER = /\[CodexLink Queue ID:\s*([A-Za-z0-9._:-]{1,240})\]/i;
 let runtimeTurnStarter = null;
+let runtimeComposerInjector = null;
 
 export function setRuntimeTurnStarter(starter) {
   runtimeTurnStarter = typeof starter === "function" ? starter : null;
+}
+
+export function setRuntimeComposerInjector(injector) {
+  runtimeComposerInjector = typeof injector === "function" ? injector : null;
+}
+
+export function usesTuiComposerTransport(config) {
+  const value = String(config?.inputTransport || "tui_composer").trim().toLowerCase();
+  return !["app_server", "app-server", "turn_start", "turn-start"].includes(value);
 }
 
 function repairMojibake(value) {
@@ -242,10 +258,151 @@ function buildTurnInput(config, message) {
   };
 }
 
+function runtimeQueueId(message) {
+  return String(message?.id || "")
+    .trim()
+    .replace(/[^A-Za-z0-9._:-]/g, "_")
+    .slice(0, 240);
+}
+
+function buildComposerText(config, message) {
+  const prompt = buildPrompt(config, message);
+  const queueId = runtimeQueueId(message);
+  if (!queueId) {
+    return prompt;
+  }
+  return `${prompt}\n\n[CodexLink Queue ID: ${queueId}]`;
+}
+
+function threadItemText(item) {
+  if (!item || item.type !== "userMessage" || !Array.isArray(item.content)) {
+    return "";
+  }
+  return item.content
+    .filter((part) => part?.type === "text")
+    .map((part) => String(part.text || ""))
+    .join("\n");
+}
+
+export function extractRuntimeQueueIdFromThreadItem(item) {
+  return threadItemText(item).match(RUNTIME_QUEUE_MARKER)?.[1] || "";
+}
+
+function readRuntime(config) {
+  try {
+    if (!config?.paths?.currentRuntimeFile || !existsSync(config.paths.currentRuntimeFile)) {
+      return null;
+    }
+    return JSON.parse(readFileSync(config.paths.currentRuntimeFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid) {
+  const parsed = Number.parseInt(String(pid || "0"), 10);
+  if (!parsed || parsed <= 0) {
+    return false;
+  }
+  try {
+    process.kill(parsed, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function composerSubmitDelayMs(config, text) {
+  const configuredMin = Number.parseInt(String(config.composerSubmitDelayMs || "260"), 10) || 260;
+  const configuredMax = Number.parseInt(String(config.composerSubmitMaxDelayMs || "12000"), 10) || 12000;
+  const safeMax = Math.max(configuredMin, Math.min(30000, configuredMax));
+  const lineCount = (String(text || "").match(/\n/g) || []).length;
+  const lengthDelay = Math.ceil(String(text || "").length / 1.2);
+  return Math.min(safeMax, Math.max(configuredMin, 700, lengthDelay + lineCount * 120));
+}
+
+function injectThroughVisibleComposer(config, message) {
+  if (process.platform !== "win32") {
+    return { ok: false, reason: "not_windows" };
+  }
+  const runtime = readRuntime(config);
+  const frontendPid = Number.parseInt(String(runtime?.frontend_host_pid || "0"), 10) || 0;
+  if (!isPidAlive(frontendPid)) {
+    return { ok: false, reason: "frontend_offline" };
+  }
+  const scriptPath = join(runtimeRoot, "telegram-console-input.ps1");
+  if (!existsSync(scriptPath)) {
+    return { ok: false, reason: "script_missing" };
+  }
+  const text = buildComposerText(config, message);
+  if (!text.trim()) {
+    return { ok: false, reason: "empty" };
+  }
+  const submitDelayMs = composerSubmitDelayMs(config, text);
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath,
+    "-TargetPid",
+    String(frontendPid),
+    "-Text",
+    text,
+    "-ClearBefore",
+    "-Submit",
+    "-SubmitDelayMs",
+    String(submitDelayMs)
+  ], {
+    cwd: runtimeRoot,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: Math.max(20000, submitDelayMs + 15000)
+  });
+  if (result.status === 0) {
+    return { ok: true, frontendPid, submitDelayMs };
+  }
+  return {
+    ok: false,
+    reason: "script_failed",
+    stdout: String(result.stdout || "").trim(),
+    stderr: String(result.stderr || result.error || "").trim()
+  };
+}
+
 export async function injectIntoThread(config, message, threadId) {
   const promptMessage = Object.assign({}, message, { mnemoContextBlock: "" });
   const turnInput = buildTurnInput(config, promptMessage);
   if (config.appServerWsUrl) {
+    if (usesTuiComposerTransport(config)) {
+      const injectComposer = runtimeComposerInjector || injectThroughVisibleComposer;
+      const result = await injectComposer(config, promptMessage, { threadId });
+      if (result?.ok) {
+        return {
+          ok: true,
+          busy: false,
+          turnId: "",
+          code: 0,
+          signal: null,
+          responseText: `composer_submitted thread=${threadId} frontend_pid=${result.frontendPid || "test"} key=enter`,
+          stdout: String(result.stdout || ""),
+          stderr: "",
+          queuedInComposer: true,
+          queueItemId: runtimeQueueId(promptMessage)
+        };
+      }
+      const reason = String(result?.reason || "unavailable");
+      return {
+        ok: false,
+        busy: true,
+        turnId: "",
+        code: null,
+        signal: null,
+        responseText: "",
+        stdout: String(result?.stdout || ""),
+        stderr: `composer_transport_unavailable reason=${reason}${result?.stderr ? ` ${result.stderr}` : ""}`
+      };
+    }
     const startTurn = runtimeTurnStarter || startTextTurnWhenIdleOverWs;
     const result = await startTurn({
       wsUrl: config.appServerWsUrl,

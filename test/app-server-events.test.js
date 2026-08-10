@@ -96,6 +96,41 @@ test("completed app-server items are correlated with their turn", async (t) => {
   assert.equal(completions[0].turnId, "turn-1");
 });
 
+test("visible-composer user messages bind their CodexLink queue id to the app-server turn", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const observed = [];
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  }, {
+    onUserMessageObserved: async (event) => observed.push(event)
+  });
+
+  await bridge._handleNotification({
+    method: "item/started",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        type: "userMessage",
+        content: [{
+          type: "text",
+          text: "Mayk schrieb:\nBitte prüfen.\n\n[CodexLink Queue ID: telegram:-1001:42]",
+          text_elements: []
+        }]
+      }
+    }
+  });
+
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].queueItemId, "telegram:-1001:42");
+  assert.equal(observed[0].turnId, "turn-1");
+});
+
 test("runtime dispatch waits for an authoritative idle thread event", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "codexlink-events-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

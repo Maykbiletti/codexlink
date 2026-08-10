@@ -1,4 +1,5 @@
 import { AppServerClient } from "./app-server-client.js";
+import { extractRuntimeQueueIdFromThreadItem } from "./codex.js";
 import { appendJsonl, appendLog, nowIso } from "./storage.js";
 
 const DECISION_APPROVAL_METHODS = new Set([
@@ -140,6 +141,17 @@ export class AppServerEventBridge {
           continue;
         }
         const items = Array.isArray(turn.items) ? turn.items : [];
+        const userItem = items.find((item) => item?.type === "userMessage");
+        const queueItemId = extractRuntimeQueueIdFromThreadItem(userItem);
+        if (queueItemId && this.handlers.onUserMessageObserved) {
+          await this.handlers.onUserMessageObserved({
+            threadId,
+            turnId: String(turn.id || "").trim(),
+            queueItemId,
+            observedAt: nowIso(),
+            recovered: true
+          });
+        }
         const finalItem = [...items].reverse().find((item) => {
           return item?.type === "agentMessage" && String(item.phase || "final_answer") === "final_answer";
         });
@@ -310,6 +322,20 @@ export class AppServerEventBridge {
       });
     }
 
+    if (method === "item/started" || method === "item/completed") {
+      const item = message?.params?.item || {};
+      const queueItemId = extractRuntimeQueueIdFromThreadItem(item);
+      if (queueItemId && turnId && this.handlers.onUserMessageObserved) {
+        await this.handlers.onUserMessageObserved({
+          threadId,
+          turnId,
+          queueItemId,
+          observedAt: nowIso(),
+          recovered: false
+        });
+      }
+    }
+
     if (method === "item/completed") {
       const item = message?.params?.item || {};
       if (item.type === "agentMessage" && String(item.phase || "final_answer") === "final_answer" && turnId) {
@@ -327,6 +353,19 @@ export class AppServerEventBridge {
     if (method === "turn/completed") {
       const turn = message?.params?.turn || {};
       const completedTurnId = String(turn.id || turnId || "").trim();
+      const completedUserItem = Array.isArray(turn.items)
+        ? turn.items.find((item) => item?.type === "userMessage")
+        : null;
+      const completedQueueItemId = extractRuntimeQueueIdFromThreadItem(completedUserItem);
+      if (completedQueueItemId && completedTurnId && this.handlers.onUserMessageObserved) {
+        await this.handlers.onUserMessageObserved({
+          threadId,
+          turnId: completedTurnId,
+          queueItemId: completedQueueItemId,
+          observedAt: nowIso(),
+          recovered: false
+        });
+      }
       const trackedActiveTurnId = this.activeTurnId;
       if (completedTurnId && this.ownedTurnId === completedTurnId) {
         this.ownedTurnId = "";

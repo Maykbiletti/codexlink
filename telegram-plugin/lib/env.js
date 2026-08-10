@@ -131,6 +131,11 @@ export function loadConfig() {
     trustedBotSenders,
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
+    inputTransport: env.BLUN_CODEXLINK_INPUT_TRANSPORT?.trim().toLowerCase()
+      || env.BLUN_TELEGRAM_INPUT_TRANSPORT?.trim().toLowerCase()
+      || "tui_composer",
+    composerSubmitDelayMs: Number.parseInt(env.BLUN_CODEXLINK_COMPOSER_SUBMIT_DELAY_MS || "260", 10) || 260,
+    composerSubmitMaxDelayMs: Number.parseInt(env.BLUN_CODEXLINK_COMPOSER_SUBMIT_MAX_DELAY_MS || "12000", 10) || 12000,
     resumeTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_RESUME_TIMEOUT_MS || "15000", 10) || 15000,
     pollIntervalMs: Number.parseInt(env.BLUN_TELEGRAM_POLL_INTERVAL_MS || "700", 10) || 700,
     injectIntervalMs: Number.parseInt(env.BLUN_TELEGRAM_INJECT_INTERVAL_MS || "700", 10) || 700,

@@ -2,6 +2,7 @@
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   bindCurrentThread,
+  bindRuntimeTurnFromUserMessage,
   bridgeStatus,
   cancelRuntimeQueueItem,
   completeRuntimeTurnFromEvent,
@@ -15,7 +16,7 @@ import {
   tailActivity
 } from "./lib/bridge.js";
 import { AppServerEventBridge } from "./lib/app-server-events.js";
-import { setRuntimeTurnStarter } from "./lib/codex.js";
+import { setRuntimeTurnStarter, usesTuiComposerTransport } from "./lib/codex.js";
 import { loadConfig } from "./lib/env.js";
 import { ensureStateLayout } from "./lib/paths.js";
 import { RuntimeController } from "./lib/runtime-controller.js";
@@ -31,6 +32,7 @@ let nextStateRecoveryProbeAt = 0;
 
 const eventBridge = config.appServerWsUrl
   ? new AppServerEventBridge(config, {
+    onUserMessageObserved: (event) => bindRuntimeTurnFromUserMessage(event),
     onTurnCompleted: (event) => completeRuntimeTurnFromEvent(event),
     onApproval: (approval) => {
       appendLog(
@@ -52,9 +54,21 @@ function resolveBoundThreadId(current = loadConfig()) {
 async function dispatchRuntimeQueue(threadId = "", options = {}) {
   const current = loadConfig();
   const resolvedThreadId = String(threadId || resolveBoundThreadId(current)).trim();
+  if (eventBridge && usesTuiComposerTransport(current) && resolvedThreadId) {
+    try {
+      await eventBridge.ensureConnected(resolvedThreadId);
+    } catch (error) {
+      return {
+        ok: false,
+        status: "deferred",
+        reason: "event_stream_unavailable",
+        error: String(error?.message || error)
+      };
+    }
+  }
   return injectNext(resolvedThreadId, {
     ...options,
-    runtimeDispatchGate: eventBridge
+    runtimeDispatchGate: eventBridge && !usesTuiComposerTransport(current)
       ? (candidateThreadId) => eventBridge.checkDispatchReady(candidateThreadId)
       : null
   });

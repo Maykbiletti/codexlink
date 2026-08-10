@@ -10,22 +10,25 @@ The runtime daemon owns the durable queue and all transport loops:
 
 1. an allowed Telegram update is normalized and persisted in `state.json`
 2. the dispatcher claims the oldest eligible item
-3. when the bound thread is idle, the daemon submits it with app-server
-   `turn/start`
-4. the next item stays locked until the matching `turn/completed` event and a
-   confirmed idle thread state
-5. app-server `item/completed` and `turn/completed` events complete the queue
+3. the daemon writes it into the visible Codex TUI composer and submits it with
+   the same `Enter` path as direct CLI input
+4. while a turn is active, the Codex TUI owns the pending-input behavior and
+   displays the message in its normal runtime queue
+5. app-server user-message, `item/completed`, and `turn/completed` events bind
+   the queued item to its turn, complete the queue
    item and route the final answer back to Telegram
 6. on restart, `thread/read` recovers turns that completed while the daemon was
    offline
 
-Ordinary inbound work never uses `turn/steer`, terminal keyboard injection, or
-`codex exec resume`. The MCP server is a thin control plane over the same daemon
-and never owns a second queue.
+Ordinary inbound work never calls `turn/start`, `turn/steer`, or `codex exec
+resume`. The app-server API does not expose the TUI's private pending-input
+queue, so CodexLink deliberately uses the visible Windows console input path.
+The MCP server is a thin control plane over the same daemon and never owns a
+second queue.
 
-The daemon tracks `thread/status/changed` on its persistent app-server
-connection. Active, unknown, or disconnected states keep the head item queued;
-there is no fail-open status poll and no direct bypass for escalations.
+The daemon keeps a persistent app-server connection for lifecycle events,
+reply correlation, and approvals. A small queue-id marker in the submitted user
+message prevents a manual CLI turn from being mistaken for a Telegram turn.
 
 Queue lifecycle:
 
@@ -110,6 +113,10 @@ Relevant optional values:
 - `BLUN_CODEXLINK_RUNTIME_PORT`: `0` by default for an ephemeral localhost port
 - `BLUN_CODEXLINK_RUNTIME_RPC_TIMEOUT_MS`: MCP-to-runtime request timeout
 - `BLUN_CODEXLINK_OVERLOAD_BASE_MS`: base delay for overload backoff
+- `BLUN_CODEXLINK_INPUT_TRANSPORT`: `tui_composer` by default; `app_server` is
+  an explicit compatibility mode and does not use the TUI pending-input queue
+- `BLUN_CODEXLINK_COMPOSER_SUBMIT_DELAY_MS`: minimum delay before the injected
+  `Enter` key; useful for very slow Windows consoles
 
 The public profile uses `workspace-write` with `on-request` approvals. Mnemo
 sync and Telegram capture are off unless explicitly enabled.

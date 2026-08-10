@@ -4,7 +4,7 @@ import { basename, extname, join } from "node:path";
 import { getActiveTurnIdOverWs, listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { diagnosticSmokeKind, isDiagnosticSmokeEntry } from "./diagnostic-smoke.js";
 import { loadConfig } from "./env.js";
-import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
+import { injectIntoThread, isAddressOnlyPing, usesTuiComposerTransport } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
 import { appendJsonl, appendLog, defaultState, loadJson, loadJsonStrict, nowIso, readTail, saveJson, saveJsonWithBackup } from "./storage.js";
 import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
@@ -412,7 +412,9 @@ async function captureInboundForMnemo(config, inbound, path) {
 }
 
 function pendingReplyKey(entry) {
-  return entry.turnId || `${entry.threadId || ""}:${entry.chatId}:${entry.messageId}`;
+  return entry.queueItemId
+    || entry.turnId
+    || `${entry.threadId || ""}:${entry.chatId}:${entry.messageId}`;
 }
 
 function containsToken(text, token) {
@@ -1134,6 +1136,7 @@ function statusWeight(status) {
     case "failed":
       return 4;
     case "running":
+      return 3;
     case "submitted":
     case "injecting":
       return 2;
@@ -1156,6 +1159,9 @@ function pickIsoLater(left, right) {
 }
 
 function hasRuntimeTurnQueueResult(entry) {
+  if (String(entry?.inputTransport || "").trim() === "tui_composer") {
+    return false;
+  }
   return /^turn_(?:queued|started)\b/i.test(String(entry?.responsePreview || ""))
     || Boolean(entry?.turnId && (entry?.deliveredAt || entry?.injectFinishedAt));
 }
@@ -1166,6 +1172,7 @@ function queueEvidenceTime(entry) {
     entry?.injectFinishedAt,
     entry?.lastAttemptAt,
     entry?.submittedAt,
+    entry?.runningAt,
     entry?.requeuedAt,
     entry?.parkedAt,
     entry?.ts
@@ -2842,6 +2849,8 @@ async function resolveSessionActivity(config, threadId, entry = null) {
 
 function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionOffset) {
   return {
+    queueItemId: String(message.id || "").trim(),
+    inputTransport: String(message.inputTransport || "").trim(),
     turnId: String(turnId || "").trim(),
     threadId: String(threadId || "").trim(),
     sessionPath: String(sessionPath || "").trim(),
@@ -3170,6 +3179,7 @@ export function bridgeStatus() {
     boundThreadId: config.currentThreadId || state.currentThreadId || null,
     frontendOwnerPid: runtimeOwner?.frontendHostPid || null,
     frontendOwnerAlive: runtimeOwner?.frontendAlive ?? null,
+    inputTransport: config.inputTransport,
     dispatchMode: config.dispatchMode,
     groupDeliveryMode: config.groupDeliveryMode,
     idleCooldownMs: config.idleCooldownMs,
@@ -3189,7 +3199,7 @@ export function bridgeStatus() {
     lastInjectAt: state.lastInjectAt,
     teamRelay: teamRelayStatus(config),
     stateDir: config.paths.root,
-    note: "The durable runtime queue is authoritative. Telegram intake is disabled until an allowlist is configured."
+    note: "The durable runtime queue persists intake; the visible Codex TUI composer owns active-turn input queueing. Telegram intake is disabled until an allowlist is configured."
   };
 }
 
@@ -3907,7 +3917,12 @@ export async function injectNext(threadId, options = {}) {
   }
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
-  const useRuntimeTurnQueue = auto && useAppServer && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy";
+  const useTuiComposerQueue = auto && useAppServer && usesTuiComposerTransport(config);
+  const useRuntimeTurnQueue = auto
+    && useAppServer
+    && !useTuiComposerQueue
+    && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy";
+  const useManagedRuntimeInput = useTuiComposerQueue || useRuntimeTurnQueue;
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
     return {
@@ -4030,7 +4045,7 @@ export async function injectNext(threadId, options = {}) {
   }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
-    if (openPendingReplies > 0 && !useRuntimeTurnQueue) {
+    if (openPendingReplies > 0 && !useManagedRuntimeInput) {
         const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
       const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
       next.status = "queued";
@@ -4052,7 +4067,7 @@ export async function injectNext(threadId, options = {}) {
       };
     }
 
-    if (!useRuntimeTurnQueue) {
+    if (!useManagedRuntimeInput) {
       const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
       if (sessionActivity.active) {
         await maybeSendDeferredReceipt(config, state, next, "session_active");
@@ -4212,6 +4227,7 @@ export async function injectNext(threadId, options = {}) {
   next.leaseUntil = null;
   next.threadId = resolvedThreadId;
   next.turnId = String(result.turnId || "").trim() || null;
+  next.inputTransport = result.queuedInComposer ? "tui_composer" : "app_server";
   next.responsePreview = result.responseText.slice(0, 400);
   next.stderr = result.stderr.slice(0, 400);
   next.stdout = result.stdout.slice(0, 400);
@@ -4221,6 +4237,7 @@ export async function injectNext(threadId, options = {}) {
     submittedAt: next.submittedAt,
     threadId: next.threadId,
     turnId: next.turnId,
+    inputTransport: next.inputTransport,
     responsePreview: next.responsePreview,
     stderr: next.stderr,
     stdout: next.stdout,
@@ -4688,6 +4705,45 @@ export function cancelRuntimeQueueItem(identifier) {
   return { ok: true, item };
 }
 
+export function bindRuntimeTurnFromUserMessage(event) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const queueItemId = String(event?.queueItemId || "").trim();
+  const turnId = String(event?.turnId || "").trim();
+  const threadId = String(event?.threadId || "").trim();
+  if (!queueItemId || !turnId) {
+    return { ok: true, matched: false, queueItemId, turnId };
+  }
+
+  const queueItem = (state.queue || []).find((entry) => String(entry.id || "").trim() === queueItemId);
+  const pending = (state.pendingReplies || []).find((entry) => {
+    return isReplyAwaitingOutcome(entry)
+      && String(entry.queueItemId || "").trim() === queueItemId;
+  });
+  if (!queueItem && !pending) {
+    appendLog(config.paths.activityFile, `RUNTIME_USER_MESSAGE_UNMATCHED queue=${queueItemId} thread=${threadId || "-"} turn=${turnId}`);
+    return { ok: true, matched: false, queueItemId, turnId };
+  }
+
+  if (queueItem) {
+    queueItem.turnId = turnId;
+    queueItem.threadId = threadId || queueItem.threadId;
+    if (String(queueItem.status || "").toLowerCase() === "submitted") {
+      queueItem.status = "running";
+      queueItem.runningAt = event.observedAt || nowIso();
+    }
+  }
+  if (pending) {
+    pending.turnId = turnId;
+    pending.threadId = threadId || pending.threadId;
+    pending.status = "running";
+    pending.lastSignalAt = event.observedAt || nowIso();
+  }
+  saveStateForConfig(config, state);
+  appendLog(config.paths.activityFile, `RUNTIME_TURN_BOUND queue=${queueItemId} thread=${threadId || "-"} turn=${turnId}`);
+  return { ok: true, matched: true, queueItemId, turnId };
+}
+
 export async function completeRuntimeTurnFromEvent(event) {
   const config = loadConfig();
   const state = loadState(config);
@@ -4702,7 +4758,10 @@ export async function completeRuntimeTurnFromEvent(event) {
     if (turnId && String(entry.turnId || "").trim() === turnId) {
       return true;
     }
-    return !entry.turnId && threadId && String(entry.threadId || "").trim() === threadId;
+    return !entry.turnId
+      && String(entry.inputTransport || "").trim() !== "tui_composer"
+      && threadId
+      && String(entry.threadId || "").trim() === threadId;
   });
 
   if (!pending) {

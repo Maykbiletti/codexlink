@@ -27,7 +27,7 @@ const server = new Server(
   },
   {
     capabilities: { tools: {} },
-    instructions: "CodexLink's durable runtime queue is authoritative. Never bypass it with console injection, hidden Codex sessions, or turn/steer for ordinary inbound work. Telegram intake is persisted by the runtime daemon and the oldest eligible item is dispatched with turn/start only when the bound thread is idle; explicit escalations may move ahead but never interrupt a turn. Use status and queue tools for inspection; use write tools only when the user explicitly requests that action."
+    instructions: "CodexLink's durable runtime queue is authoritative. Never create hidden Codex sessions or call turn/start or turn/steer for ordinary inbound work. Telegram intake is persisted by the runtime daemon, then submitted through the visible Codex TUI composer with the same Enter path as local CLI input. The TUI owns active-turn queueing; the app-server connection is used for lifecycle events, reply correlation, and approvals. Use status and queue tools for inspection; use write tools only when the user explicitly requests that action."
   }
 );
 
