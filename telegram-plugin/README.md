@@ -9,11 +9,12 @@ create a shadow Codex session.
 The runtime daemon owns the durable queue and all transport loops:
 
 1. an allowed Telegram update is normalized and persisted in `state.json`
-2. the dispatcher claims the oldest eligible item
-3. the daemon writes it into the visible Codex TUI composer and submits it with
+2. while a turn is active, every later item remains in the durable CodexLink
+   queue and cannot enter the composer as steering input
+3. after `turn/completed` and an authoritative `idle` status, the dispatcher
+   atomically claims exactly the oldest eligible item
+4. the daemon writes it into the visible Codex TUI composer and submits it with
    the same `Enter` path as direct CLI input
-4. while a turn is active, the Codex TUI owns the pending-input behavior and
-   displays the message in its normal runtime queue
 5. app-server user-message, `item/completed`, and `turn/completed` events bind
    the queued item to its turn, complete the queue
    item and route the final answer back to Telegram
@@ -28,7 +29,9 @@ second queue.
 
 The daemon keeps a persistent app-server connection for lifecycle events,
 reply correlation, and approvals. A small queue-id marker in the submitted user
-message prevents a manual CLI turn from being mistaken for a Telegram turn.
+message prevents a manual CLI turn from being mistaken for a Telegram turn. An
+atomic composer claim keeps the next FIFO item locked until that marked turn has
+completed and the thread is idle again.
 
 Queue lifecycle:
 

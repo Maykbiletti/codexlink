@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ import {
 } from "../telegram-plugin/lib/bridge.js";
 import { setRuntimeComposerInjector, setRuntimeTurnStarter } from "../telegram-plugin/lib/codex.js";
 
-test("runtime queue submits consecutive messages through the visible composer even while a turn is active", async (t) => {
+test("runtime queue keeps visible-composer delivery strict FIFO until completion and idle", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "codexlink-runtime-dispatch-"));
   const previous = new Map();
   const values = {
@@ -49,7 +49,12 @@ test("runtime queue submits consecutive messages through the visible composer ev
 
   enqueueRuntimeMessage("first", { messageId: "1", noTelegramReply: false });
   enqueueRuntimeMessage("second", { messageId: "2", noTelegramReply: false });
-  const gate = {
+  const statePath = join(root, "state.json");
+  const reorderedByOldPriority = JSON.parse(readFileSync(statePath, "utf8"));
+  reorderedByOldPriority.queue[1].relevance = "escalation";
+  writeFileSync(statePath, `${JSON.stringify(reorderedByOldPriority, null, 2)}\n`, "utf8");
+
+  let gate = {
     ready: false,
     reason: "active_turn",
     threadStatus: "active",
@@ -60,24 +65,69 @@ test("runtime queue submits consecutive messages through the visible composer ev
     gateCalls += 1;
     return gate;
   };
+  let claimCalls = 0;
+  const runtimeDispatchClaim = async ({ queueItemId }) => {
+    claimCalls += 1;
+    if (!gate.ready) {
+      return gate;
+    }
+    gate = {
+      ready: false,
+      reason: "turn_completion_pending",
+      threadStatus: "active",
+      activeTurnId: "pending-turn-id",
+      queueItemId
+    };
+    return {
+      ready: true,
+      reason: "claimed",
+      threadStatus: "active",
+      activeTurnId: "pending-turn-id",
+      queueItemId
+    };
+  };
+  const runtimeDispatchSettled = async ({ result }) => {
+    if (!result.ok) {
+      gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
+    }
+  };
+  const dispatchOptions = {
+    auto: true,
+    runtimeDispatchGate,
+    runtimeDispatchClaim,
+    runtimeDispatchSettled
+  };
 
-  const firstResult = await injectNext("thread-1", { auto: true, runtimeDispatchGate });
+  const blockedByActiveTurn = await injectNext("thread-1", dispatchOptions);
+  assert.equal(blockedByActiveTurn.status, "deferred");
+  assert.equal(blockedByActiveTurn.reason, "runtime_active_turn");
+  assert.deepEqual(composerSubmissions, []);
+
+  gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
+  const blockedWithoutAtomicLock = await injectNext("thread-1", {
+    auto: true,
+    runtimeDispatchGate
+  });
+  assert.equal(blockedWithoutAtomicLock.status, "deferred");
+  assert.equal(blockedWithoutAtomicLock.reason, "runtime_composer_lock_unavailable");
+  assert.deepEqual(composerSubmissions, []);
+
+  const firstResult = await injectNext("thread-1", dispatchOptions);
   assert.equal(firstResult.status, "submitted");
   assert.equal(firstResult.message.messageId, "1");
-  const secondResult = await injectNext("thread-1", { auto: true, runtimeDispatchGate });
-  assert.equal(secondResult.status, "submitted");
-  assert.equal(secondResult.message.messageId, "2");
+  const blockedUntilCompletion = await injectNext("thread-1", dispatchOptions);
+  assert.equal(blockedUntilCompletion.status, "deferred");
+  assert.equal(blockedUntilCompletion.reason, "runtime_turn_completion_pending");
 
-  assert.equal(gateCalls, 0);
   assert.deepEqual(composerSubmissions, [
-    { id: "runtime:1", threadId: "thread-1" },
-    { id: "runtime:2", threadId: "thread-1" }
+    { id: "runtime:1", threadId: "thread-1" }
   ]);
-  let state = JSON.parse(readFileSync(join(root, "state.json"), "utf8"));
-  assert.deepEqual(state.queue.map((item) => item.status), ["submitted", "submitted"]);
-  assert.deepEqual(state.queue.map((item) => item.inputTransport), ["tui_composer", "tui_composer"]);
-  assert.equal(state.pendingReplies.length, 2);
-  assert.deepEqual(state.pendingReplies.map((item) => item.turnId), ["", ""]);
+  let state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.deepEqual(state.queue.map((item) => item.status), ["submitted", "queued"]);
+  assert.equal(state.queue[0].inputTransport, "tui_composer");
+  assert.equal(state.queue[1].inputTransport, undefined);
+  assert.equal(state.pendingReplies.length, 1);
+  assert.equal(state.pendingReplies[0].turnId, "");
 
   const manualCompletion = await completeRuntimeTurnFromEvent({
     threadId: "thread-1",
@@ -97,5 +147,28 @@ test("runtime queue submits consecutive messages through the visible composer ev
   assert.equal(state.queue[0].status, "running");
   assert.equal(state.queue[0].turnId, "turn-telegram-1");
   assert.equal(state.pendingReplies[0].turnId, "turn-telegram-1");
-  assert.equal(state.pendingReplies[1].turnId, "");
+
+  const completed = await completeRuntimeTurnFromEvent({
+    threadId: "thread-1",
+    turnId: "turn-telegram-1",
+    status: "completed",
+    finalText: ""
+  });
+  assert.equal(completed.matched, true);
+  gate = { ready: false, reason: "status_unknown", threadStatus: "unknown", activeTurnId: "" };
+  const blockedUntilIdle = await injectNext("thread-1", dispatchOptions);
+  assert.equal(blockedUntilIdle.status, "deferred");
+  assert.equal(blockedUntilIdle.reason, "runtime_status_unknown");
+  assert.equal(composerSubmissions.length, 1);
+
+  gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
+  const secondResult = await injectNext("thread-1", dispatchOptions);
+  assert.equal(secondResult.status, "submitted");
+  assert.equal(secondResult.message.messageId, "2");
+  assert.deepEqual(composerSubmissions, [
+    { id: "runtime:1", threadId: "thread-1" },
+    { id: "runtime:2", threadId: "thread-1" }
+  ]);
+  assert.equal(gateCalls, 6);
+  assert.equal(claimCalls, 2);
 });

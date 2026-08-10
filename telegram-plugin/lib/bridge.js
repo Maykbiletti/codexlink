@@ -3570,26 +3570,7 @@ export function listQueue(limit = 10) {
   return state.queue.slice(-Math.max(1, limit));
 }
 
-function getQueuedDispatchPriority(item) {
-  if (!item || item.status !== "queued") {
-    return Number.MAX_SAFE_INTEGER;
-  }
-  const relevance = String(item.relevance || "").toLowerCase();
-  const chatType = String(item.chatType || "").toLowerCase();
-  if (relevance === "escalation") {
-    return 0;
-  }
-  if (chatType === "private" || relevance === "direct" || relevance === "lane") {
-    return 2;
-  }
-  return 3;
-}
-
 function compareQueuedDispatchOrder(left, right) {
-  const priorityDiff = getQueuedDispatchPriority(left) - getQueuedDispatchPriority(right);
-  if (priorityDiff !== 0) {
-    return priorityDiff;
-  }
   const leftTs = String(left?.ts || "");
   const rightTs = String(right?.ts || "");
   if (leftTs !== rightTs) {
@@ -3918,11 +3899,9 @@ export async function injectNext(threadId, options = {}) {
   const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
   const useTuiComposerQueue = auto && useAppServer && usesTuiComposerTransport(config);
-  const useRuntimeTurnQueue = auto
-    && useAppServer
-    && !useTuiComposerQueue
-    && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy";
-  const useManagedRuntimeInput = useTuiComposerQueue || useRuntimeTurnQueue;
+  const useRuntimeTurnQueue = auto && useAppServer && !useTuiComposerQueue;
+  const useStrictRuntimeQueue = useTuiComposerQueue || useRuntimeTurnQueue;
+  const useManagedRuntimeInput = useStrictRuntimeQueue;
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
     return {
@@ -4025,6 +4004,12 @@ export async function injectNext(threadId, options = {}) {
   const runtimeDispatchGate = typeof options.runtimeDispatchGate === "function"
     ? options.runtimeDispatchGate
     : null;
+  const runtimeDispatchClaim = typeof options.runtimeDispatchClaim === "function"
+    ? options.runtimeDispatchClaim
+    : null;
+  const runtimeDispatchSettled = typeof options.runtimeDispatchSettled === "function"
+    ? options.runtimeDispatchSettled
+    : null;
   let resolvedThreadId = runtimeDispatchGate && preferredThreadId
     ? preferredThreadId
     : await resolveActiveThreadId(config, state, preferredThreadId, {
@@ -4082,8 +4067,8 @@ export async function injectNext(threadId, options = {}) {
       }
     }
   }
-  if (useRuntimeTurnQueue) {
-    appendLog(config.paths.activityFile, `RUNTIME_TURN_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
+  if (useStrictRuntimeQueue) {
+    appendLog(config.paths.activityFile, `RUNTIME_FIFO_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
     const dispatchState = await resolveRuntimeDispatchState(config, resolvedThreadId, runtimeDispatchGate);
     if (!dispatchState.ready) {
       const checkedAt = nowIso();
@@ -4137,6 +4122,81 @@ export async function injectNext(threadId, options = {}) {
     saveStateForConfig(config, state);
   }
 
+  let composerDispatchClaimed = false;
+  if (useTuiComposerQueue) {
+    let claimState = {
+      ready: false,
+      reason: "composer_lock_unavailable",
+      activeTurnId: "",
+      threadStatus: "unknown"
+    };
+    if (runtimeDispatchClaim) {
+      try {
+        claimState = await runtimeDispatchClaim({
+          threadId: resolvedThreadId,
+          queueItemId: String(next.id || "").trim()
+        });
+      } catch {
+        claimState = {
+          ready: false,
+          reason: "composer_lock_unavailable",
+          activeTurnId: "",
+          threadStatus: "unknown"
+        };
+      }
+    }
+    if (claimState?.ready !== true) {
+      const checkedAt = nowIso();
+      next.status = "queued";
+      next.lastAttemptAt = checkedAt;
+      next.retryAfterAt = null;
+      next.activeTurnId = String(claimState?.activeTurnId || "").trim() || null;
+      next.responsePreview = `waiting_for_${claimState?.reason || "composer_lock_unavailable"}`;
+      markMatchingQueueEntriesInPlace(state, next, {
+        status: next.status,
+        lastAttemptAt: next.lastAttemptAt,
+        retryAfterAt: null,
+        activeTurnId: next.activeTurnId,
+        responsePreview: next.responsePreview
+      });
+      appendLog(config.paths.activityFile, `RUNTIME_COMPOSER_CLAIM_DEFER message=${next.messageId} reason=${claimState?.reason || "composer_lock_unavailable"}`);
+      const latestState = loadState(config);
+      markMatchingQueueEntriesInPlace(latestState, next, {
+        status: next.status,
+        lastAttemptAt: next.lastAttemptAt,
+        retryAfterAt: null,
+        activeTurnId: next.activeTurnId,
+        responsePreview: next.responsePreview
+      });
+      saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+      return {
+        ok: false,
+        status: "deferred",
+        reason: `runtime_${claimState?.reason || "composer_lock_unavailable"}`,
+        activeTurnId: next.activeTurnId || "",
+        threadStatus: String(claimState?.threadStatus || "unknown"),
+        retryAfterAt: null,
+        message: next
+      };
+    }
+    composerDispatchClaimed = true;
+  }
+
+  const settleComposerDispatch = async (result) => {
+    if (!composerDispatchClaimed || !runtimeDispatchSettled) {
+      return;
+    }
+    try {
+      await runtimeDispatchSettled({
+        threadId: resolvedThreadId,
+        queueItemId: String(next.id || "").trim(),
+        result
+      });
+    } catch (error) {
+      appendLog(config.paths.activityFile, `RUNTIME_COMPOSER_SETTLE_ERROR message=${next.messageId} ${String(error?.message || error).replace(/\s+/g, " ").slice(0, 300)}`);
+    }
+  };
+
   next.attempts = Number(next.attempts || 0) + 1;
   next.lastAttemptAt = nowIso();
   next.status = "injecting";
@@ -4163,11 +4223,23 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `HISTORY_APPEND thread=${resolvedThreadId} message=${next.messageId}`);
     }
   }
-  saveStateForConfig(config, state);
+  try {
+    saveStateForConfig(config, state);
+  } catch (error) {
+    await settleComposerDispatch({ ok: false, busy: false, error });
+    throw error;
+  }
+
   appendLog(config.paths.activityFile, `INJECT_START thread=${resolvedThreadId} message=${next.messageId}`);
-  let result = await injectIntoThread(config, next, resolvedThreadId);
+  let result;
+  try {
+    result = await injectIntoThread(config, next, resolvedThreadId);
+  } catch (error) {
+    await settleComposerDispatch({ ok: false, busy: false, error });
+    throw error;
+  }
   const injectErrorText = `${result.responseText || ""}\n${result.stderr || ""}`;
-  if (useAppServer && !result.ok && /thread\s+not\s+found/i.test(injectErrorText)) {
+  if (useAppServer && !useTuiComposerQueue && !result.ok && /thread\s+not\s+found/i.test(injectErrorText)) {
     appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY old_thread=${resolvedThreadId} message=${next.messageId}`);
     const retryThreadId = await resolveActiveThreadId(config, state, "", {
       forcePreferred: false
@@ -4185,6 +4257,7 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY_SKIPPED thread=${resolvedThreadId} message=${next.messageId}`);
     }
   }
+  await settleComposerDispatch(result);
   if (result.busy) {
     const promotedThisAttempt = useAppServer ? false : promoteVisibleQueuedEntry(config, state, resolvedThreadId, next);
     const activeRetryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "750"), 10) || 750);

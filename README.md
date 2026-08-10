@@ -19,10 +19,10 @@ runtime queue is the source of truth, and MCP is the control plane.
 Telegram delivery is serial by default:
 
 - inbound messages land in a local queue first
-- active work is not interrupted immediately
+- active work is never interrupted by automatic delivery
 - queued messages wait until the visible thread has no active turn
 - ambient group noise stays queued until it is relevant or manually drained
-- escalation-style messages can still jump the line
+- eligible messages are submitted in strict FIFO order without priority jumps
 - stale pending replies time out automatically, so the queue cannot block forever
 
 ## Install
@@ -140,10 +140,12 @@ blun-codex telegram-plugin --print-only
 ## Queue Behavior
 
 Every allowed Telegram message is persisted before dispatch. The runtime daemon
-then writes it into the visible Codex TUI composer and submits it with the same
-`Enter` path as direct CLI input. While a turn is active, the installed Codex
-TUI owns the normal pending-input behavior and displays the message in its own
-runtime queue.
+keeps it in CodexLink's strict FIFO queue while any turn is active. Only after
+the matching `turn/completed` event and an authoritative `idle` thread status
+does the daemon write exactly one oldest eligible item into the visible Codex
+TUI composer and submit it with the same `Enter` path as direct CLI input. A
+later item never enters the composer early and therefore cannot become steering
+input for the running turn.
 
 Normal inbound work does not call app-server `turn/start`, `turn/steer`, or
 `codex exec resume`. The app-server API has no endpoint for the TUI's private
@@ -370,9 +372,9 @@ BLUN_TELEGRAM_DISPATCH_MODE=deferred
 
 Telegram messages are treated like normal app-server input. If the visible run
 is still active, the message stays in the local queue and is submitted after the
-current run. Normal `direct` messages and continue signals do not bypass this
-lock; escalation events may move ahead in the queue but do not interrupt an
-active turn.
+current run has completed and the thread is confirmed idle. Normal `direct`,
+continue, and escalation messages do not bypass this lock or overtake an older
+eligible item.
 
 The doctor checks whether `observe` mode and team relay are wired correctly and
 whether a configured HTTP relay endpoint is reachable.

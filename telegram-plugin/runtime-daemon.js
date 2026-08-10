@@ -54,7 +54,8 @@ function resolveBoundThreadId(current = loadConfig()) {
 async function dispatchRuntimeQueue(threadId = "", options = {}) {
   const current = loadConfig();
   const resolvedThreadId = String(threadId || resolveBoundThreadId(current)).trim();
-  if (eventBridge && usesTuiComposerTransport(current) && resolvedThreadId) {
+  const useTuiComposer = Boolean(eventBridge && usesTuiComposerTransport(current));
+  if (useTuiComposer && resolvedThreadId) {
     try {
       await eventBridge.ensureConnected(resolvedThreadId);
     } catch (error) {
@@ -68,8 +69,14 @@ async function dispatchRuntimeQueue(threadId = "", options = {}) {
   }
   return injectNext(resolvedThreadId, {
     ...options,
-    runtimeDispatchGate: eventBridge && !usesTuiComposerTransport(current)
+    runtimeDispatchGate: eventBridge
       ? (candidateThreadId) => eventBridge.checkDispatchReady(candidateThreadId)
+      : null,
+    runtimeDispatchClaim: useTuiComposer
+      ? ({ threadId: candidateThreadId, queueItemId }) => eventBridge.claimComposerDispatch(candidateThreadId, queueItemId)
+      : null,
+    runtimeDispatchSettled: useTuiComposer
+      ? ({ threadId: candidateThreadId, queueItemId, result }) => eventBridge.settleComposerDispatch(candidateThreadId, queueItemId, result)
       : null
   });
 }

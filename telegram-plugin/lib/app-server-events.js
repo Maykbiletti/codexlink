@@ -52,6 +52,7 @@ export class AppServerEventBridge {
     this.threadStatus = "unknown";
     this.activeTurnId = "";
     this.ownedTurnId = "";
+    this.ownedQueueItemId = "";
     this.awaitingTurnCompletion = false;
     this.dispatchInFlight = false;
     this.statusUpdatedAt = null;
@@ -85,6 +86,7 @@ export class AppServerEventBridge {
     this.threadStatus = "unknown";
     this.activeTurnId = "";
     this.ownedTurnId = "";
+    this.ownedQueueItemId = "";
     this.awaitingTurnCompletion = false;
     this.dispatchInFlight = false;
     if (previousClient) {
@@ -191,6 +193,7 @@ export class AppServerEventBridge {
       this.threadStatus = "active";
       this.activeTurnId = startedTurnId || "active";
       this.ownedTurnId = startedTurnId || "pending-turn-id";
+      this.ownedQueueItemId = "";
       this.awaitingTurnCompletion = true;
       this.statusUpdatedAt = nowIso();
       return result;
@@ -241,6 +244,69 @@ export class AppServerEventBridge {
     return this.getDispatchState(requestedThreadId);
   }
 
+  async claimComposerDispatch(threadId, queueItemId) {
+    const requestedThreadId = String(threadId || this.threadId || "").trim();
+    const requestedQueueItemId = String(queueItemId || "").trim();
+    if (!requestedQueueItemId) {
+      return {
+        ready: false,
+        reason: "queue_item_unbound",
+        threadStatus: this.threadStatus,
+        activeTurnId: this.activeTurnId || ""
+      };
+    }
+    const dispatchState = await this.checkDispatchReady(requestedThreadId);
+    if (!dispatchState.ready) {
+      return dispatchState;
+    }
+
+    this.dispatchInFlight = true;
+    this.ownedQueueItemId = requestedQueueItemId;
+    this.ownedTurnId = "pending-turn-id";
+    this.awaitingTurnCompletion = true;
+    this.threadStatus = "active";
+    this.activeTurnId = "pending-turn-id";
+    this.statusUpdatedAt = nowIso();
+    appendLog(
+      this.config.paths.activityFile,
+      `APP_COMPOSER_DISPATCH_CLAIMED thread=${requestedThreadId} queue=${requestedQueueItemId}`
+    );
+    return {
+      ready: true,
+      reason: "claimed",
+      threadId: requestedThreadId,
+      threadStatus: "active",
+      activeTurnId: "pending-turn-id",
+      queueItemId: requestedQueueItemId
+    };
+  }
+
+  settleComposerDispatch(threadId, queueItemId, result = {}) {
+    const requestedThreadId = String(threadId || "").trim();
+    const requestedQueueItemId = String(queueItemId || "").trim();
+    if (requestedThreadId !== this.threadId || requestedQueueItemId !== this.ownedQueueItemId) {
+      return { ok: true, matched: false };
+    }
+
+    this.dispatchInFlight = false;
+    const submitted = result?.ok === true && result?.busy !== true;
+    if (!submitted && this.ownedTurnId === "pending-turn-id") {
+      this.ownedTurnId = "";
+      this.ownedQueueItemId = "";
+      this.awaitingTurnCompletion = false;
+      if (this.activeTurnId === "pending-turn-id") {
+        this.activeTurnId = "";
+      }
+      this.threadStatus = "idle";
+      this.statusUpdatedAt = nowIso();
+    }
+    appendLog(
+      this.config.paths.activityFile,
+      `APP_COMPOSER_DISPATCH_SETTLED thread=${requestedThreadId} queue=${requestedQueueItemId} submitted=${submitted ? 1 : 0}`
+    );
+    return { ok: true, matched: true, submitted };
+  }
+
   getDispatchState(threadId = "") {
     const requestedThreadId = String(threadId || this.threadId || "").trim();
     const sameThread = Boolean(requestedThreadId && requestedThreadId === this.threadId);
@@ -265,6 +331,7 @@ export class AppServerEventBridge {
       threadStatus: sameThread ? this.threadStatus : "unknown",
       activeTurnId: sameThread ? (this.activeTurnId || this.ownedTurnId || "") : "",
       ownedTurnId: sameThread ? this.ownedTurnId : "",
+      ownedQueueItemId: sameThread ? this.ownedQueueItemId : "",
       awaitingTurnCompletion: sameThread ? this.awaitingTurnCompletion : false,
       dispatchInFlight: this.dispatchInFlight,
       statusUpdatedAt: this.statusUpdatedAt
@@ -325,6 +392,14 @@ export class AppServerEventBridge {
     if (method === "item/started" || method === "item/completed") {
       const item = message?.params?.item || {};
       const queueItemId = extractRuntimeQueueIdFromThreadItem(item);
+      if (queueItemId && turnId && queueItemId === this.ownedQueueItemId) {
+        this.ownedTurnId = turnId;
+        this.activeTurnId = turnId;
+        this.threadStatus = "active";
+        this.awaitingTurnCompletion = true;
+        this.dispatchInFlight = false;
+        this.statusUpdatedAt = nowIso();
+      }
       if (queueItemId && turnId && this.handlers.onUserMessageObserved) {
         await this.handlers.onUserMessageObserved({
           threadId,
@@ -357,6 +432,9 @@ export class AppServerEventBridge {
         ? turn.items.find((item) => item?.type === "userMessage")
         : null;
       const completedQueueItemId = extractRuntimeQueueIdFromThreadItem(completedUserItem);
+      if (completedQueueItemId && completedTurnId && completedQueueItemId === this.ownedQueueItemId) {
+        this.ownedTurnId = completedTurnId;
+      }
       if (completedQueueItemId && completedTurnId && this.handlers.onUserMessageObserved) {
         await this.handlers.onUserMessageObserved({
           threadId,
@@ -367,16 +445,24 @@ export class AppServerEventBridge {
         });
       }
       const trackedActiveTurnId = this.activeTurnId;
-      if (completedTurnId && this.ownedTurnId === completedTurnId) {
+      const completionMatchesOwnedTurn = Boolean(completedTurnId) && (
+        this.ownedTurnId === completedTurnId
+        || (
+          this.ownedTurnId === "pending-turn-id"
+          && (!this.ownedQueueItemId || completedQueueItemId === this.ownedQueueItemId)
+        )
+      );
+      if (completionMatchesOwnedTurn) {
         this.ownedTurnId = "";
-      }
-      if (completedTurnId && this.ownedTurnId === "pending-turn-id") {
-        this.ownedTurnId = "";
+        this.ownedQueueItemId = "";
       }
       if (completedTurnId && this.activeTurnId === completedTurnId) {
         this.activeTurnId = "";
       }
-      if (!trackedActiveTurnId || trackedActiveTurnId === "active" || trackedActiveTurnId === completedTurnId) {
+      const completionMatchesTrackedTurn = !trackedActiveTurnId
+        || trackedActiveTurnId === "active"
+        || trackedActiveTurnId === completedTurnId;
+      if (completionMatchesOwnedTurn || (!this.ownedTurnId && completionMatchesTrackedTurn)) {
         this.awaitingTurnCompletion = false;
       }
       if (this.threadStatus !== "idle") {
@@ -496,6 +582,7 @@ export class AppServerEventBridge {
     this.threadStatus = "unknown";
     this.activeTurnId = "";
     this.ownedTurnId = "";
+    this.ownedQueueItemId = "";
     this.awaitingTurnCompletion = false;
     this.dispatchInFlight = false;
   }

@@ -218,3 +218,69 @@ test("one started runtime turn locks dispatch until its matching completion and 
   });
   assert.equal(bridge.getDispatchState("thread-1").ready, true);
 });
+
+test("one composer submission owns the FIFO lock until its matching completion and idle", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  });
+  bridge.connected = true;
+  bridge.threadId = "thread-1";
+  bridge.threadStatus = "idle";
+  bridge.client = {};
+
+  const claimed = await bridge.claimComposerDispatch("thread-1", "runtime:1");
+  assert.equal(claimed.ready, true);
+  assert.equal(bridge.getDispatchState("thread-1").reason, "dispatch_in_flight");
+  bridge.settleComposerDispatch("thread-1", "runtime:1", { ok: true, queuedInComposer: true });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  await bridge._handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-runtime-1" } }
+  });
+  await bridge._handleNotification({
+    method: "item/started",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-runtime-1",
+      item: {
+        type: "userMessage",
+        content: [{
+          type: "text",
+          text: "first\n\n[CodexLink Queue ID: runtime:1]",
+          text_elements: []
+        }]
+      }
+    }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").ownedTurnId, "turn-runtime-1");
+
+  await bridge._handleNotification({
+    method: "thread/status/changed",
+    params: { threadId: "thread-1", status: { type: "idle" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  await bridge._handleNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "manual-cli-turn", status: "completed" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  await bridge._handleNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-runtime-1", status: "completed" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").ready, true);
+
+  const failedClaim = await bridge.claimComposerDispatch("thread-1", "runtime:2");
+  assert.equal(failedClaim.ready, true);
+  bridge.settleComposerDispatch("thread-1", "runtime:2", { ok: false });
+  assert.equal(bridge.getDispatchState("thread-1").ready, true);
+});
