@@ -2,16 +2,121 @@ import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from "node:crypto";
 import { basename, extname, join } from "node:path";
 import { getActiveTurnIdOverWs, listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
+import { diagnosticSmokeKind, isDiagnosticSmokeEntry } from "./diagnostic-smoke.js";
 import { loadConfig } from "./env.js";
 import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
-import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
+import { appendJsonl, appendLog, defaultState, loadJson, loadJsonStrict, nowIso, readTail, saveJson, saveJsonWithBackup } from "./storage.js";
 import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
 import { captureTelegramLive, logMnemoOutboundReceipt } from "./mnemo-policy.js";
 
+let lastStateRecoveryReportAt = 0;
+
+function normalizeRuntimeState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Runtime state must be a JSON object.");
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "offset")) {
+    throw new Error("Runtime state is missing its Telegram offset.");
+  }
+  const offset = Number(value.offset);
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new Error(`Runtime state has an invalid Telegram offset: ${value.offset}`);
+  }
+  for (const key of ["queue", "pendingReplies"]) {
+    if (value[key] !== undefined && !Array.isArray(value[key])) {
+      throw new Error(`Runtime state field ${key} must be an array.`);
+    }
+  }
+  for (const key of ["replyOffsets", "replyBuffers"]) {
+    if (value[key] !== undefined && (!value[key] || typeof value[key] !== "object" || Array.isArray(value[key]))) {
+      throw new Error(`Runtime state field ${key} must be an object.`);
+    }
+  }
+  const normalized = {
+    ...defaultState(),
+    ...value,
+    schemaVersion: 3,
+    offset,
+    queue: Array.isArray(value.queue) ? value.queue : [],
+    pendingReplies: Array.isArray(value.pendingReplies) ? value.pendingReplies : [],
+    replyOffsets: value.replyOffsets || {},
+    replyBuffers: value.replyBuffers || {},
+    intakeCursorInitialized: typeof value.intakeCursorInitialized === "boolean"
+      ? value.intakeCursorInitialized
+      : true
+  };
+  return scrubIdleBriefArtifactsInPlace(normalized);
+}
+
+function stateRecoveryMarkerPath(config) {
+  return config.paths.stateRecoveryFile || join(config.paths.root, "state-recovery-required.json");
+}
+
+function stateBackupPath(config) {
+  return config.paths.stateBackupFile || `${config.paths.stateFile}.bak`;
+}
+
+function clearStateRecoveryMarker(config) {
+  try { unlinkSync(stateRecoveryMarkerPath(config)); } catch {}
+}
+
+function reportStateRecoveryRequired(config, primaryError, backupError) {
+  const error = new Error(
+    `Runtime state recovery required; Telegram intake is stopped. Primary: ${compactError(primaryError)}. Backup: ${compactError(backupError)}`
+  );
+  error.code = "STATE_RECOVERY_REQUIRED";
+  error.primaryError = primaryError;
+  error.backupError = backupError;
+  const markerPath = stateRecoveryMarkerPath(config);
+  const existingMarker = existsSync(markerPath) ? loadJson(markerPath, null) : null;
+  const marker = {
+    version: 1,
+    status: "recovery_required",
+    intakeStopped: true,
+    detectedAt: existingMarker?.detectedAt || nowIso(),
+    lastDetectedAt: nowIso(),
+    stateFile: config.paths.stateFile,
+    backupFile: stateBackupPath(config),
+    primaryError: compactError(primaryError),
+    backupError: compactError(backupError)
+  };
+  if (!existingMarker || Date.now() - lastStateRecoveryReportAt >= 30000) {
+    try { saveJson(markerPath, marker); } catch {}
+    appendLog(config.paths.activityFile, `STATE_RECOVERY_REQUIRED intake=stopped primary=${marker.primaryError} backup=${marker.backupError}`);
+    lastStateRecoveryReportAt = Date.now();
+  }
+  throw error;
+}
+
 function loadState(config) {
-  const state = loadJson(config.paths.stateFile, defaultState());
-  return scrubIdleBriefArtifactsInPlace(state);
+  const backupFile = stateBackupPath(config);
+  if (!existsSync(config.paths.stateFile) && !existsSync(backupFile)) {
+    const state = defaultState();
+    saveJsonWithBackup(config.paths.stateFile, state, backupFile);
+    clearStateRecoveryMarker(config);
+    appendLog(config.paths.activityFile, "STATE_INITIALIZED intake_cursor=tail_pending");
+    return state;
+  }
+
+  let primaryError = null;
+  try {
+    const state = normalizeRuntimeState(loadJsonStrict(config.paths.stateFile));
+    clearStateRecoveryMarker(config);
+    return state;
+  } catch (error) {
+    primaryError = error;
+  }
+
+  try {
+    const recovered = normalizeRuntimeState(loadJsonStrict(backupFile));
+    saveJsonWithBackup(config.paths.stateFile, recovered, backupFile);
+    clearStateRecoveryMarker(config);
+    appendLog(config.paths.activityFile, `STATE_RECOVERED source=backup offset=${recovered.offset} primary_error=${compactError(primaryError)}`);
+    return recovered;
+  } catch (backupError) {
+    return reportStateRecoveryRequired(config, primaryError, backupError);
+  }
 }
 
 let mnemoOutboundRetryDrainScheduled = false;
@@ -227,7 +332,11 @@ function saveStateForConfig(config, state) {
   withStateLock(config, () => {
     const latestState = loadState(config);
     const mergedState = mergeStateSnapshots(latestState, state);
-    saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(mergedState));
+    saveJsonWithBackup(
+      config.paths.stateFile,
+      scrubIdleBriefArtifactsInPlace(mergedState),
+      stateBackupPath(config)
+    );
   });
 }
 
@@ -1559,9 +1668,7 @@ function looksLikeBotSender(entry) {
 }
 
 function isTransportSmokeEntry(entry) {
-  const scope = String(entry?.scope || "").trim().toLowerCase();
-  const sourceText = String(entry?.sourceText || entry?.text || "").trim().toLowerCase();
-  return scope === "transport-smoke" || sourceText.startsWith("[botdoctor smoke]");
+  return isDiagnosticSmokeEntry(entry);
 }
 
 function isTrustedBotSender(config, entry) {
@@ -3226,7 +3333,33 @@ export async function pollOnce() {
   if (parkedAmbientAtStart > 0) {
     appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbientAtStart}`);
   }
-  const startOffset = Number(state.offset || 0);
+  if (state.intakeCursorInitialized !== true) {
+    const pending = await getUpdates(config, -1);
+    const updateIds = (pending || [])
+      .map((update) => Number(update?.update_id))
+      .filter((value) => Number.isSafeInteger(value) && value >= 0);
+    const latestUpdateId = updateIds.length > 0 ? Math.max(...updateIds) : -1;
+    state.offset = latestUpdateId >= 0 ? latestUpdateId + 1 : 0;
+    state.intakeCursorInitialized = true;
+    state.intakeInitializedAt = nowIso();
+    state.lastPollAt = state.intakeInitializedAt;
+    saveStateForConfig(config, state);
+    appendLog(
+      config.paths.activityFile,
+      `INTAKE_TAIL_INITIALIZED next_offset=${state.offset} discarded_pending=${updateIds.length}`
+    );
+    return {
+      ok: true,
+      status: "tail_initialized",
+      startOffset: null,
+      nextOffset: state.offset,
+      captured: 0,
+      ignored: updateIds.length,
+      discardedPending: updateIds.length
+    };
+  }
+
+  const startOffset = Number(state.offset);
   const updates = await getUpdates(config, startOffset);
   let captured = 0;
   let ignored = 0;
@@ -3256,9 +3389,21 @@ export async function pollOnce() {
       continue;
     }
     const inbound = normalizeInbound(message, updateType);
+    inbound.updateId = String(update.update_id);
     if (!isAllowedChat(config, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} user=${inbound.userId || "-"} message=${inbound.messageId}`);
+      continue;
+    }
+    const diagnosticKind = diagnosticSmokeKind(inbound);
+    if (diagnosticKind) {
+      ignored += 1;
+      appendJsonl(config.paths.inboxFile, {
+        ...inbound,
+        status: "ignored_diagnostic_smoke",
+        diagnosticKind
+      });
+      appendLog(config.paths.activityFile, `DIAGNOSTIC_SMOKE_DROPPED kind=${diagnosticKind} chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
     if (String(inbound.chatType || "") === "private" && looksLikeMnemoIdleLoopBrief(inbound.text)) {
@@ -3345,6 +3490,23 @@ export async function consumeTeamRelayOnce() {
     }
     seenIds.add(eventId);
     consumedIds.push(eventId);
+
+    const diagnosticKind = diagnosticSmokeKind(event);
+    if (diagnosticKind) {
+      ignored += 1;
+      appendJsonl(config.paths.inboxFile, {
+        id: eventId,
+        source: "team-relay",
+        chatId: firstRelayText(event, "chatId", "chat_id"),
+        messageId: firstRelayText(event, "messageId", "message_id"),
+        text: String(event?.text || ""),
+        ts: String(event?.ts || "") || nowIso(),
+        status: "ignored_diagnostic_smoke",
+        diagnosticKind
+      });
+      appendLog(config.paths.activityFile, `TEAM_RELAY_DIAGNOSTIC_DROPPED kind=${diagnosticKind} id=${eventId}`);
+      continue;
+    }
 
     const inbound = normalizeTeamRelayInbound(config, state, event);
     if (!inbound) {

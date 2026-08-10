@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { loadJson, nowIso, saveJson } from "./storage.js";
 
 function boundedInteger(value, fallback, maximum) {
@@ -25,12 +26,18 @@ export class RuntimeController {
   }
 
   health() {
+    const recoveryFile = this.config.paths.stateRecoveryFile;
+    const stateRecovery = recoveryFile && existsSync(recoveryFile)
+      ? loadJson(recoveryFile, { status: "recovery_required", intakeStopped: true })
+      : null;
     return {
-      ok: true,
+      ok: !stateRecovery,
       pid: process.pid,
       startedAt: this.startedAt,
       lastTickAt: this.lastTickAt,
       paused: this.paused,
+      intakeStopped: Boolean(stateRecovery?.intakeStopped),
+      stateRecovery,
       appServerEvents: this.eventBridge?.status?.() || null
     };
   }
@@ -40,10 +47,23 @@ export class RuntimeController {
       case "runtime_health":
         return this.health();
       case "runtime_status":
-        return {
-          ...this.operations.status(),
-          runtime: this.health()
-        };
+        try {
+          return {
+            ...this.operations.status(),
+            runtime: this.health()
+          };
+        } catch (error) {
+          if (error?.code !== "STATE_RECOVERY_REQUIRED") {
+            throw error;
+          }
+          return {
+            ok: false,
+            status: "state_recovery_required",
+            intakeStopped: true,
+            error: String(error.message || error),
+            runtime: this.health()
+          };
+        }
       case "runtime_queue_list":
         return this.operations.listQueue(boundedInteger(params.limit, 20, 200));
       case "runtime_queue_enqueue":

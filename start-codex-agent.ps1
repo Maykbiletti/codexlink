@@ -257,10 +257,23 @@ function Write-TextFileWithRetry {
     [int]$DelayMs = 120
   )
   for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    $tempPath = $Path + "." + $PID + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
     try {
-      Set-Content -Path $Path -Value $Content -Encoding UTF8
+      $directory = [System.IO.Path]::GetDirectoryName($Path)
+      if ($directory -and -not [System.IO.Directory]::Exists($directory)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+      }
+      $encoding = New-Object System.Text.UTF8Encoding($false)
+      [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
+      if ([System.IO.File]::Exists($Path)) {
+        $backupPath = if ([System.IO.Path]::GetFileName($Path) -eq "state.json") { $Path + ".bak" } else { $null }
+        [System.IO.File]::Replace($tempPath, $Path, $backupPath, $true)
+      } else {
+        [System.IO.File]::Move($tempPath, $Path)
+      }
       return
     } catch {
+      try { [System.IO.File]::Delete($tempPath) } catch {}
       if ($attempt -eq $Attempts) { throw }
       Start-Sleep -Milliseconds $DelayMs
     }

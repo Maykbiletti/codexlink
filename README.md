@@ -176,6 +176,12 @@ The bundled `codexlink_runtime` MCP server is intentionally thin. It talks to
 the persistent daemon over an authenticated localhost RPC endpoint and never
 owns a second queue.
 
+The runtime state is fail-closed. Atomic `state.json` writes maintain a valid
+`state.json.bak`; an empty or corrupt primary is recovered only from that
+backup. If neither file is valid, Telegram intake stops with
+`STATE_RECOVERY_REQUIRED` instead of restarting from offset `0`. Fresh installs
+initialize at the Telegram tail so pending history is not replayed.
+
 CodexLink also restricts its app-server WebSocket client to loopback endpoints.
 The app-server WebSocket transport is currently experimental, so this package
 targets local operator workflows rather than unauthenticated remote exposure.
@@ -208,9 +214,10 @@ For broad group intake:
 BLUN_TELEGRAM_GROUP_DELIVERY=all
 ```
 
-In `all` mode, the runtime daemon accepts every message from allowed chats, regardless
-of whether the sender is human or bot. `message.from.is_bot` is stored as
-metadata and is not filtered at receive time.
+In `all` mode, the runtime daemon accepts normal messages from allowed chats,
+regardless of whether the sender is human or bot. Explicit Health Smoke,
+BotDoctor Smoke, and manual-test diagnostics are the exception: they are
+audited as ignored before Mnemo, queueing, or team relay.
 
 Useful settings for this mode:
 

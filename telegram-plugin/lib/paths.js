@@ -22,6 +22,8 @@ export function getPaths() {
     sessionsDir: join(codexHome, "sessions"),
     envFile: join(root, ".env"),
     stateFile: join(root, "state.json"),
+    stateBackupFile: join(root, "state.json.bak"),
+    stateRecoveryFile: join(root, "state-recovery-required.json"),
     runtimeControlFile: join(root, "runtime-control.json"),
     runtimeEndpointFile: join(root, "runtime-endpoint.json"),
     runtimeEventsFile: join(root, "runtime-events.jsonl"),

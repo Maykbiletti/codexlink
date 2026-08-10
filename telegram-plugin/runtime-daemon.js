@@ -26,6 +26,8 @@ ensureStateLayout();
 const config = loadConfig();
 let stopping = false;
 let rpc = null;
+let stateRecoveryBlocked = false;
+let nextStateRecoveryProbeAt = 0;
 
 const eventBridge = config.appServerWsUrl
   ? new AppServerEventBridge(config, {
@@ -66,6 +68,13 @@ function runExclusive(name, operation) {
   const task = Promise.resolve()
     .then(operation)
     .catch((error) => {
+      if (error?.code === "STATE_RECOVERY_REQUIRED") {
+        if (!stateRecoveryBlocked) {
+          appendLog(config.paths.activityFile, "RUNTIME_STATE_BLOCKED intake=stopped reason=state_recovery_required");
+        }
+        stateRecoveryBlocked = true;
+        return null;
+      }
       appendLog(config.paths.activityFile, `RUNTIME_${name.toUpperCase()}_ERROR ${String(error?.message || error).replace(/\s+/g, " ").slice(0, 500)}`);
       return null;
     })
@@ -89,6 +98,18 @@ async function tick() {
   const now = Date.now();
   controller.lastTickAt = nowIso();
   const current = loadConfig();
+
+  if (stateRecoveryBlocked) {
+    if (now >= nextStateRecoveryProbeAt) {
+      nextStateRecoveryProbeAt = now + 5000;
+      void runExclusive("state_recovery_probe", () => {
+        bridgeStatus();
+        stateRecoveryBlocked = false;
+        appendLog(config.paths.activityFile, "RUNTIME_STATE_RECOVERED operations=resumed");
+      });
+    }
+    return;
+  }
 
   if (now >= schedule.poll && current.botToken && current.allowedChatIds.length > 0) {
     schedule.poll = now + Math.max(250, current.pollIntervalMs);

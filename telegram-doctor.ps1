@@ -6,6 +6,25 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Write-StateJsonAtomic {
+  param(
+    [string]$Path,
+    [object]$Value
+  )
+  $tempPath = $Path + "." + $PID + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+  try {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tempPath, ($Value | ConvertTo-Json -Depth 10), $encoding)
+    if ([System.IO.File]::Exists($Path)) {
+      [System.IO.File]::Replace($tempPath, $Path, ($Path + ".bak"), $true)
+    } else {
+      [System.IO.File]::Move($tempPath, $Path)
+    }
+  } finally {
+    try { [System.IO.File]::Delete($tempPath) } catch {}
+  }
+}
+
 function Read-DotEnvFile {
   param([string]$Path)
   $values = @{}
@@ -300,7 +319,7 @@ function Invoke-RuntimeFix {
       } else {
         $state | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue ""
       }
-      $state | ConvertTo-Json -Depth 10 | Set-Content -Path $stateFile -Encoding UTF8
+      Write-StateJsonAtomic -Path $stateFile -Value $state
       $actions.Add("cleared_state_thread") | Out-Null
     } catch {
       $actions.Add("state_thread_clear_failed") | Out-Null
@@ -403,6 +422,30 @@ if (Test-AllowedChatIdsFormat -Value $activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
   $allowedChatSource = "legacy env fallback legacy key"
 }
 Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "fail" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No allowlist set. Telegram intake is disabled until pairing succeeds." })
+
+$stateGateStatus = if ($status.state_recovery_required) {
+  "fail"
+} elseif ($status.state_valid) {
+  "ok"
+} elseif ($status.state_backup_valid) {
+  "warn"
+} elseif (-not $status.state_file_exists) {
+  "warn"
+} else {
+  "fail"
+}
+$stateGateDetail = if ($status.state_recovery_required) {
+  "State recovery is required; Telegram intake is stopped. Restore state.json.bak or a known-good state before resuming."
+} elseif ($status.state_valid) {
+  "state.json valid; backup_valid=" + [string]$status.state_backup_valid
+} elseif ($status.state_backup_valid) {
+  "state.json invalid, but a valid backup exists and will be recovered by the runtime daemon."
+} elseif (-not $status.state_file_exists) {
+  "No state yet. First intake will initialize at the Telegram tail without replaying pending history."
+} else {
+  "state.json is invalid and no valid backup is available; intake must remain stopped."
+}
+Add-Check -List $checks -Name "state_recovery_gate" -Status $stateGateStatus -Detail $stateGateDetail
 
 $wsReachabilityKnown = $null -ne $status.active_ws_reachable
 $wsReachable = -not $wsReachabilityKnown -or [bool]$status.active_ws_reachable

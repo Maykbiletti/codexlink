@@ -56,6 +56,9 @@ Important files:
 
 - `.env`: local transport configuration
 - `state.json`: authoritative queue and delivery state
+- `state.json.bak`: last valid atomic state backup
+- `state-recovery-required.json`: fail-closed recovery marker; while present,
+  Telegram intake is stopped
 - `inbox.jsonl` and `outbox.jsonl`: append-only transport history
 - `runtime-events.jsonl`: app-server notification history
 - `runtime-control.json`: persisted pause state
@@ -67,6 +70,18 @@ Important files:
 The RPC endpoint binds only to `127.0.0.1`. Its random bearer token is written
 with owner-only POSIX permissions where the filesystem supports them. The Codex
 app-server WebSocket endpoint is also restricted to loopback addresses.
+
+State writes use temporary files plus atomic replacement; there is no direct
+Windows truncate fallback. If `state.json` is empty or invalid, the daemon
+recovers only from a valid `state.json.bak`. If both are invalid, it reports
+`STATE_RECOVERY_REQUIRED` and does not call Telegram with offset `0`. A genuinely
+new installation initializes once at the Telegram tail and discards pending
+history before normal intake begins.
+
+Messages explicitly tagged `[Health Smoke]`, `[BotDoctor Smoke]`, `manualtest`,
+or with a diagnostic smoke scope are recorded as
+`ignored_diagnostic_smoke`. They are rejected before Mnemo capture, queueing,
+and team-relay publication.
 
 ## Required configuration
 

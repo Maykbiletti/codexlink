@@ -1,5 +1,6 @@
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { dirname } from "node:path";
+import { diagnosticSmokeKind } from "./diagnostic-smoke.js";
 import { appendJsonl, appendLog, loadJson, nowIso, saveJson } from "./storage.js";
 
 function normalizeMode(value) {
@@ -194,6 +195,12 @@ async function readRelayUrlDelta(config, after) {
 export async function publishTeamRelayEvent(config, event) {
   if (!teamRelayPublishes(config)) {
     return { ok: true, published: false, reason: "disabled" };
+  }
+
+  const diagnosticKind = diagnosticSmokeKind(event);
+  if (diagnosticKind) {
+    appendLog(config.paths.activityFile, `TEAM_RELAY_DIAGNOSTIC_DROPPED kind=${diagnosticKind} message=${relayField(event, "messageId", "message_id") || "-"}`);
+    return { ok: true, published: false, reason: "diagnostic_smoke", diagnosticKind };
   }
 
   const relayEvent = normalizeRelayEvent(config, event);
