@@ -10,7 +10,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check telegram-plugin/runtime-daemon.js && node --check telegram-plugin/server.js && node --test"
+    "check": "node --check telegram-plugin/runtime-daemon.js && node --check telegram-plugin/telegram-doctor-daemon.js && node --check telegram-plugin/telegram-doctor-cli.js && node --check telegram-plugin/server.js && node --test"
   },
   "files": [
     "bin/",

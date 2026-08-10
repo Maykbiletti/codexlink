@@ -166,9 +166,50 @@ export class AppServerEventBridge {
           completedAt: nowIso(),
           recovered: true
         });
+        const recoveredTurnId = String(turn.id || "").trim();
+        const matchesOwnedTurn = Boolean(recoveredTurnId) && (
+          this.ownedTurnId === recoveredTurnId
+          || (
+            this.ownedTurnId === "pending-turn-id"
+            && queueItemId
+            && queueItemId === this.ownedQueueItemId
+          )
+        );
+        if (matchesOwnedTurn) {
+          this.ownedTurnId = "";
+          this.ownedQueueItemId = "";
+          this.awaitingTurnCompletion = false;
+          if (this.activeTurnId === recoveredTurnId || this.activeTurnId === "pending-turn-id") {
+            this.activeTurnId = "";
+          }
+          appendLog(
+            this.config.paths.activityFile,
+            `APP_EVENT_RECOVERED_OWNED_TURN thread=${threadId} turn=${recoveredTurnId} queue=${queueItemId || "-"}`
+          );
+        }
       }
     } catch (error) {
       appendLog(this.config.paths.activityFile, `APP_EVENT_RECOVERY_ERROR thread=${threadId} ${compactError(error)}`);
+    }
+  }
+
+  async reconcileThread(threadId = "") {
+    const requestedThreadId = String(threadId || this.threadId || "").trim();
+    if (!requestedThreadId) {
+      return { ok: false, reason: "thread_unbound" };
+    }
+    try {
+      const client = await this.ensureConnected(requestedThreadId);
+      await this._recoverCompletedTurns(client, requestedThreadId);
+      const state = this.getDispatchState(requestedThreadId);
+      appendLog(
+        this.config.paths.activityFile,
+        `APP_EVENT_RECONCILED thread=${requestedThreadId} reason=${state.reason} status=${state.threadStatus}`
+      );
+      return { ok: true, ...state };
+    } catch (error) {
+      appendLog(this.config.paths.activityFile, `APP_EVENT_RECONCILE_ERROR thread=${requestedThreadId} ${compactError(error)}`);
+      return { ok: false, reason: "event_stream_unavailable", error: compactError(error) };
     }
   }
 

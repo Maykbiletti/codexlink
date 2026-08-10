@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import {
   bindCurrentThread,
   bindRuntimeTurnFromUserMessage,
@@ -22,6 +22,8 @@ import { ensureStateLayout } from "./lib/paths.js";
 import { RuntimeController } from "./lib/runtime-controller.js";
 import { createRuntimeRpcServer } from "./lib/runtime-rpc.js";
 import { appendLog, nowIso } from "./lib/storage.js";
+import { ensureDoctorWatchdog, writeSidecarOwnership } from "./lib/sidecars.js";
+import { currentProcessInstanceId } from "./lib/state-lock.js";
 
 ensureStateLayout();
 const config = loadConfig();
@@ -124,7 +126,8 @@ const schedule = {
   dispatch: 0,
   replyRecovery: 0,
   teamRelay: 0,
-  eventStream: 0
+  eventStream: 0,
+  doctorWatch: Date.now() + 5000
 };
 
 async function tick() {
@@ -172,6 +175,15 @@ async function tick() {
     }
   }
 
+  if (current.doctorWatchEnabled && now >= schedule.doctorWatch) {
+    schedule.doctorWatch = now + Math.max(5000, current.doctorIntervalMs * 2);
+    try {
+      ensureDoctorWatchdog(current, { forceRestart: false });
+    } catch (error) {
+      appendLog(config.paths.activityFile, `TELEGRAM_DOCTOR_ENSURE_ERROR ${String(error?.message || error).replace(/\s+/g, " ").slice(0, 300)}`);
+    }
+  }
+
   if (now >= schedule.dispatch && !controller.paused && current.appServerWsUrl) {
     schedule.dispatch = now + Math.max(250, current.injectIntervalMs);
     void runExclusive("dispatch", () => dispatchRuntimeQueue("", { auto: true }));
@@ -191,6 +203,7 @@ async function shutdown(signal) {
   try {
     if (Number.parseInt(readFileSync(config.paths.runtimePidFile, "utf8").trim(), 10) === process.pid) {
       unlinkSync(config.paths.runtimePidFile);
+      try { unlinkSync(`${config.paths.runtimePidFile}.meta.json`); } catch {}
     }
   } catch {
     // A stale pid file is harmless; the sidecar manager validates liveness.
@@ -200,7 +213,15 @@ async function shutdown(signal) {
 process.on("SIGINT", () => void shutdown("SIGINT").finally(() => process.exit(0)));
 process.on("SIGTERM", () => void shutdown("SIGTERM").finally(() => process.exit(0)));
 
-writeFileSync(config.paths.runtimePidFile, `${process.pid}\n`, "utf8");
+writeSidecarOwnership(config.paths.runtimePidFile, {
+  pid: process.pid,
+  scriptName: "runtime-daemon.js",
+  agentName: config.agentName || "default",
+  stateDir: config.paths.root,
+  instanceId: currentProcessInstanceId(),
+  startedAt: nowIso(),
+  writtenBy: "runtime-daemon"
+});
 rpc = await createRuntimeRpcServer(config, (method, params) => controller.invoke(method, params));
 appendLog(config.paths.activityFile, `RUNTIME_START pid=${process.pid}`);
 

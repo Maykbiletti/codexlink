@@ -29,7 +29,8 @@ test("runtime daemon serves authenticated health without a Telegram token", asyn
       BLUN_TELEGRAM_BOT_TOKEN: "",
       BLUN_TELEGRAM_ALLOWED_CHAT_ID: "",
       BLUN_TELEGRAM_APP_SERVER_WS_URL: "",
-      BLUN_TELEGRAM_TEAM_RELAY_MODE: "off"
+      BLUN_TELEGRAM_TEAM_RELAY_MODE: "off",
+      BLUN_CODEXLINK_DOCTOR_WATCH: "0"
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -55,5 +56,6 @@ test("runtime daemon serves authenticated health without a Telegram token", asyn
   assert.equal(response.status, 200);
   assert.equal(payload.ok, true);
   assert.equal(payload.result.pid, child.pid);
+  assert.ok(payload.result.instanceId);
   assert.equal(payload.result.paused, false);
 });

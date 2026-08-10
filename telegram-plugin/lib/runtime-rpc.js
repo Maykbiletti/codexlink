@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { appendLog, loadJson, nowIso, saveJson } from "./storage.js";
+import { currentProcessInstanceId } from "./state-lock.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -97,6 +98,7 @@ export async function createRuntimeRpcServer(config, invoke, options = {}) {
   const endpoint = {
     version: 1,
     pid: process.pid,
+    instanceId: currentProcessInstanceId(),
     host,
     port: Number(address?.port || 0),
     token,

@@ -124,12 +124,28 @@ JSON doctor output:
 blun-codex telegram-doctor --json
 ```
 
-Repair stale runtime state and then restart Telegram mode:
+Apply safe, profile-scoped recovery without clearing the queue or thread
+binding:
 
 ```powershell
 blun-codex telegram-doctor --fix
-blun-codex telegram-plugin
 ```
+
+The automatic Telegram Doctor runs beside the runtime by default. It checks
+the state lock, PID ownership, authenticated runtime RPC, app-server event
+stream, and queue dispatch gate. It repairs only conditions with provable
+ownership: orphaned locks are renamed into quarantine, a healthy runtime's PID
+record is reconciled from its authenticated endpoint, and a dead daemon is
+restarted. Active locks and unverified processes are never killed.
+
+Doctor alerts are state-change based: one log entry when a condition breaks and
+one when it recovers, with no repeated healthy heartbeat noise. Use
+
+```powershell
+blun-codex telegram-doctor --deep-fix
+```
+
+only for the older explicit full runtime/thread reset.
 
 Dry run:
 
@@ -196,6 +212,11 @@ The runtime state is fail-closed. Atomic `state.json` writes maintain a valid
 backup. If neither file is valid, Telegram intake stops with
 `STATE_RECOVERY_REQUIRED` instead of restarting from offset `0`. Fresh installs
 initialize at the Telegram tail so pending history is not replayed.
+
+`state.json.lock` now contains its owner PID, process-instance id, acquisition
+time, and a bounded lease. A dead, expired, empty, or otherwise provably
+orphaned lock is atomically renamed to a `state.json.lock.stale-*` evidence file
+before intake continues. A live owner's lock is never removed.
 
 CodexLink also restricts its app-server WebSocket client to loopback endpoints.
 The app-server WebSocket transport is currently experimental, so this package
@@ -380,8 +401,12 @@ current run has completed and the thread is confirmed idle. Normal `direct`,
 continue, and escalation messages do not bypass this lock or overtake an older
 eligible item.
 
-The doctor checks whether `observe` mode and team relay are wired correctly and
-whether a configured HTTP relay endpoint is reachable.
+The doctor checks whether `observe` mode and team relay are wired correctly,
+whether a configured HTTP relay endpoint is reachable, whether Telegram intake
+is blocked by a stale state lock, whether daemon PID/RPC identity agrees, and
+whether an idle TUI is stuck behind a missed app-server completion. For the last
+case it reconciles through `thread/read` and releases the FIFO claim only when
+the persisted turn contains the matching CodexLink queue marker.
 
 When an agent does not see other bot messages, the decisive check is this: the
 message must appear in `activity.log`, `inbox.jsonl`, or the shared relay. If it
@@ -478,7 +503,7 @@ npm install -g github:Maykbiletti/codexlink
 blun-codex install --profile reviewer
 ```
 
-`install` runs setup, applies `telegram-doctor --fix`, prints the core health
+`install` runs setup, applies the safe `telegram-doctor --fix`, prints the core health
 checks, and starts Telegram mode. If a session is already open and you only want
 to repair the runtime without starting a new visible CLI window, run:
 
@@ -486,9 +511,10 @@ to repair the runtime without starting a new visible CLI window, run:
 blun-codex repair --profile reviewer
 ```
 
-This is the recommended support path before manual debugging. It fixes stale
-thread bindings, stale runtime files, secure relay defaults, and a stopped
-runtime daemon before asking the user to touch `.env` files or process lists.
+This is the recommended support path before manual debugging. It repairs stale
+state locks, reconciles daemon ownership, restarts a provably dead runtime,
+checks the event stream and queue gate, and preserves the existing queue and
+thread binding.
 
 ## What It Does
 

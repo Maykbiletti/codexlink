@@ -24,6 +24,7 @@ test("runtime RPC binds locally, authenticates, and returns results", async (t) 
   assert.equal(endpoint.host, "127.0.0.1");
   assert.ok(endpoint.port > 0);
   assert.ok(endpoint.token.length >= 32);
+  assert.ok(endpoint.instanceId);
   if (process.platform !== "win32") {
     assert.equal(statSync(config.paths.runtimeEndpointFile).mode & 0o777, 0o600);
   }

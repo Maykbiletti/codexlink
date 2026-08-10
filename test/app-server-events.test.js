@@ -284,3 +284,63 @@ test("one composer submission owns the FIFO lock until its matching completion a
   bridge.settleComposerDispatch("thread-1", "runtime:2", { ok: false });
   assert.equal(bridge.getDispatchState("thread-1").ready, true);
 });
+
+test("doctor reconciliation recovers a missed matching completion without releasing another turn", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-reconcile-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const observed = [];
+  const completed = [];
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  }, {
+    onUserMessageObserved: async (event) => observed.push(event),
+    onTurnCompleted: async (event) => {
+      completed.push(event);
+      return { matched: true };
+    }
+  });
+  bridge.connected = true;
+  bridge.threadId = "thread-1";
+  bridge.threadStatus = "idle";
+  bridge.client = {
+    request: async (method) => {
+      assert.equal(method, "thread/read");
+      return {
+        result: {
+          thread: {
+            status: { type: "idle" },
+            turns: [{
+              id: "turn-runtime-1",
+              status: "completed",
+              items: [
+                {
+                  type: "userMessage",
+                  content: [{ type: "text", text: "first\n\n[CodexLink Queue ID: runtime:1]" }]
+                },
+                { type: "agentMessage", phase: "final_answer", text: "Fertig." }
+              ]
+            }]
+          }
+        }
+      };
+    }
+  };
+
+  const claimed = await bridge.claimComposerDispatch("thread-1", "runtime:1");
+  assert.equal(claimed.ready, true);
+  bridge.settleComposerDispatch("thread-1", "runtime:1", { ok: true, queuedInComposer: true });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  const reconciled = await bridge.reconcileThread("thread-1");
+
+  assert.equal(reconciled.ok, true);
+  assert.equal(reconciled.ready, true);
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].queueItemId, "runtime:1");
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].turnId, "turn-runtime-1");
+});

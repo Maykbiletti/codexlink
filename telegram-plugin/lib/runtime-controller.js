@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { loadJson, nowIso, saveJson } from "./storage.js";
+import { currentProcessInstanceId, inspectStateLock } from "./state-lock.js";
 
 function boundedInteger(value, fallback, maximum) {
   const parsed = Number.parseInt(String(value ?? fallback), 10);
@@ -33,11 +34,15 @@ export class RuntimeController {
     return {
       ok: !stateRecovery,
       pid: process.pid,
+      instanceId: currentProcessInstanceId(),
+      profile: this.config.agentName || "default",
+      stateDir: this.config.paths.root,
       startedAt: this.startedAt,
       lastTickAt: this.lastTickAt,
       paused: this.paused,
       intakeStopped: Boolean(stateRecovery?.intakeStopped),
       stateRecovery,
+      stateLock: inspectStateLock(this.config.paths.stateFile),
       appServerEvents: this.eventBridge?.status?.() || null
     };
   }
@@ -109,6 +114,11 @@ export class RuntimeController {
         return { ok: true, paused: false };
       case "runtime_approvals_list":
         return this.eventBridge?.listApprovals?.() || [];
+      case "runtime_events_reconcile":
+        if (!this.eventBridge) {
+          return { ok: false, reason: "event_bridge_disabled" };
+        }
+        return this.eventBridge.reconcileThread(String(params.thread_id || ""));
       case "runtime_approval_decide":
         if (!this.eventBridge) {
           throw new Error("App-server event bridge is not connected.");

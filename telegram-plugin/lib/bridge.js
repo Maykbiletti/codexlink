@@ -9,6 +9,7 @@ import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessag
 import { appendJsonl, appendLog, defaultState, loadJson, loadJsonStrict, nowIso, readTail, saveJson, saveJsonWithBackup } from "./storage.js";
 import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
 import { captureTelegramLive, logMnemoOutboundReceipt } from "./mnemo-policy.js";
+import { withStateFileLock } from "./state-lock.js";
 
 let lastStateRecoveryReportAt = 0;
 
@@ -290,46 +291,8 @@ function scheduleMnemoOutboundRetryDrain(config) {
   }
 }
 
-function sleepStateLock(ms) {
-  const buffer = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
-}
-
-function withStateLock(config, callback) {
-  const lockPath = `${config.paths.stateFile}.lock`;
-  const deadline = Date.now() + 15000;
-  let descriptor = null;
-
-  while (descriptor === null) {
-    try {
-      descriptor = openSync(lockPath, "wx");
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(lockPath).mtimeMs > 60000) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for Telegram state lock: ${lockPath}`);
-      }
-      sleepStateLock(25);
-    }
-  }
-
-  try {
-    return callback();
-  } finally {
-    try { closeSync(descriptor); } catch {}
-    try { unlinkSync(lockPath); } catch {}
-  }
-}
-
 function saveStateForConfig(config, state) {
-  withStateLock(config, () => {
+  withStateFileLock(config, () => {
     const latestState = loadState(config);
     const mergedState = mergeStateSnapshots(latestState, state);
     saveJsonWithBackup(

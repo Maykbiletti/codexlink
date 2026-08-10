@@ -21,7 +21,8 @@ test("MCP server exposes the runtime control plane and reaches the daemon", asyn
       BLUN_TELEGRAM_BOT_TOKEN: "",
       BLUN_TELEGRAM_ALLOWED_CHAT_ID: "",
       BLUN_TELEGRAM_APP_SERVER_WS_URL: "",
-      BLUN_TELEGRAM_TEAM_RELAY_MODE: "off"
+      BLUN_TELEGRAM_TEAM_RELAY_MODE: "off",
+      BLUN_CODEXLINK_DOCTOR_WATCH: "0"
     },
     stderr: "pipe"
   });

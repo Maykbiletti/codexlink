@@ -1,4 +1,5 @@
-import { existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
@@ -23,12 +24,39 @@ function readPidMeta(pidFile) {
   }
 }
 
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function writePidMeta(pidFile, meta) {
   try {
-    writeFileSync(`${pidFile}.meta.json`, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+    writeAtomically(`${pidFile}.meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
   } catch {
     // Metadata is a safety aid; sidecar ownership still falls back to pid.
   }
+}
+
+function writeAtomically(path, content) {
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tempPath, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tempPath, path);
+  } finally {
+    try { unlinkSync(tempPath); } catch {}
+  }
+}
+
+export function writeSidecarOwnership(pidFile, meta) {
+  const pid = Number.parseInt(String(meta?.pid || "0"), 10) || 0;
+  if (!pid) {
+    throw new Error(`Cannot write sidecar ownership without a valid pid: ${pidFile}`);
+  }
+  writePidMeta(pidFile, meta);
+  writeAtomically(pidFile, `${pid}\n`);
 }
 
 function isPidAlive(pid) {
@@ -44,9 +72,27 @@ function isPidAlive(pid) {
 }
 
 function readProcessCommandLine(pid) {
-  if (!pid || pid <= 0 || process.platform !== "win32") {
+  if (!pid || pid <= 0) {
     return "";
   }
+  if (process.platform === "linux") {
+    try {
+      return readFileSync(`/proc/${Number(pid)}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    } catch {
+      return "";
+    }
+  }
+  if (process.platform === "darwin") {
+    try {
+      return String(execFileSync("ps", ["-p", String(Number(pid)), "-o", "command="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"]
+      })).trim();
+    } catch {
+      return "";
+    }
+  }
+  if (process.platform !== "win32") return "";
   try {
     return String(execFileSync("powershell.exe", [
       "-NoProfile",
@@ -120,10 +166,13 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     }
   }
 
+  const instanceId = randomUUID();
   const env = {
     ...process.env,
+    BLUN_CODEXLINK_PROCESS_INSTANCE_ID: instanceId,
     BLUN_TELEGRAM_AGENT_NAME: config.agentName || "default",
     BLUN_TELEGRAM_STATE_DIR: config.paths.root,
+    BLUN_CODEX_RUNTIME_DIR: config.paths.runtimeDir || "",
     BLUN_TELEGRAM_BOT_TOKEN: config.botToken || "",
     BLUN_TELEGRAM_ALLOWED_UPDATES: config.allowedUpdates || "",
     BLUN_TELEGRAM_ALLOWED_CHAT_ID: Array.isArray(config.allowedChatIds) ? config.allowedChatIds.join(",") : (config.allowedChatId || ""),
@@ -155,6 +204,11 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     BLUN_TELEGRAM_TEAM_RELAY_START: config.teamRelayStart || "tail",
     BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS: String(config.teamRelayTimeoutMs || 750),
     BLUN_TELEGRAM_PLUGIN_MODE: config.pluginMode || "plugin",
+    BLUN_CODEXLINK_DOCTOR_WATCH: config.doctorWatchEnabled === false ? "0" : "1",
+    BLUN_CODEXLINK_DOCTOR_AUTO_REPAIR: config.doctorAutoRepair === false ? "0" : "1",
+    BLUN_CODEXLINK_DOCTOR_INTERVAL_MS: String(config.doctorIntervalMs || 5000),
+    BLUN_CODEXLINK_DOCTOR_RPC_TIMEOUT_MS: String(config.doctorRpcTimeoutMs || 1500),
+    BLUN_CODEXLINK_DOCTOR_QUEUE_STALL_MS: String(config.doctorQueueStallMs || 60000),
     BLUN_CODEX_MODEL: config.model || "",
     BLUN_CODEX_REASONING_EFFORT: config.reasoningEffort || "",
     BLUN_CODEX_PERSONALITY: config.personality || ""
@@ -166,7 +220,7 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
 
   const child = spawn(
     process.execPath,
-    [join(pluginRoot, scriptName)],
+    [join(pluginRoot, scriptName), "--instance-id", instanceId],
     {
       cwd: pluginRoot,
       env,
@@ -180,15 +234,53 @@ function ensureSidecar(scriptName, pidFile, stdoutFile, stderrFile, config, opti
     }
   );
   child.unref();
-  writeFileSync(pidFile, `${child.pid}\n`, "utf8");
-  writePidMeta(pidFile, {
+  writeSidecarOwnership(pidFile, {
     pid: child.pid,
     scriptName,
     agentName: config.agentName || "default",
     stateDir: config.paths.root,
+    instanceId,
     startedAt: new Date().toISOString()
   });
   return { started: true, pid: child.pid, reason: "spawned" };
+}
+
+export function ensureRuntimeDaemon(config, options = {}) {
+  return ensureSidecar(
+    "runtime-daemon.js",
+    config.paths.runtimePidFile,
+    config.paths.runtimeStdoutFile,
+    config.paths.runtimeStderrFile,
+    config,
+    options
+  );
+}
+
+export function ensureDoctorWatchdog(config, options = {}) {
+  if (config.doctorWatchEnabled === false) {
+    return { started: false, pid: 0, reason: "doctor_watch_disabled" };
+  }
+  const doctorPid = readPid(config.paths.doctorPidFile);
+  const doctorMeta = readPidMeta(config.paths.doctorPidFile);
+  const doctorState = readJson(config.paths.doctorStateFile);
+  const thresholdMs = Math.max(15000, Number(config.doctorIntervalMs || 5000) * 3);
+  const startedAtMs = Date.parse(String(doctorMeta?.startedAt || ""));
+  const checkedAtMs = Date.parse(String(doctorState?.checkedAt || ""));
+  const pastStartupGrace = Number.isFinite(startedAtMs) && Date.now() - startedAtMs > thresholdMs;
+  const heartbeatStalled = isPidAlive(doctorPid)
+    && pastStartupGrace
+    && (!Number.isFinite(checkedAtMs) || Date.now() - checkedAtMs > thresholdMs);
+  if (heartbeatStalled) {
+    appendLog(config.paths.activityFile, `TELEGRAM_DOCTOR_HEARTBEAT_STALLED pid=${doctorPid} threshold_ms=${thresholdMs}`);
+  }
+  return ensureSidecar(
+    "telegram-doctor-daemon.js",
+    config.paths.doctorPidFile,
+    config.paths.doctorStdoutFile,
+    config.paths.doctorStderrFile,
+    config,
+    { ...options, forceRestart: Boolean(options.forceRestart) || heartbeatStalled }
+  );
 }
 
 export function ensureBackgroundSidecars(config, options = {}) {
@@ -211,14 +303,8 @@ export function ensureBackgroundSidecars(config, options = {}) {
     }
   }
 
-  const runtime = ensureSidecar(
-    "runtime-daemon.js",
-    config.paths.runtimePidFile,
-    config.paths.runtimeStdoutFile,
-    config.paths.runtimeStderrFile,
-    config,
-    { forceRestart: config.sidecarForceRestart }
-  );
+  const runtime = ensureRuntimeDaemon(config, { forceRestart: config.sidecarForceRestart });
+  const doctor = ensureDoctorWatchdog(config, { forceRestart: false });
   const disabled = { started: false, pid: 0, reason: "owned_by_runtime_daemon" };
   const poller = disabled;
   const dispatcher = disabled;
@@ -227,13 +313,14 @@ export function ensureBackgroundSidecars(config, options = {}) {
 
   appendLog(
     config.paths.activityFile,
-    `PLUGIN_AUTOSTART runtime=${runtime.pid || 0}:${runtime.reason} legacy_sidecars=disabled`
+    `PLUGIN_AUTOSTART runtime=${runtime.pid || 0}:${runtime.reason} doctor=${doctor.pid || 0}:${doctor.reason} legacy_sidecars=disabled`
   );
 
   return {
     ok: true,
     enabled: true,
     runtime,
+    doctor,
     poller,
     dispatcher,
     responder,

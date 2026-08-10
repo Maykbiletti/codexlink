@@ -47,6 +47,9 @@ does not stop Telegram intake.
 
 - `runtime-daemon.js` owns Telegram polling, FIFO dispatch, app-server events,
   reply routing, approval requests, and optional team-relay consumption
+- `telegram-doctor-daemon.js` watches the profile's state lock, daemon/RPC
+  identity, event stream, and queue gate and performs only ownership-safe
+  recovery
 - `server.js` exposes MCP tools and calls the daemon over authenticated
   localhost RPC
 - `team-relay-server.js` is optional and serves a shared authenticated HTTP
@@ -54,7 +57,8 @@ does not stop Telegram intake.
 
 The legacy `poller.js`, `dispatcher.js`, `responder.js`, and
 `team-relay-consumer.js` entry points remain only for compatibility. The
-sidecar manager stops owned legacy processes and starts one runtime daemon.
+sidecar manager stops owned legacy processes and starts one runtime daemon plus
+one profile-scoped Telegram Doctor watcher.
 
 ## State
 
@@ -76,6 +80,9 @@ Important files:
 - `runtime-control.json`: persisted pause state
 - `runtime-endpoint.json`: authenticated localhost RPC endpoint
 - `runtime-daemon.pid`: daemon ownership record
+- `telegram-doctor.pid`: automatic Doctor watcher ownership record
+- `telegram-doctor-state.json`: last health signature for one alert on failure
+  and one on recovery
 - `activity.log`: operational activity
 - `attachments/`: staged Telegram attachments
 
@@ -89,6 +96,19 @@ recovers only from a valid `state.json.bak`. If both are invalid, it reports
 `STATE_RECOVERY_REQUIRED` and does not call Telegram with offset `0`. A genuinely
 new installation initializes once at the Telegram tail and discards pending
 history before normal intake begins.
+
+State lock files are self-describing. `state.json.lock` records owner PID,
+process-instance id, acquisition time, and a bounded lease. The runtime and
+Doctor quarantine only locks whose owner is dead, whose lease is expired, or
+whose metadata is provably invalid. Quarantined locks remain as
+`state.json.lock.stale-*` evidence; an active owner's lock is never deleted.
+
+The Doctor also reconciles a stale PID record from the authenticated runtime
+endpoint instead of terminating the healthy process. If the daemon is provably
+dead, it starts a replacement with the same profile and state directory. If an
+idle thread is stuck behind a missed completion event, the Doctor uses
+`thread/read` and releases the FIFO lock only after finding the matching
+CodexLink queue marker in the persisted turn.
 
 Messages explicitly tagged `[Health Smoke]`, `[BotDoctor Smoke]`, `manualtest`,
 or with a diagnostic smoke scope are recorded as
@@ -120,6 +140,13 @@ Relevant optional values:
   an explicit compatibility mode and does not use the TUI pending-input queue
 - `BLUN_CODEXLINK_COMPOSER_SUBMIT_DELAY_MS`: minimum delay before the injected
   `Enter` key; useful for very slow Windows consoles
+- `BLUN_CODEXLINK_DOCTOR_WATCH`: `1` by default; set `0` only to disable the
+  automatic Doctor watcher
+- `BLUN_CODEXLINK_DOCTOR_AUTO_REPAIR`: `1` by default; set `0` for report-only
+  monitoring
+- `BLUN_CODEXLINK_DOCTOR_INTERVAL_MS`: watcher interval, `5000` by default
+- `BLUN_CODEXLINK_DOCTOR_QUEUE_STALL_MS`: age before an idle/unknown dispatch
+  gate is reported as stalled, `60000` by default
 
 The public profile uses `workspace-write` with `on-request` approvals. Mnemo
 sync and Telegram capture are off unless explicitly enabled.
