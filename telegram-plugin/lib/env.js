@@ -94,7 +94,7 @@ export function loadConfig() {
   const teamRelayFile = configuredTeamRelayFile && !samePath(configuredTeamRelayFile, legacyDefaultRelayFile)
     ? configuredTeamRelayFile
     : (teamRelayUrl ? "" : defaultRelayFile);
-  const teamRelayMode = env.BLUN_TELEGRAM_TEAM_RELAY_MODE?.trim().toLowerCase() || "both";
+  const teamRelayMode = env.BLUN_TELEGRAM_TEAM_RELAY_MODE?.trim().toLowerCase() || "off";
   const allowedChatIds = parseAllowedChatIds(env.BLUN_TELEGRAM_ALLOWED_CHAT_ID || env.TELEGRAM_ALLOWED_CHAT_ID || "");
   const mentionNames = parseMentionNames(
     env.BLUN_TELEGRAM_MENTION_NAMES
@@ -129,12 +129,14 @@ export function loadConfig() {
     mentionNames,
     otherAgentNames,
     trustedBotSenders,
-    codexBin: env.BLUN_TELEGRAM_CODEX_BIN?.trim() || "codex",
     appServerWsUrl: env.BLUN_TELEGRAM_APP_SERVER_WS_URL?.trim() || "",
     currentThreadId: env.BLUN_TELEGRAM_THREAD_ID?.trim() || process.env.CODEX_THREAD_ID?.trim() || "",
     resumeTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_RESUME_TIMEOUT_MS || "15000", 10) || 15000,
     pollIntervalMs: Number.parseInt(env.BLUN_TELEGRAM_POLL_INTERVAL_MS || "700", 10) || 700,
     injectIntervalMs: Number.parseInt(env.BLUN_TELEGRAM_INJECT_INTERVAL_MS || "700", 10) || 700,
+    runtimePort: Number.parseInt(env.BLUN_CODEXLINK_RUNTIME_PORT || "0", 10) || 0,
+    runtimeRpcTimeoutMs: Number.parseInt(env.BLUN_CODEXLINK_RUNTIME_RPC_TIMEOUT_MS || "65000", 10) || 65000,
+    runtimeOverloadBaseMs: Number.parseInt(env.BLUN_CODEXLINK_OVERLOAD_BASE_MS || "500", 10) || 500,
     getUpdatesTimeout: Number.parseInt(env.BLUN_TELEGRAM_GETUPDATES_TIMEOUT || "0", 10) || 0,
     activeTurnRetryMs: Number.parseInt(env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "750", 10) || 750,
     idleCooldownMs: Number.parseInt(env.BLUN_TELEGRAM_IDLE_COOLDOWN_MS || "3000", 10) || 3000,
@@ -152,17 +154,13 @@ export function loadConfig() {
     teamRelayPrivate: env.BLUN_TELEGRAM_TEAM_RELAY_PRIVATE?.trim() || "0",
     teamRelayStart: env.BLUN_TELEGRAM_TEAM_RELAY_START?.trim().toLowerCase() || "tail",
     teamRelayTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_TEAM_RELAY_TIMEOUT_MS || "750", 10) || 750,
-    visibleConsoleInject: env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT?.trim().toLowerCase() || "",
-    visibleConsoleSubmitDelayMs: Number.parseInt(env.BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_DELAY_MS || "260", 10) || 260,
-    visibleConsoleSubmitMaxDelayMs: Number.parseInt(env.BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_MAX_DELAY_MS || "12000", 10) || 12000,
-    visibleConsoleSkipAttachments: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_VISIBLE_CONSOLE_SKIP_ATTACHMENTS || ""),
     queueNoticeEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_TELEGRAM_QUEUE_NOTICE || ""),
     dispatchMode: env.BLUN_TELEGRAM_DISPATCH_MODE?.trim() || "deferred",
     groupDeliveryMode: parseGroupDeliveryMode(
       env.BLUN_TELEGRAM_GROUP_DELIVERY
       || env.TELEGRAM_GROUP_DELIVERY
       || env.BLUN_TELEGRAM_RELEVANCE_MODE
-      || "all"
+      || "observe"
     ),
     privateDmGroupGuard: !/^(0|false|no|off)$/i.test(String(env.BLUN_TELEGRAM_PRIVATE_DM_GROUP_GUARD || "1")),
     privateReplyMode: env.BLUN_TELEGRAM_PRIVATE_REPLY_MODE?.trim().toLowerCase() || "auto",
@@ -171,7 +169,7 @@ export function loadConfig() {
     model: env.BLUN_CODEX_MODEL?.trim() || "",
     reasoningEffort: env.BLUN_CODEX_REASONING_EFFORT?.trim() || "",
     personality: env.BLUN_CODEX_PERSONALITY?.trim() || "",
-    mnemoSyncEnabled: env.BLUN_MNEMO_SYNC_ENABLED !== "0",
+    mnemoSyncEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_MNEMO_SYNC_ENABLED || ""),
     mnemoHubUrl: env.BLUN_MNEMO_HUB_URL?.trim() || env.MNEMO_HUB_URL?.trim() || "https://listing.blun.ai/mnemo",
     mnemoProject: env.BLUN_MNEMO_PROJECT?.trim() || env.BLUN_PROJECT?.trim() || "",
     mnemoHardBlockInject: /^(1|true|yes|on)$/i.test(env.BLUN_MNEMO_HARD_BLOCK_INJECT || ""),
@@ -180,6 +178,6 @@ export function loadConfig() {
     mnemoPromptTimeoutMs: Number.parseInt(env.BLUN_MNEMO_PROMPT_TIMEOUT_MS || "0", 10) || 0,
     mnemoSyncTimeoutMs: Number.parseInt(env.BLUN_MNEMO_SYNC_TIMEOUT_MS || "15000", 10) || 15000,
     mnemoSyncRetryAttempts: Number.parseInt(env.BLUN_MNEMO_SYNC_RETRY_ATTEMPTS || "3", 10) || 3,
-    mnemoTelegramCaptureEnabled: !/^(0|false|no|off)$/i.test(env.BLUN_MNEMO_TELEGRAM_CAPTURE_ENABLED || "1")
+    mnemoTelegramCaptureEnabled: /^(1|true|yes|on)$/i.test(env.BLUN_MNEMO_TELEGRAM_CAPTURE_ENABLED || "")
   };
 }

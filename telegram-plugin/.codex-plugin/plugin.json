@@ -1,6 +1,6 @@
 {
-  "name": "codexlink-telegram",
-  "description": "BLUN Telegram bridge for one visible CLI session. Queues inbound messages, binds the live thread, and sends explicit replies without a shadow bot.",
-  "version": "0.1.0",
-  "keywords": ["blun", "telegram", "codexlink", "bridge", "mcp"]
+  "name": "codexlink-runtime",
+  "description": "Persistent CodexLink runtime with a durable FIFO queue, Telegram transport, app-server events, and an MCP control plane for one visible CLI thread.",
+  "version": "0.2.0",
+  "keywords": ["blun", "telegram", "codexlink", "runtime", "queue", "mcp"]
 }

@@ -1,7 +1,22 @@
+import WebSocket from "ws";
+
 function normalizeWsUrl(rawUrl) {
   const value = String(rawUrl || "").trim();
   if (!value) {
     throw new Error("App-server websocket URL is missing.");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("App-server websocket URL is invalid.");
+  }
+  if (!["ws:", "wss:"].includes(parsed.protocol)) {
+    throw new Error("App-server URL must use ws:// or wss://.");
+  }
+  const loopback = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+  if (!loopback.has(parsed.hostname.toLowerCase())) {
+    throw new Error("CodexLink app-server connections are restricted to localhost.");
   }
   return value;
 }
@@ -19,16 +34,12 @@ function parseJson(data) {
 
 function buildInitializeRequest(id) {
   return {
-    jsonrpc: "2.0",
     id,
     method: "initialize",
     params: {
       clientInfo: {
         name: "codexlink-telegram",
         version: "0.2.0"
-      },
-      capabilities: {
-        experimentalApi: true
       }
     }
   };
@@ -36,8 +47,8 @@ function buildInitializeRequest(id) {
 
 function buildInitializedNotification() {
   return {
-    jsonrpc: "2.0",
-    method: "initialized"
+    method: "initialized",
+    params: {}
   };
 }
 
@@ -55,10 +66,8 @@ function extractTurnId(response) {
     || "";
 }
 
-function extractActiveTurnId(turnsResponse) {
-  const turns = Array.isArray(turnsResponse?.result?.data) ? turnsResponse.result.data : [];
-  const active = turns.find((turn) => String(turn?.status || "").trim() === "inProgress");
-  return String(active?.id || "").trim();
+function isThreadActive(response) {
+  return String(response?.result?.thread?.status?.type || "").trim().toLowerCase() === "active";
 }
 
 function extractThreadPath(response) {
@@ -93,6 +102,10 @@ function buildTextInput(text) {
   ];
 }
 
+function omitEmptyOverrides(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== null && entry !== undefined && entry !== ""));
+}
+
 export class AppServerClient {
   constructor(wsUrl, options = {}) {
     this.wsUrl = normalizeWsUrl(wsUrl);
@@ -101,6 +114,9 @@ export class AppServerClient {
     this.pending = new Map();
     this.nextId = 1;
     this.connected = false;
+    this.onNotification = typeof options.onNotification === "function" ? options.onNotification : null;
+    this.onServerRequest = typeof options.onServerRequest === "function" ? options.onServerRequest : null;
+    this.onClose = typeof options.onClose === "function" ? options.onClose : null;
   }
 
   async connect() {
@@ -135,6 +151,21 @@ export class AppServerClient {
         return;
       }
 
+      if (message?.method && Object.prototype.hasOwnProperty.call(message, "id")) {
+        if (this.onServerRequest) {
+          Promise.resolve(this.onServerRequest(message, (result) => this.respond(message.id, result)))
+            .catch(() => {});
+        }
+        return;
+      }
+
+      if (message?.method) {
+        if (this.onNotification) {
+          Promise.resolve(this.onNotification(message)).catch(() => {});
+        }
+        return;
+      }
+
       if (message && Object.prototype.hasOwnProperty.call(message, "id")) {
         const key = String(message.id);
         const pending = this.pending.get(key);
@@ -161,6 +192,9 @@ export class AppServerClient {
         pending.reject(makeError("App-server websocket closed before request completed."));
         this.pending.delete(key);
       }
+      if (this.onClose) {
+        Promise.resolve(this.onClose()).catch(() => {});
+      }
     });
 
     const initId = String(this.nextId++);
@@ -179,7 +213,6 @@ export class AppServerClient {
     await this.connect();
     const id = String(this.nextId++);
     const payload = {
-      jsonrpc: "2.0",
       id,
       method,
       params
@@ -203,6 +236,36 @@ export class AppServerClient {
     this.socket = null;
   }
 
+  async respond(id, result) {
+    await this.connect();
+    await this._sendRaw({ id, result });
+  }
+
+  async resumeThread(threadId, options = {}) {
+    return this.request("thread/resume", {
+      threadId: String(threadId || "").trim()
+    }, options);
+  }
+
+  async startTurn(options) {
+    const input = Array.isArray(options.input) && options.input.length > 0
+      ? normalizeUserInput(options.input)
+      : buildTextInput(options.text);
+    const response = await this.request("turn/start", omitEmptyOverrides({
+      threadId: options.threadId,
+      input,
+      model: options.model || null,
+      effort: options.effort || null,
+      personality: options.personality || null
+    }), { timeoutMs: options.timeoutMs || this.timeoutMs });
+    return {
+      ok: true,
+      busy: false,
+      turnId: extractTurnId(response),
+      response
+    };
+  }
+
   async _sendRaw(payload) {
     const text = JSON.stringify(payload);
     this.socket.send(text);
@@ -224,7 +287,7 @@ export class AppServerClient {
 export async function startThreadOverWs(options) {
   const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
   try {
-    const response = await client.request("thread/start", {
+    const response = await client.request("thread/start", omitEmptyOverrides({
       cwd: options.cwd || null,
       model: options.model || null,
       sandbox: options.sandbox || null,
@@ -232,7 +295,7 @@ export async function startThreadOverWs(options) {
       personality: options.personality || null,
       threadSource: "user",
       sessionStartSource: "startup"
-    }, { timeoutMs: options.timeoutMs || 20000 });
+    }), { timeoutMs: options.timeoutMs || 20000 });
 
     const threadId = extractThreadId(response);
     if (!threadId) {
@@ -255,13 +318,13 @@ export async function startTextTurnOverWs(options) {
     const input = Array.isArray(options.input) && options.input.length > 0
       ? normalizeUserInput(options.input)
       : buildTextInput(options.text);
-    const response = await client.request("turn/start", {
+    const response = await client.request("turn/start", omitEmptyOverrides({
       threadId: options.threadId,
       input,
       model: options.model || null,
       effort: options.effort || null,
       personality: options.personality || null
-    }, { timeoutMs: options.timeoutMs || 20000 });
+    }), { timeoutMs: options.timeoutMs || 20000 });
 
     return {
       ok: true,
@@ -289,14 +352,13 @@ export async function startTextTurnOverWs(options) {
 export async function getActiveTurnIdOverWs(options) {
   const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 10000 });
   try {
-    const response = await client.request("thread/turns/list", {
+    const response = await client.request("thread/read", {
       threadId: options.threadId,
-      limit: options.limit || 8,
-      itemsView: "notLoaded"
+      includeTurns: false
     }, { timeoutMs: Math.min(options.timeoutMs || 10000, 5000) });
     return {
       ok: true,
-      activeTurnId: extractActiveTurnId(response),
+      activeTurnId: isThreadActive(response) ? "active" : "",
       response
     };
   } catch (error) {
@@ -319,33 +381,27 @@ export async function startQueuedTextTurnOverWs(options) {
 
     let activeTurnId = "";
     try {
-      const turnsResponse = await client.request("thread/turns/list", {
+      const statusResponse = await client.request("thread/read", {
         threadId: options.threadId,
-        limit: 8,
-        itemsView: "notLoaded"
+        includeTurns: false
       }, { timeoutMs: Math.min(options.timeoutMs || 20000, 5000) });
-      activeTurnId = extractActiveTurnId(turnsResponse);
+      activeTurnId = isThreadActive(statusResponse) ? "active" : "";
     } catch {
       activeTurnId = "";
     }
 
-    const response = await client.request("turn/start", {
+    const response = await client.request("turn/start", omitEmptyOverrides({
       threadId: options.threadId,
       input,
       model: options.model || null,
       effort: options.effort || null,
-      personality: options.personality || null,
-      responsesapiClientMetadata: {
-        source: "telegram",
-        delivery: "runtime_turn_queue"
-      }
-    }, { timeoutMs: options.timeoutMs || 20000 });
+      personality: options.personality || null
+    }), { timeoutMs: options.timeoutMs || 20000 });
 
     return {
       ok: true,
       busy: false,
       queuedBehindActiveTurn: Boolean(activeTurnId),
-      steered: false,
       turnId: extractTurnId(response),
       activeTurnId,
       response
@@ -360,120 +416,6 @@ export async function startQueuedTextTurnOverWs(options) {
     return {
       ok: false,
       busy,
-      steered: false,
-      error
-    };
-  } finally {
-    await client.close();
-  }
-}
-
-export async function startOrSteerTextTurnOverWs(options) {
-  const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
-  try {
-    const input = Array.isArray(options.input) && options.input.length > 0
-      ? normalizeUserInput(options.input)
-      : buildTextInput(options.text);
-
-    let activeTurnId = "";
-    try {
-      const turnsResponse = await client.request("thread/turns/list", {
-        threadId: options.threadId,
-        limit: 8,
-        itemsView: "notLoaded"
-      }, { timeoutMs: Math.min(options.timeoutMs || 20000, 5000) });
-      activeTurnId = extractActiveTurnId(turnsResponse);
-    } catch {
-      activeTurnId = "";
-    }
-
-    if (activeTurnId && options.steerActiveTurn === false) {
-      return {
-        ok: false,
-        busy: true,
-        steered: false,
-        turnId: activeTurnId,
-        error: makeError("Active turn is still running; wait for an idle turn/start.")
-      };
-    }
-
-    if (activeTurnId) {
-      try {
-        const steerResponse = await client.request("turn/steer", {
-          threadId: options.threadId,
-          expectedTurnId: activeTurnId,
-          input,
-          responsesapiClientMetadata: {
-            source: "telegram"
-          }
-        }, { timeoutMs: options.timeoutMs || 20000 });
-
-        return {
-          ok: true,
-          busy: false,
-          steered: true,
-          turnId: extractTurnId(steerResponse) || activeTurnId,
-          response: steerResponse
-        };
-      } catch (error) {
-        const details = `${error?.message || error}`.toLowerCase();
-        const notSteerable = details.includes("activeturnnotsteerable")
-          || details.includes("not steerable")
-          || details.includes("cannot accept same-turn steering");
-        const staleTurn = details.includes("expectedturnid")
-          || details.includes("precondition")
-          || details.includes("does not match")
-          || details.includes("no active turn");
-        if (notSteerable) {
-          return {
-            ok: false,
-            busy: true,
-            steered: true,
-            turnId: activeTurnId,
-            error
-          };
-        }
-        if (!staleTurn) {
-          return {
-            ok: false,
-            busy: true,
-            steered: true,
-            turnId: activeTurnId,
-            error
-          };
-        }
-      }
-    }
-
-    const response = await client.request("turn/start", {
-      threadId: options.threadId,
-      input,
-      model: options.model || null,
-      effort: options.effort || null,
-      personality: options.personality || null,
-      responsesapiClientMetadata: {
-        source: "telegram"
-      }
-    }, { timeoutMs: options.timeoutMs || 20000 });
-
-    return {
-      ok: true,
-      busy: false,
-      steered: false,
-      turnId: extractTurnId(response),
-      response
-    };
-  } catch (error) {
-    const details = `${error?.message || error}`.toLowerCase();
-    const busy = details.includes("active turn")
-      || details.includes("cannot accept")
-      || details.includes("already running")
-      || details.includes("busy");
-
-    return {
-      ok: false,
-      busy,
-      steered: false,
       error
     };
   } finally {

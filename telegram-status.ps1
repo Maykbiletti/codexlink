@@ -148,21 +148,18 @@ $injectingAges = @($injecting | ForEach-Object {
   Get-IsoAgeMs -IsoString $startedAt
 })
 $oldestInjectingAgeMs = if ($injectingAges.Count -gt 0) { [math]::Round(($injectingAges | Measure-Object -Maximum).Maximum) } else { 0 }
-$delivered = @($queue | Where-Object { $_.status -eq "delivered" })
-$errors = @($queue | Where-Object { $_.status -eq "error" })
-$pendingReplies = @($state.pendingReplies | Where-Object { -not $_.sentAt -and @("error", "expired", "ignored_bot", "suppressed_ack", "superseded", "sent", "stale_thread") -notcontains $_.status })
+$delivered = @($queue | Where-Object { @("delivered", "replied") -contains $_.status })
+$errors = @($queue | Where-Object { @("error", "failed") -contains $_.status })
+$pendingReplies = @($state.pendingReplies | Where-Object { -not $_.sentAt -and @("error", "expired", "ignored_bot", "suppressed_ack", "superseded", "sent", "stale_thread", "aborted", "no_reply_completed", "suppressed_private_reply") -notcontains $_.status })
 $expiredPendingReplies = @($state.pendingReplies | Where-Object { $_.status -eq "expired" })
-$pollerPid = if (Test-Path (Join-Path $stateDir "poller.pid")) { (Get-Content -Raw (Join-Path $stateDir "poller.pid")).Trim() } else { $null }
-$dispatcherPid = if (Test-Path (Join-Path $stateDir "dispatcher.pid")) { (Get-Content -Raw (Join-Path $stateDir "dispatcher.pid")).Trim() } else { $null }
-$responderPid = if (Test-Path (Join-Path $stateDir "responder.pid")) { (Get-Content -Raw (Join-Path $stateDir "responder.pid")).Trim() } else { $null }
-$teamRelayPid = if (Test-Path (Join-Path $stateDir "team-relay.pid")) { (Get-Content -Raw (Join-Path $stateDir "team-relay.pid")).Trim() } else { $null }
+$runtimePid = if (Test-Path (Join-Path $stateDir "runtime-daemon.pid")) { (Get-Content -Raw (Join-Path $stateDir "runtime-daemon.pid")).Trim() } else { $null }
 $stateThreadId = if ($state.currentThreadId) { [string]$state.currentThreadId } else { "" }
 $runtimeThreadId = if ($currentRuntime -and $currentRuntime.thread_id) { [string]$currentRuntime.thread_id } else { "" }
 $telegramPluginRoot = Get-TelegramPluginRoot -RuntimeRoot $runtimeRoot
 $dispatchMode = if ($envFile["BLUN_TELEGRAM_DISPATCH_MODE"]) { [string]$envFile["BLUN_TELEGRAM_DISPATCH_MODE"] } else { "deferred" }
-$groupDeliveryMode = if ($envFile["BLUN_TELEGRAM_GROUP_DELIVERY"]) { [string]$envFile["BLUN_TELEGRAM_GROUP_DELIVERY"] } else { "all" }
+$groupDeliveryMode = if ($envFile["BLUN_TELEGRAM_GROUP_DELIVERY"]) { [string]$envFile["BLUN_TELEGRAM_GROUP_DELIVERY"] } else { "observe" }
 $teamRelayUrl = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_URL"] } else { "" }
-$teamRelayMode = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"] } else { "both" }
+$teamRelayMode = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_MODE"] } else { "off" }
 $defaultTeamRelayFile = Get-DefaultTeamRelayFile
 $teamRelayFile = if ($envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"]) { [string]$envFile["BLUN_TELEGRAM_TEAM_RELAY_FILE"] } elseif ($teamRelayUrl) { "" } else { $defaultTeamRelayFile }
 if ($teamRelayFile -and -not $teamRelayUrl) {
@@ -176,7 +173,7 @@ if ($teamRelayFile -and -not $teamRelayUrl) {
   } catch {
   }
 }
-$idleCooldownMs = if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { [int]$envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { 15000 }
+$idleCooldownMs = if ($envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"]) { [int]$envFile["BLUN_TELEGRAM_IDLE_COOLDOWN_MS"] } else { 3000 }
 $eligibleQueued = if ($dispatchMode -eq "legacy") {
   @($queued)
 } else {
@@ -223,32 +220,11 @@ if ($currentRuntime) {
       $currentRuntime | Add-Member -NotePropertyName "thread_id" -NotePropertyValue $stateThreadId
     }
   }
-  if ($pollerPid) {
-    if ($currentRuntime.PSObject.Properties.Name.Contains("poller_pid")) {
-      $currentRuntime.poller_pid = $pollerPid
+  if ($runtimePid) {
+    if ($currentRuntime.PSObject.Properties.Name.Contains("runtime_pid")) {
+      $currentRuntime.runtime_pid = $runtimePid
     } else {
-      $currentRuntime | Add-Member -NotePropertyName "poller_pid" -NotePropertyValue $pollerPid
-    }
-  }
-  if ($dispatcherPid) {
-    if ($currentRuntime.PSObject.Properties.Name.Contains("dispatcher_pid")) {
-      $currentRuntime.dispatcher_pid = $dispatcherPid
-    } else {
-      $currentRuntime | Add-Member -NotePropertyName "dispatcher_pid" -NotePropertyValue $dispatcherPid
-    }
-  }
-  if ($responderPid) {
-    if ($currentRuntime.PSObject.Properties.Name.Contains("responder_pid")) {
-      $currentRuntime.responder_pid = $responderPid
-    } else {
-      $currentRuntime | Add-Member -NotePropertyName "responder_pid" -NotePropertyValue $responderPid
-    }
-  }
-  if ($teamRelayPid) {
-    if ($currentRuntime.PSObject.Properties.Name.Contains("team_relay_pid")) {
-      $currentRuntime.team_relay_pid = $teamRelayPid
-    } else {
-      $currentRuntime | Add-Member -NotePropertyName "team_relay_pid" -NotePropertyValue $teamRelayPid
+      $currentRuntime | Add-Member -NotePropertyName "runtime_pid" -NotePropertyValue $runtimePid
     }
   }
 }
@@ -310,10 +286,7 @@ $result = [ordered]@{
   history_count = $queue.Count
   last_inbound = $state.lastInbound
   last_outbound = $state.lastOutbound
-  poller_pid = $pollerPid
-  dispatcher_pid = $dispatcherPid
-  responder_pid = $responderPid
-  team_relay_pid = $teamRelayPid
+  runtime_pid = $runtimePid
   next_queued = if ($nextQueued.Count -gt 0) {
     [ordered]@{
       chat_id = $nextQueued[0].chatId
@@ -337,17 +310,8 @@ $result = [ordered]@{
   wait_reason = $waitReason
 }
 
-if ($result.poller_pid) {
-  $result["poller_alive"] = Test-PidAlive -ProcId ([int]$result.poller_pid)
-}
-if ($result.dispatcher_pid) {
-  $result["dispatcher_alive"] = Test-PidAlive -ProcId ([int]$result.dispatcher_pid)
-}
-if ($result.responder_pid) {
-  $result["responder_alive"] = Test-PidAlive -ProcId ([int]$result.responder_pid)
-}
-if ($result.team_relay_pid) {
-  $result["team_relay_alive"] = Test-PidAlive -ProcId ([int]$result.team_relay_pid)
+if ($result.runtime_pid) {
+  $result["runtime_alive"] = Test-PidAlive -ProcId ([int]$result.runtime_pid)
 }
 if ($result.frontend_owner_pid) {
   $result["frontend_owner_alive"] = Test-PidAlive -ProcId ([int]$result.frontend_owner_pid)

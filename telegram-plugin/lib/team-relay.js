@@ -139,9 +139,10 @@ async function publishRelayUrl(config, event) {
 
   const headers = { "content-type": "application/json" };
   const secret = String(config?.teamRelaySecret || "").trim();
-  if (secret) {
-    headers.authorization = `Bearer ${secret}`;
+  if (!secret) {
+    throw new Error("BLUN_TELEGRAM_TEAM_RELAY_SECRET is required for HTTP relay publishing.");
   }
+  headers.authorization = `Bearer ${secret}`;
 
   const response = await fetch(url, relayFetchOptions(config, {
     method: "POST",
@@ -172,9 +173,10 @@ async function readRelayUrlDelta(config, after) {
 
   const headers = {};
   const secret = String(config?.teamRelaySecret || "").trim();
-  if (secret) {
-    headers.authorization = `Bearer ${secret}`;
+  if (!secret) {
+    throw new Error("BLUN_TELEGRAM_TEAM_RELAY_SECRET is required for HTTP relay consumption.");
   }
+  headers.authorization = `Bearer ${secret}`;
 
   const response = await fetch(url, relayFetchOptions(config, { headers }));
   if (!response.ok) {

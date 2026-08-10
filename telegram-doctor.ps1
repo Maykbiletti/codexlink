@@ -194,11 +194,11 @@ function Ensure-TeamRelayDefaults {
 
   $changed = $false
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
-    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "observe"
     $changed = $true
   }
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
-    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "off"
     $changed = $true
   }
   $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
@@ -256,6 +256,7 @@ function Invoke-RuntimeFix {
       $runtime.frontend_host_pid,
       $runtime.app_server_pid,
       $runtime.queue_notifier_pid,
+      $runtime.runtime_pid,
       $runtime.poller_pid,
       $runtime.dispatcher_pid,
       $runtime.responder_pid,
@@ -401,7 +402,7 @@ if (Test-AllowedChatIdsFormat -Value $activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
   $allowedChatIds = [string]$legacyEnv["TELEGRAM_ALLOWED_CHAT_ID"]
   $allowedChatSource = "legacy env fallback legacy key"
 }
-Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "warn" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No allowlist set. Telegram currently accepts any chat the bot can see." })
+Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "fail" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No allowlist set. Telegram intake is disabled until pairing succeeds." })
 
 $wsReachabilityKnown = $null -ne $status.active_ws_reachable
 $wsReachable = -not $wsReachabilityKnown -or [bool]$status.active_ws_reachable
@@ -434,9 +435,7 @@ if ($status.active_thread_id -and $loadedThreads.Count -gt 0 -and -not ($loadedT
 Add-Check -List $checks -Name "thread_visibility" -Status $threadVisibilityStatus -Detail $threadVisibilityDetail
 Add-Check -List $checks -Name "frontend_owner" -Status $(if ($status.frontend_owner_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.frontend_owner_pid + " alive=" + [string]$status.frontend_owner_alive)
 Add-Check -List $checks -Name "queue_notifier" -Status $(if (($null -eq $status.queue_notifier_pid) -or ($status.queue_notifier_alive)) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.queue_notifier_pid + " alive=" + [string]$status.queue_notifier_alive)
-Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.poller_pid + " alive=" + [string]$status.poller_alive)
-Add-Check -List $checks -Name "dispatcher" -Status $(if ($status.dispatcher_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.dispatcher_pid + " alive=" + [string]$status.dispatcher_alive)
-Add-Check -List $checks -Name "responder" -Status $(if ($status.responder_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.responder_pid + " alive=" + [string]$status.responder_alive)
+Add-Check -List $checks -Name "runtime_daemon" -Status $(if ($status.runtime_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.runtime_pid + " alive=" + [string]$status.runtime_alive)
 $teamRelayMode = ([string]$status.team_relay_mode).ToLower()
 $groupDeliveryMode = ([string]$status.group_delivery).ToLower()
 $teamRelayConfigured = $status.team_relay_file -or $status.team_relay_url_configured
@@ -459,7 +458,7 @@ if ($groupDeliveryMode -eq "observe" -and $teamRelayMode -eq "off") {
   Add-Check -List $checks -Name "observe_team_relay" -Status "ok" -Detail ("group_delivery=" + [string]$status.group_delivery + " relay_mode=" + [string]$status.team_relay_mode)
 }
 if ($teamRelayShouldRun -and $teamRelayConfigured) {
-  Add-Check -List $checks -Name "team_relay_consumer" -Status $(if ($status.team_relay_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.team_relay_pid + " alive=" + [string]$status.team_relay_alive)
+  Add-Check -List $checks -Name "team_relay_consumer" -Status $(if ($status.runtime_alive) { "ok" } else { "warn" }) -Detail ("owned_by_runtime_daemon pid=" + [string]$status.runtime_pid + " alive=" + [string]$status.runtime_alive)
 } else {
   Add-Check -List $checks -Name "team_relay_consumer" -Status "ok" -Detail "not required"
 }

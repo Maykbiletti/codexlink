@@ -12,7 +12,7 @@ export function getPaths() {
   const agentName = process.env.BLUN_TELEGRAM_AGENT_NAME?.trim()
     || process.env.TELEGRAM_AGENT_NAME?.trim()
     || "default";
-  const runtimeDir = join(codexHome, "runtimes", agentName);
+  const runtimeDir = process.env.BLUN_CODEX_RUNTIME_DIR?.trim() || join(codexHome, "runtimes", agentName);
   return {
     root,
     legacyRoot: join(codexHome, "channels", "codexlink-telegram"),
@@ -22,6 +22,9 @@ export function getPaths() {
     sessionsDir: join(codexHome, "sessions"),
     envFile: join(root, ".env"),
     stateFile: join(root, "state.json"),
+    runtimeControlFile: join(root, "runtime-control.json"),
+    runtimeEndpointFile: join(root, "runtime-endpoint.json"),
+    runtimeEventsFile: join(root, "runtime-events.jsonl"),
     mnemoSyncStateFile: join(root, "mnemo-sync-state.json"),
     inboxFile: join(root, "inbox.jsonl"),
     outboxFile: join(root, "outbox.jsonl"),
@@ -30,6 +33,7 @@ export function getPaths() {
     pollerPidFile: join(root, "poller.pid"),
     dispatcherPidFile: join(root, "dispatcher.pid"),
     responderPidFile: join(root, "responder.pid"),
+    runtimePidFile: join(root, "runtime-daemon.pid"),
     teamRelayPidFile: join(root, "team-relay.pid"),
     pollerStdoutFile: join(root, "poller.stdout.log"),
     pollerStderrFile: join(root, "poller.stderr.log"),
@@ -37,6 +41,8 @@ export function getPaths() {
     dispatcherStderrFile: join(root, "dispatcher.stderr.log"),
     responderStdoutFile: join(root, "responder.stdout.log"),
     responderStderrFile: join(root, "responder.stderr.log"),
+    runtimeStdoutFile: join(root, "runtime-daemon.stdout.log"),
+    runtimeStderrFile: join(root, "runtime-daemon.stderr.log"),
     teamRelayStdoutFile: join(root, "team-relay.stdout.log"),
     teamRelayStderrFile: join(root, "team-relay.stderr.log"),
     teamRelayCursorFile: join(root, "team-relay.cursor.json"),

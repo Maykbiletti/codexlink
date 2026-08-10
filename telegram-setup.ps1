@@ -68,11 +68,11 @@ function Ensure-TeamRelayDefaults {
 
   $changed = $false
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
-    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "observe"
     $changed = $true
   }
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
-    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "off"
     $changed = $true
   }
   $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
@@ -231,8 +231,8 @@ function Wait-TelegramPairingChat {
   $botName = if ($BotInfo.username) { "@" + [string]$BotInfo.username } else { "deinen Bot" }
   Write-Host ""
   Write-Host "Telegram Pairing" -ForegroundColor Cyan
-  Write-Host "Oeffne Telegram und sende jetzt eine neue Nachricht an $botName." -ForegroundColor White
-  Write-Host "Fuer Gruppen: Bot in die Gruppe einladen und dort kurz '$botName connect' schreiben." -ForegroundColor DarkGray
+  Write-Host "Öffne Telegram und sende jetzt eine neue Nachricht an $botName." -ForegroundColor White
+  Write-Host "Für Gruppen: Bot in die Gruppe einladen und dort kurz '$botName connect' schreiben." -ForegroundColor DarkGray
   Write-Host "Ich erkenne die Chat-ID automatisch. Du musst keine ID suchen." -ForegroundColor DarkGray
   Write-Host ""
 
@@ -354,7 +354,7 @@ if ($EnsureConfigured -and -not $needsToken -and -not $needsChatIds) {
   if ($Json) {
     $result | ConvertTo-Json -Depth 6
   } else {
-    Write-Host "Telegram ist bereits eingerichtet fuer Profil '$profileAgent'." -ForegroundColor Green
+    Write-Host "Telegram ist bereits eingerichtet für Profil '$profileAgent'." -ForegroundColor Green
     Write-Host "State-Ordner: $stateDir"
   }
   exit 0
@@ -415,18 +415,13 @@ if ($needsChatIds -and -not $Json) {
         $label = if ($pairedChat.title) { "$($pairedChat.title) ($($pairedChat.chat_type))" } else { $pairedChat.chat_type }
         Write-Host "Gekoppelt: $label -> $currentAllowedChatIds" -ForegroundColor Green
       } else {
-        $envValues["BLUN_TELEGRAM_PAIRING_DONE"] = "1"
-        Write-Host "Keine Telegram-Nachricht erkannt. Ich starte ohne Allowlist; du kannst spaeter erneut `blun-codex telegram-setup` ausfuehren." -ForegroundColor Yellow
+        throw "Keine Telegram-Nachricht erkannt. Aus Sicherheitsgründen startet CodexLink nicht ohne Chat-Allowlist. Sende dem Bot eine Nachricht und führe telegram-setup erneut aus."
       }
     } else {
-      Write-Host "Hinweis: keine Chat-Allowlist gesetzt. Der Bot akzeptiert aktuell alle Chats, die er sehen kann." -ForegroundColor Yellow
+      throw "Keine Chat-Allowlist gesetzt. Aus Sicherheitsgründen ist Telegram deaktiviert, bis die Kopplung abgeschlossen ist."
     }
   } catch {
-    if ($tokenWasPrompted) {
-      throw
-    }
-    Write-Host $_.Exception.Message -ForegroundColor Yellow
-    Write-Host "Ich starte ohne Allowlist; du kannst spaeter erneut `blun-codex telegram-setup` ausfuehren." -ForegroundColor Yellow
+    throw
   }
 }
 
@@ -452,8 +447,8 @@ Write-Host ""
 Write-Host "Telegram ist jetzt eingerichtet." -ForegroundColor Green
 Write-Host "Gespeichert unter: $envPath"
 Write-Host ""
-Write-Host "Naechster Schritt:" -ForegroundColor Cyan
+Write-Host "Nächster Schritt:" -ForegroundColor Cyan
 Write-Host "  blun-codex --profile $profileAgent telegram-plugin"
 Write-Host ""
-Write-Host "Pruefen kannst du spaeter mit:" -ForegroundColor Cyan
+Write-Host "Prüfen kannst du später mit:" -ForegroundColor Cyan
 Write-Host "  blun-codex --profile $profileAgent telegram-doctor"

@@ -12,14 +12,15 @@
 CodexLink is the BLUN launcher for one visible local CLI session with optional
 Telegram delivery.
 
-It keeps transport, queueing, runtime state, and Telegram sidecars wrapped
-around the operator without starting a hidden second session.
+It runs one persistent local runtime daemon around the operator without
+starting a hidden second Codex session. Telegram is a transport, the durable
+runtime queue is the source of truth, and MCP is the control plane.
 
 Telegram delivery is serial by default:
 
 - inbound messages land in a local queue first
 - active work is not interrupted immediately
-- direct messages wait until the visible session is quiet
+- queued messages wait until the visible thread has no active turn
 - ambient group noise stays queued until it is relevant or manually drained
 - escalation-style messages can still jump the line
 - stale pending replies time out automatically, so the queue cannot block forever
@@ -138,9 +139,19 @@ blun-codex telegram-plugin --print-only
 
 ## Queue Behavior
 
-When Telegram messages arrive while work is running, the visible CLI input stays
-untouched. Pending messages stay visible in the window title and status output
-until the reply is sent or the message really expires.
+Every allowed Telegram message is persisted before dispatch. The runtime daemon
+claims one eligible item, starts it with app-server `turn/start`, and leaves all
+later items queued while that turn is active. Normal inbound work never uses
+`turn/steer`, keyboard injection, or `codex exec resume`.
+
+The lifecycle is:
+
+```text
+received -> queued -> injecting -> submitted -> replied
+```
+
+Failed submissions return to `queued` with backoff. App-server overloads use
+exponential backoff with jitter. Queue state survives CLI and MCP restarts.
 
 You can inspect the queue at any time:
 
@@ -159,44 +170,45 @@ BLUN_TELEGRAM_PROGRESS_RELAY=commentary
 BLUN_TELEGRAM_PROGRESS_RELAY=off
 ```
 
-## Visible Console Injection
+## Runtime MCP Server
 
-By default, CodexLink injects messages through the app server into the active
-thread. Enable Windows keyboard injection only when Telegram messages must land
-visibly in the original CLI console:
+The bundled `codexlink_runtime` MCP server is intentionally thin. It talks to
+the persistent daemon over an authenticated localhost RPC endpoint and never
+owns a second queue.
 
-```text
-BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
-```
+CodexLink also restricts its app-server WebSocket client to loopback endpoints.
+The app-server WebSocket transport is currently experimental, so this package
+targets local operator workflows rather than unauthenticated remote exposure.
 
-In this mode, CodexLink writes the message into the visible input field, waits
-briefly, and sends a real `Enter` / `VK_RETURN` key event. The reply is still
-tracked from the visible session and sent back to Telegram.
+Core tools:
 
-Short reachability pings, such as the product name, `Assistant`, or a custom
-profile name, are treated as real thread input by default. This keeps Telegram
-from behaving like a separate hidden bot.
+- `runtime_health`
+- `runtime_status`
+- `runtime_queue_list`
+- `runtime_queue_enqueue`
+- `runtime_queue_cancel`
+- `runtime_bind_thread`
+- `runtime_pause` / `runtime_resume`
+- `runtime_approvals_list` / `runtime_approval_decide`
+- `runtime_reply`
 
-To restore the older ack-only behavior for these pings:
-
-```text
-BLUN_TELEGRAM_PING_ACK_ONLY=1
-```
+App-server `item/completed` and `turn/completed` events drive outbound replies.
+On daemon restart, completed turns are recovered through `thread/read`; internal
+Codex session files are not the primary integration surface.
 
 ## Group Delivery
 
-Group messages are delivered to the active CLI by default. Telegram is only the
+Allowed group messages use `observe` routing by default. Telegram is only the
 transport; the visible agent decides inside the thread whether a message is
-relevant.
+relevant, while non-addressed context does not create an automatic reply.
 
 For broad group intake:
 
 ```text
 BLUN_TELEGRAM_GROUP_DELIVERY=all
-BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
 ```
 
-In `all` mode, the poller accepts every message from allowed chats, regardless
+In `all` mode, the runtime daemon accepts every message from allowed chats, regardless
 of whether the sender is human or bot. `message.from.is_bot` is stored as
 metadata and is not filtered at receive time.
 
@@ -205,18 +217,7 @@ Useful settings for this mode:
 ```text
 BLUN_TELEGRAM_ALLOWED_CHAT_ID=<private-user-id>,<group-id>
 BLUN_TELEGRAM_GROUP_DELIVERY=all
-BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT=force
-BLUN_TELEGRAM_VISIBLE_CONSOLE_SUBMIT_DELAY_MS=260
 BLUN_TELEGRAM_TEAM_RELAY_URL=
-```
-
-Image and file messages also flow through the visible console in `force` mode.
-The generated prompt contains the local attachment path.
-
-To send attachments through the app server instead of the visible console:
-
-```text
-BLUN_TELEGRAM_VISIBLE_CONSOLE_SKIP_ATTACHMENTS=1
 ```
 
 Leave `BLUN_TELEGRAM_TEAM_RELAY_URL` empty when no shared HTTP relay is running.
@@ -259,11 +260,10 @@ BLUN_TELEGRAM_MENTION_NAMES=assistant,codex
 BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
 ```
 
-Mention names are passed to the poller, dispatcher, responder, and team relay
-consumer. This matters because sidecars classify group and relay messages before
-they are injected into the visible CLI.
+Mention names are passed to the runtime daemon. It classifies group and relay
+messages before they are submitted to the visible app-server thread.
 
-Important: a Telegram bot token must not be polled by old or foreign pollers at
+Important: a Telegram bot token must not be polled by another process at
 the same time. If Telegram reports `Conflict: terminated by other getUpdates
 request`, close all old `blun-codex telegram-plugin` windows for that bot and
 start exactly one current session.
@@ -276,13 +276,13 @@ shared relay channel. Human group messages and agent outbound messages are
 written as JSONL events or sent to a central relay endpoint, then consumed by
 other profiles.
 
-On one Windows machine, the normal installation uses a shared relay file:
+On one Windows machine, an explicitly enabled relay can use a shared file:
 
 ```text
 %ProgramData%\Blun\codexlink\blun-team-relay.jsonl
 ```
 
-Recommended local relay settings:
+Explicit local relay settings:
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
@@ -324,6 +324,9 @@ BLUN_TELEGRAM_TEAM_RELAY_SECRET=change-me
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 
+The HTTP relay refuses to start or connect without
+`BLUN_TELEGRAM_TEAM_RELAY_SECRET`. Team relay is off by default.
+
 Private direct messages stay private. A private DM context may be broadcast into
 a group only with an explicit group-broadcast approval. Manual bridge replies
 need both flags:
@@ -345,10 +348,11 @@ The default dispatch mode is:
 BLUN_TELEGRAM_DISPATCH_MODE=deferred
 ```
 
-Telegram messages are treated like normal CLI input. If the visible run is still
-active, the message stays in the local queue and is injected after the current
-run. Normal `direct` messages and continue signals do not bypass this lock; only
-real escalation events may jump the line.
+Telegram messages are treated like normal app-server input. If the visible run
+is still active, the message stays in the local queue and is submitted after the
+current run. Normal `direct` messages and continue signals do not bypass this
+lock; escalation events may move ahead in the queue but do not interrupt an
+active turn.
 
 The doctor checks whether `observe` mode and team relay are wired correctly and
 whether a configured HTTP relay endpoint is reachable.
@@ -457,34 +461,25 @@ blun-codex repair --profile reviewer
 ```
 
 This is the recommended support path before manual debugging. It fixes stale
-thread bindings, stale runtime files, missing relay defaults, and stopped
-sidecars before asking the user to touch `.env` files or process lists.
-
-Inbound Telegram messages are mirrored into the visible CLI console by default,
-so the operator can see that the message arrived. Queue summaries and outbound
-reply notices stay out of the console to avoid input-line noise.
-
-Use these values to change console mirroring:
-
-```text
-BLUN_TELEGRAM_CONSOLE_UI_NOTICES=off
-BLUN_TELEGRAM_CONSOLE_UI_NOTICES=all
-```
+thread bindings, stale runtime files, secure relay defaults, and a stopped
+runtime daemon before asking the user to touch `.env` files or process lists.
 
 ## What It Does
 
 - starts one consistent local CLI runtime
 - writes a launch record into `.codex/runtimes/default/`
-- keeps Telegram queue state under `.codex/channels/telegram-default/`
+- keeps the durable runtime queue under `.codex/channels/telegram-default/`
 - attaches Telegram delivery to the same visible session
-- defers automatic Telegram delivery until the foreground session is idle
-- keeps poller, dispatcher, and reply relay separate from the foreground
-  operator
+- dispatches only when the bound app-server thread is idle
+- keeps Telegram intake alive while the CLI or MCP client reconnects
+- receives replies and approvals over the persistent app-server event stream
 
 ## What It Does Not Do
 
 - no hidden autonomous answer bot
 - no second shadow session
+- no terminal keyboard injection
+- no `turn/steer` for ordinary inbound work
 - no per-agent internal company presets in the public package
 
 ## Public Profile
@@ -505,8 +500,9 @@ The bundled plugin lives under `telegram-plugin/` and contains:
 
 - `.codex-plugin/plugin.json`
 - `.mcp.json`
-- `server.js`
-- sidecars and bridge helpers
+- `server.js` (thin MCP adapter)
+- `runtime-daemon.js` (queue owner and dispatcher)
+- app-server event, local RPC, Telegram, and queue helpers
 
 ## Requirements
 

@@ -1,166 +1,170 @@
-# CodexLink Telegram Plugin
+# CodexLink Runtime Plugin
 
-This is the bundled Telegram plugin for CodexLink.
+This plugin connects Telegram to one visible Codex app-server thread through a
+persistent local runtime. It is not an autonomous answer bot and it does not
+create a shadow Codex session.
 
-It is intentionally **not** an autonomous answer bot.
+## Architecture
 
-## What it does
+The runtime daemon owns the durable queue and all transport loops:
 
-- polls Telegram updates into a local queue
-- stores inbound and outbound history under a local state directory
-- keeps private chats and group threads separated
-- binds a live thread id
-- injects private messages and, by default, group messages into the active app-server thread
-- steers active turns when the app-server supports it
-- keeps queued Telegram messages visible when they are waiting instead of ready to deliver
-- sends explicit manual replies from the visible operator session
-- supports strict mention-only group routing when `BLUN_TELEGRAM_GROUP_DELIVERY=mentions`
-- lets escalation-style messages bypass the normal idle queue
-- can publish and consume a shared team relay so bot-to-bot group messages do not depend on Telegram raw delivery
+1. an allowed Telegram update is normalized and persisted in `state.json`
+2. the dispatcher claims the oldest eligible item
+3. when the bound thread is idle, the daemon submits it with app-server
+   `turn/start`
+4. app-server `item/completed` and `turn/completed` events complete the queue
+   item and route the final answer back to Telegram
+5. on restart, `thread/read` recovers turns that completed while the daemon was
+   offline
 
-## What it does not do
+Ordinary inbound work never uses `turn/steer`, terminal keyboard injection, or
+`codex exec resume`. The MCP server is a thin control plane over the same daemon
+and never owns a second queue.
 
-- no hidden second session
-- no autonomous answer loop
-- no background reply worker pretending to be the operator
+Queue lifecycle:
+
+```text
+received -> queued -> injecting -> submitted -> replied
+```
+
+Busy or overloaded submissions return to `queued` with retry timing. Overload
+retries use exponential backoff with jitter. `runtime_pause` stops dispatch but
+does not stop Telegram intake.
+
+## Processes
+
+- `runtime-daemon.js` owns Telegram polling, FIFO dispatch, app-server events,
+  reply routing, approval requests, and optional team-relay consumption
+- `server.js` exposes MCP tools and calls the daemon over authenticated
+  localhost RPC
+- `team-relay-server.js` is optional and serves a shared authenticated HTTP
+  relay for multi-host teams
+
+The legacy `poller.js`, `dispatcher.js`, `responder.js`, and
+`team-relay-consumer.js` entry points remain only for compatibility. The
+sidecar manager stops owned legacy processes and starts one runtime daemon.
 
 ## State
 
-Default state directory:
+The default directory is:
 
-`%USERPROFILE%\\.codex\\channels\\codexlink-telegram`
+```text
+%USERPROFILE%\.codex\channels\codexlink-telegram
+```
 
-Files created there:
+Important files:
 
-- `.env`
-- `state.json`
-- `inbox.jsonl`
-- `outbox.jsonl`
-- `activity.log`
-- `prompts/`
-- `responses/`
-- `poller.pid`
-- `dispatcher.pid`
-- `responder.pid`
-- `team-relay.pid`
+- `.env`: local transport configuration
+- `state.json`: authoritative queue and delivery state
+- `inbox.jsonl` and `outbox.jsonl`: append-only transport history
+- `runtime-events.jsonl`: app-server notification history
+- `runtime-control.json`: persisted pause state
+- `runtime-endpoint.json`: authenticated localhost RPC endpoint
+- `runtime-daemon.pid`: daemon ownership record
+- `activity.log`: operational activity
+- `attachments/`: staged Telegram attachments
 
-## Env
+The RPC endpoint binds only to `127.0.0.1`. Its random bearer token is written
+with owner-only POSIX permissions where the filesystem supports them. The Codex
+app-server WebSocket endpoint is also restricted to loopback addresses.
 
-Copy `.env.example` to `.env` in the state directory or export env vars:
+## Required configuration
 
-- `BLUN_TELEGRAM_AGENT_NAME`
-- `BLUN_TELEGRAM_BOT_TOKEN`
-- `BLUN_TELEGRAM_ALLOWED_CHAT_ID` (`chatId` or comma-separated list like `123456789,-1001234567890`)
-- `BLUN_TELEGRAM_CODEX_BIN`
-- `BLUN_TELEGRAM_THREAD_ID`
-- `BLUN_TELEGRAM_RESUME_TIMEOUT_MS`
-- `BLUN_TELEGRAM_IDLE_COOLDOWN_MS`
-- `BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS`
-- `BLUN_TELEGRAM_PROGRESS_RELAY` (`status` by default, `commentary` to mirror commentary updates, `off` to disable progress notices)
-- `BLUN_TELEGRAM_DISPATCH_MODE` (`deferred` by default, `legacy` to restore eager dispatch)
-- `BLUN_TELEGRAM_GROUP_DELIVERY` (`all` by default for public/single-agent bridges, `observe` for team-wide context delivery without automatic replies, `mentions` for strict multi-agent routing)
-- `BLUN_TELEGRAM_TEAM_RELAY_MODE` (`both` by default, or `off`, `publish`, `consume`)
-- `BLUN_TELEGRAM_TEAM_RELAY_FILE` (defaults to `%ProgramData%\Blun\codexlink\blun-team-relay.jsonl` on Windows; use a shared absolute path for agents under different machines/accounts)
-- `BLUN_TELEGRAM_TEAM_RELAY_URL` (shared HTTP relay endpoint for multiple machines)
-- `BLUN_TELEGRAM_TEAM_RELAY_SECRET` (optional bearer secret for the shared HTTP relay)
-- `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE` (`0` by default; private DMs are not shared)
-- `BLUN_TELEGRAM_TEAM_RELAY_START` (`tail` by default so enabling the relay does not replay old group history)
+Use `blun-codex telegram-setup` for normal setup. Telegram intake is disabled
+until both a bot token and a non-empty chat allowlist exist.
 
-## Team relay
+```text
+BLUN_TELEGRAM_BOT_TOKEN=123456789:replace_me
+BLUN_TELEGRAM_ALLOWED_CHAT_ID=123456789,-1001234567890
+BLUN_TELEGRAM_APP_SERVER_WS_URL=ws://127.0.0.1:PORT
+BLUN_TELEGRAM_THREAD_ID=thread-id
+```
 
-Telegram does not reliably deliver bot-to-bot group messages to every bot. CodexLink therefore supports a separate team relay:
+Relevant optional values:
 
-- every participating agent can publish inbound group messages it sees
-- every participating agent can publish its own outbound Telegram messages
-- every participating agent can consume the shared relay and, with `BLUN_TELEGRAM_GROUP_DELIVERY=observe`, receive all group messages as context while only replying to direct/scope-relevant work
-- private DMs stay private unless `BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=1` is explicitly set
-- private-DM context cannot be sent into a group by accident; manual bridge replies need both `allow_private_to_group=true` and `confirm_group_broadcast=true`
+- `BLUN_TELEGRAM_GROUP_DELIVERY`: `observe` by default; `mentions`, `all`, and
+  `ambient` are available for explicit routing choices
+- `BLUN_TELEGRAM_DISPATCH_MODE`: `deferred` by default
+- `BLUN_TELEGRAM_PROGRESS_RELAY`: `status` by default, or `commentary` / `off`
+- `BLUN_CODEXLINK_RUNTIME_PORT`: `0` by default for an ephemeral localhost port
+- `BLUN_CODEXLINK_RUNTIME_RPC_TIMEOUT_MS`: MCP-to-runtime request timeout
+- `BLUN_CODEXLINK_OVERLOAD_BASE_MS`: base delay for overload backoff
 
-Minimal local setup for multiple agents on one Windows machine is now the default. All agents use the shared ProgramData relay path unless `BLUN_TELEGRAM_TEAM_RELAY_FILE` or `BLUN_TELEGRAM_TEAM_RELAY_URL` is configured:
+The public profile uses `workspace-write` with `on-request` approvals. Mnemo
+sync and Telegram capture are off unless explicitly enabled.
+
+## MCP tools
+
+- `runtime_health`
+- `runtime_status`
+- `runtime_queue_list`
+- `runtime_queue_enqueue`
+- `runtime_queue_cancel`
+- `runtime_bind_thread`
+- `runtime_reply`
+- `runtime_pause` and `runtime_resume`
+- `runtime_approvals_list` and `runtime_approval_decide`
+- `runtime_tail_activity`
+
+The daemon stores app-server approval requests until the MCP control plane
+resolves them with `accept`, `acceptForSession`, `decline`, or `cancel`.
+
+## Group routing
+
+`observe` is the safe default for group context. Direct messages and explicit
+agent mentions remain actionable. Non-addressed group messages can be supplied
+as context without generating an automatic Telegram reply.
+
+Use strict routing when several agents share a group:
+
+```text
+BLUN_TELEGRAM_GROUP_DELIVERY=mentions
+BLUN_TELEGRAM_MENTION_NAMES=assistant,codex
+BLUN_TELEGRAM_OTHER_AGENT_NAMES=designer,reviewer,ops
+```
+
+Use broad intake only when it is intentional:
+
+```text
+BLUN_TELEGRAM_GROUP_DELIVERY=all
+```
+
+Telegram permits only one `getUpdates` consumer per bot token. If Telegram
+reports a conflict, stop the older CodexLink instance and keep one runtime
+daemon for that token.
+
+## Optional team relay
+
+Team relay is off by default. Enable it explicitly only when agents need shared
+group context that Telegram does not deliver bot-to-bot.
+
+For one host, configure an absolute shared file:
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
-BLUN_TELEGRAM_TEAM_RELAY_FILE=%ProgramData%\Blun\codexlink\blun-team-relay.jsonl
+BLUN_TELEGRAM_TEAM_RELAY_FILE=C:\ProgramData\Blun\codexlink\team-relay.jsonl
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 
-External publishers can also write the minimal snake_case event format. CodexLink normalizes it to the internal camelCase format and deduplicates by `source_agent + chat_id + message_id`:
-
-```json
-{
-  "source_agent": "dieter",
-  "target_agent": "alfred",
-  "chat_id": "-1003927574737",
-  "message_id": "telegram-id",
-  "scope": "engineering",
-  "priority": "normal",
-  "text": "..."
-}
-```
-
-The HTTP relay also accepts the same event wrapped as `{ "event": ... }`, `{ "payload": ... }`, `{ "data": ... }`, or `{ "message": ... }`. Invalid POSTs return the concrete missing required fields.
-
-For multiple machines, run one shared relay server and point every agent at the same URL:
-
-```powershell
-$env:BLUN_TELEGRAM_TEAM_RELAY_HOST="0.0.0.0"
-$env:BLUN_TELEGRAM_TEAM_RELAY_PORT="28787"
-$env:BLUN_TELEGRAM_TEAM_RELAY_SECRET="change-me"
-blun-codex telegram-relay-server
-```
+For multiple hosts, configure an HTTP relay. A bearer secret is mandatory for
+both the server and all clients:
 
 ```text
 BLUN_TELEGRAM_TEAM_RELAY_MODE=both
 BLUN_TELEGRAM_TEAM_RELAY_URL=http://SERVER-IP:28787/events
-BLUN_TELEGRAM_TEAM_RELAY_SECRET=change-me
+BLUN_TELEGRAM_TEAM_RELAY_SECRET=replace-with-a-strong-secret
 BLUN_TELEGRAM_TEAM_RELAY_PRIVATE=0
 ```
 
-Agent outbound messages should still publish to the relay, because Telegram may not expose those bot messages as raw updates to other bots.
+Start the server with the same secret:
 
-Recommended team mode:
-
-```text
-BLUN_TELEGRAM_GROUP_DELIVERY=observe
+```powershell
+$env:BLUN_TELEGRAM_TEAM_RELAY_HOST="0.0.0.0"
+$env:BLUN_TELEGRAM_TEAM_RELAY_PORT="28787"
+$env:BLUN_TELEGRAM_TEAM_RELAY_SECRET="replace-with-a-strong-secret"
+blun-codex telegram-relay-server
 ```
 
-In this mode direct messages and explicit agent mentions still behave as actionable work. Other group messages are injected as `observe` context so the agent can keep situational awareness, but CodexLink does not track an automatic Telegram reply for them.
-
-## Public trigger model
-
-CodexLink keeps personal agent names, but public repos should also work without private names such as "Otto" or "Alfred".
-
-Default neutral triggers include:
-
-- slash commands: `/ai`, `/ask`, `/debug`, `/fix`, `/review`, `/explain`, `/translate`, `/summarize`, `/analyze`
-- mentions or names: `@ai`, `@assistant`, `@bot`, `assistant`, `gpt`, `codex`, `claude`, `openai`
-- common natural phrases in multiple languages for help, explanation, debugging, fixes, review, translation, summarization, analysis, improvement, and optimization
-
-Slash commands and `@` mentions are the recommended universal path because they remain clear in every language. Natural-language triggers are best-effort multilingual shortcuts, not the sole routing contract.
-
-## Tools
-
-- `bridge_status`
-- `bridge_bind_current_thread`
-- `bridge_poll_once`
-- `bridge_list_queue`
-- `bridge_inject_next`
-- `bridge_reply`
-- `bridge_relay_once`
-- `bridge_team_relay_once`
-- `bridge_tail_activity`
-
-## Runtime split
-
-- `poller.js` only fetches Telegram updates into the queue
-- `dispatcher.js` only retries queue delivery into the bound live thread after the current run is quiet
-- `responder.js` only relays finished answers back out
-- `team-relay-consumer.js` only reads the shared relay and queues relevant group messages
-- `team-relay-server.js` stores and serves shared relay events for machines that cannot share one local file
-- none of them are allowed to invent an answer on their own
-
-Sidecar restarts are ownership-gated. CodexLink writes a small `.meta.json`
-next to each pid file and only stops a running sidecar when the pid, script,
-agent name and state directory match that metadata. If ownership cannot be
-verified, the restart is skipped and logged instead of killing a possibly
-unrelated Node/Claude/agent process.
+Private DMs are not relayed by default. Sending private-DM context to a group
+requires both `allow_private_to_group=true` and
+`confirm_group_broadcast=true` on the explicit reply action.

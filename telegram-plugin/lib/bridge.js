@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { basename, extname, join } from "node:path";
 import { getActiveTurnIdOverWs, listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
 import { loadConfig } from "./env.js";
@@ -453,7 +454,7 @@ const UNIVERSAL_AGENT_PATTERNS = [
 ];
 
 function groupDeliveryMode(config) {
-  return String(config.groupDeliveryMode || "all").trim().toLowerCase();
+  return String(config.groupDeliveryMode || "observe").trim().toLowerCase();
 }
 
 function shouldDeliverAllGroupMessages(config) {
@@ -465,8 +466,7 @@ function shouldObserveAllGroupMessages(config) {
 }
 
 function shouldSubmitEveryAllowedMessage(config) {
-  const visibleConsoleMode = String(config?.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "").trim().toLowerCase();
-  return shouldDeliverAllGroupMessages(config) || visibleConsoleMode === "force";
+  return shouldDeliverAllGroupMessages(config);
 }
 
 function looksLikeUniversalAgentIntent(text) {
@@ -1019,8 +1019,12 @@ function classifyInboundRelevance(config, inbound) {
 function statusWeight(status) {
   switch (status) {
     case "delivered":
+    case "replied":
+    case "cancelled":
     case "error":
+    case "failed":
       return 4;
+    case "running":
     case "submitted":
     case "injecting":
       return 2;
@@ -1043,7 +1047,7 @@ function pickIsoLater(left, right) {
 }
 
 function hasRuntimeTurnQueueResult(entry) {
-  return /^turn_(?:queued|steered)\b/i.test(String(entry?.responsePreview || ""))
+  return /^turn_queued\b/i.test(String(entry?.responsePreview || ""))
     || Boolean(entry?.turnId && (entry?.deliveredAt || entry?.injectFinishedAt));
 }
 
@@ -1398,12 +1402,15 @@ function recoverStaleInjectingEntriesInPlace(entries, staleMs = 1000 * 60 * 5) {
     }
     entry.status = "queued";
     entry.injectRecoveredAt = nowIso();
+    entry.requeuedAt = entry.injectRecoveredAt;
+    entry.requeueReason = "stale_injecting_lease";
+    entry.leaseUntil = null;
     recovered += 1;
   }
   return recovered;
 }
 
-function mergeQueueEntry(current, incoming) {
+export function mergeQueueEntry(current, incoming) {
   if (!current && !incoming) {
     return null;
   }
@@ -1445,13 +1452,18 @@ function mergeQueueEntry(current, incoming) {
     merged[field] = anchor[field] ?? other[field] ?? null;
   }
 
-  const runtimeQueueSource = hasRuntimeTurnQueueResult(incoming) ? incoming : (hasRuntimeTurnQueueResult(current) ? current : null);
+  const currentHasRuntimeResult = hasRuntimeTurnQueueResult(current);
+  const incomingHasRuntimeResult = hasRuntimeTurnQueueResult(incoming);
+  const runtimeQueueSource = currentHasRuntimeResult && incomingHasRuntimeResult
+    ? selectQueueMergeAnchor(current, incoming)
+    : (incomingHasRuntimeResult ? incoming : (currentHasRuntimeResult ? current : null));
   if (runtimeQueueSource) {
-    merged.status = "delivered";
+    const terminal = ["delivered", "replied", "cancelled", "error", "failed"].includes(String(runtimeQueueSource.status || "").toLowerCase());
+    merged.status = terminal ? runtimeQueueSource.status : "submitted";
     merged.relevance = "direct";
     merged.threadId = runtimeQueueSource.threadId || merged.threadId || null;
     merged.turnId = runtimeQueueSource.turnId || merged.turnId || null;
-    merged.responsePreview = runtimeQueueSource.responsePreview;
+    merged.responsePreview = runtimeQueueSource.responsePreview ?? merged.responsePreview;
     merged.retryAfterAt = null;
   }
 
@@ -1750,7 +1762,7 @@ function mergeStateSnapshots(currentState, incomingState) {
 function compactQueueHistory(queue) {
   const configured = Number.parseInt(process.env.BLUN_TELEGRAM_QUEUE_HISTORY_LIMIT || "500", 10);
   const historyLimit = Number.isFinite(configured) && configured >= 50 ? configured : 500;
-  const terminalStatuses = new Set(["delivered", "expired", "ignored_bot", "suppressed_ack", "stale_thread"]);
+  const terminalStatuses = new Set(["delivered", "replied", "cancelled", "failed", "expired", "ignored_bot", "suppressed_ack", "stale_thread"]);
   const active = [];
   const terminal = [];
   for (const entry of queue || []) {
@@ -1898,7 +1910,11 @@ function normalizeInbound(message, updateType = "message") {
   const telegramThreadId = message.message_thread_id ? String(message.message_thread_id) : "";
   const chatId = String(message.chat.id);
   const sender = message.from || message.sender_chat || {};
+  const receivedAt = nowIso();
   return {
+    id: `telegram:${chatId}:${String(message.message_id)}`,
+    source: "telegram",
+    sourceMessageId: String(message.message_id),
     chatId,
     messageId: String(message.message_id),
     replyToMessageId: message.reply_to_message ? String(message.reply_to_message.message_id) : "",
@@ -1913,7 +1929,10 @@ function normalizeInbound(message, updateType = "message") {
     userId: sender.id ? String(sender.id) : "",
     text,
     attachment: pickTelegramAttachment(message),
-    ts: nowIso(),
+    ts: receivedAt,
+    createdAt: receivedAt,
+    availableAt: receivedAt,
+    leaseUntil: null,
     intent: "message",
     relevance: "ambient",
     updateType,
@@ -2077,7 +2096,11 @@ function normalizeTeamRelayInbound(config, state, event) {
   const conversationKey = firstRelayText(event, "conversationKey", "conversation_key") || `${chatId}:${telegramThreadId || "root"}`;
   const scope = firstRelayText(event, "scope");
   const priority = firstRelayText(event, "priority");
+  const receivedAt = String(event.ts || "").trim() || nowIso();
   const inbound = {
+    id: `team-relay:${chatId}:${messageId}`,
+    source: "team-relay",
+    sourceMessageId: messageId,
     chatId,
     messageId,
     replyToMessageId: firstRelayText(event, "replyToMessageId", "reply_to_message_id"),
@@ -2089,7 +2112,10 @@ function normalizeTeamRelayInbound(config, state, event) {
     user: String(event.user || sourceAgent || "team-relay").trim() || "team-relay",
     userId: firstRelayText(event, "userId", "user_id"),
     text,
-    ts: String(event.ts || "").trim() || nowIso(),
+    ts: receivedAt,
+    createdAt: receivedAt,
+    availableAt: receivedAt,
+    leaseUntil: null,
     intent: "message",
     relevance: "ambient",
     status: "queued",
@@ -2173,14 +2199,13 @@ function normalizeTelegramThreadId(value) {
   return String(value || "").trim();
 }
 
-function isAllowedChat(config, inbound) {
+export function isAllowedChat(config, inbound) {
   const allowed = Array.isArray(config.allowedChatIds) ? config.allowedChatIds : [];
   if (allowed.length === 0) {
-    return true;
+    return false;
   }
   const chatId = String(inbound?.chatId || inbound || "").trim();
-  const userId = String(inbound?.userId || "").trim();
-  return allowed.includes(chatId) || (userId && allowed.includes(userId));
+  return allowed.includes(chatId);
 }
 
 function splitTelegramText(text, maxLength = 3500) {
@@ -2739,6 +2764,9 @@ function shouldTrackPendingReply(config, message) {
   if (!message) {
     return false;
   }
+  if (message.noTelegramReply === true) {
+    return false;
+  }
   if (String(message.relevance || "").trim().toLowerCase() === "observe") {
     return false;
   }
@@ -2754,12 +2782,6 @@ function shouldTrackPendingReply(config, message) {
   }
   const chatType = String(message.chatType || "").trim().toLowerCase();
   return chatType === "group" || chatType === "supergroup";
-}
-
-function usesVisibleConsoleInject(config) {
-  return String(config?.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "")
-    .trim()
-    .toLowerCase() === "force";
 }
 
 function parseUnixSeconds(isoString) {
@@ -3028,6 +3050,7 @@ export function bridgeStatus() {
   }
   const queued = state.queue.filter((item) => item.status === "queued");
   const submitted = state.queue.filter((item) => item.status === "submitted");
+  const running = state.queue.filter((item) => item.status === "running");
   const parked = state.queue.filter((item) => item.status === "parked");
   const ambient = queued.filter((item) => item.relevance === "ambient");
   const observe = queued.filter((item) => item.relevance === "observe");
@@ -3036,6 +3059,7 @@ export function bridgeStatus() {
   return {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
+    allowlistConfigured: config.allowedChatIds.length > 0,
     boundThreadId: config.currentThreadId || state.currentThreadId || null,
     frontendOwnerPid: runtimeOwner?.frontendHostPid || null,
     frontendOwnerAlive: runtimeOwner?.frontendAlive ?? null,
@@ -3048,6 +3072,7 @@ export function bridgeStatus() {
     ambientQueueDepth: ambient.length,
     parkedQueueDepth: parked.length,
     submittedDepth: submitted.length,
+    runningDepth: running.length,
     pendingReplyDepth: pendingReplies.length,
     expiredPendingReplyDepth: expiredReplies.length,
     progressRelayMode: getProgressRelayMode(config),
@@ -3057,7 +3082,7 @@ export function bridgeStatus() {
     lastInjectAt: state.lastInjectAt,
     teamRelay: teamRelayStatus(config),
     stateDir: config.paths.root,
-    note: "Telegram first lands in queue. Use BLUN_TELEGRAM_GROUP_DELIVERY=observe for team-wide group visibility without automatic Telegram replies, all for eager group delivery, mentions for strict routing."
+    note: "The durable runtime queue is authoritative. Telegram intake is disabled until an allowlist is configured."
   };
 }
 
@@ -3632,9 +3657,13 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
   }
   const now = nowIso();
   const sourceMessageId = String(sourceEntry.messageId || "").trim();
+  const catchupMessageId = `catchup-${sourceMessageId}-${Date.now()}`;
   const catchup = {
+    id: `runtime:${catchupMessageId}`,
+    source: "runtime",
+    sourceMessageId: catchupMessageId,
     chatId: String(sourceEntry.chatId || "").trim(),
-    messageId: `catchup-${sourceMessageId}-${Date.now()}`,
+    messageId: catchupMessageId,
     replyToMessageId: String(sourceEntry.replyToMessageId || sourceEntry.messageId || "").trim(),
     telegramThreadId: normalizeTelegramThreadId(sourceEntry.telegramThreadId),
     chatType: String(sourceEntry.chatType || "").trim(),
@@ -3646,7 +3675,7 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
     text: [
       "Catch-up nach direktem Telegram-Auftrag:",
       "Seit Start des letzten Alfred-Turns sind weitere Gruppenmeldungen eingetroffen.",
-      "Verarbeite sie ueber den Agentgruppen-Kontext. Wenn der letzte Auftrag Wiederholen/Test war, liefere die fehlenden Meldungen vollstaendig nach; sonst antworte nur bei konkretem Mehrwert."
+      "Verarbeite sie über den Agentgruppen-Kontext. Wenn der letzte Auftrag Wiederholen/Test war, liefere die fehlenden Meldungen vollständig nach; sonst antworte nur bei konkretem Mehrwert."
     ].join(" "),
     sourceText: "CodexLink catch-up turn for parked group messages.",
     relevance: "direct",
@@ -3654,6 +3683,8 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
     status: "queued",
     ts: now,
     createdAt: now,
+    availableAt: now,
+    leaseUntil: null,
     updateType: "catchup",
     catchupForMessageId: sourceMessageId,
     catchupObserveRefs: entries.map((entry) => String(entry.messageId || "").trim()).filter(Boolean),
@@ -3669,7 +3700,7 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
 
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
-  const state = loadState(config);
+  let state = loadState(config);
   const recoveredInjecting = recoverStaleInjectingEntriesInPlace(state.queue || []);
   const reclassified = reclassifyQueuedEntriesInPlace(config, state.queue || []);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
@@ -3702,7 +3733,7 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  const next = selectNextQueuedEntry(state.queue || [], {
+  let next = selectNextQueuedEntry(state.queue || [], {
     auto,
     dispatchMode: config.dispatchMode,
     submitAllQueued: shouldSubmitEveryAllowedMessage(config)
@@ -3795,7 +3826,7 @@ export async function injectNext(threadId, options = {}) {
     forcePreferred: Boolean(explicitThreadId || config.currentThreadId)
   });
   if (!resolvedThreadId) {
-    throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
+    throw new Error("No bound thread id. Use runtime_bind_thread first.");
   }
   const staleThreadPendingReplies = closeStaleThreadPendingRepliesInPlace(state.pendingReplies || [], resolvedThreadId);
   if (staleThreadPendingReplies > 0) {
@@ -3877,6 +3908,17 @@ export async function injectNext(threadId, options = {}) {
       };
     }
   }
+  const selectedQueueKey = queueKey(next);
+  const latestBeforeClaim = loadState(config);
+  state = mergeStateSnapshots(latestBeforeClaim, state);
+  next = (state.queue || []).find((entry) => queueKey(entry) === selectedQueueKey) || null;
+  if (!next || String(next.status || "").toLowerCase() !== "queued") {
+    return {
+      ok: true,
+      status: "deferred",
+      reason: "queue_item_no_longer_claimable"
+    };
+  }
   next = attachAgentGroupContextBlock(config, state, next);
 
   let promoted = 0;
@@ -3895,22 +3937,20 @@ export async function injectNext(threadId, options = {}) {
   next.lastAttemptAt = nowIso();
   next.status = "injecting";
   next.injectStartedAt = next.lastAttemptAt;
+  next.leasedAt = next.lastAttemptAt;
+  next.leaseUntil = new Date(Date.now() + Math.max(60000, Number(config.resumeTimeoutMs || 15000) * 4)).toISOString();
   next.retryAfterAt = null;
   markMatchingQueueEntriesInPlace(state, next, {
     status: "injecting",
     attempts: next.attempts,
     lastAttemptAt: next.lastAttemptAt,
     injectStartedAt: next.injectStartedAt,
+    leasedAt: next.leasedAt,
+    leaseUntil: next.leaseUntil,
     retryAfterAt: null
   });
   let sessionPath = "";
   let sessionOffset = 0;
-  if (useAppServer) {
-    sessionPath = await resolveThreadSessionPath(config, resolvedThreadId);
-    if (sessionPath && existsSync(sessionPath)) {
-      sessionOffset = statSync(sessionPath).size;
-    }
-  }
   if (!useAppServer && !next.historyLoggedAt) {
     const historyEntry = appendHistoryEntry(config, resolvedThreadId, next);
     if (historyEntry) {
@@ -3943,16 +3983,23 @@ export async function injectNext(threadId, options = {}) {
   }
   if (result.busy) {
     const promotedThisAttempt = useAppServer ? false : promoteVisibleQueuedEntry(config, state, resolvedThreadId, next);
-    const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
+    const activeRetryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "750"), 10) || 750);
+    const overloadBaseMs = Math.max(250, Number(config.runtimeOverloadBaseMs || 500));
+    const overloadDelayMs = Math.min(30000, overloadBaseMs * Math.pow(2, Math.min(6, Math.max(0, next.attempts - 1))));
+    const retryMs = result.overloaded
+      ? overloadDelayMs + Math.floor(Math.random() * Math.max(100, overloadBaseMs))
+      : activeRetryMs;
     const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
     next.status = promotedThisAttempt ? "submitted" : "queued";
     next.retryAfterAt = retryAfterAt;
+    next.leaseUntil = null;
     markMatchingQueueEntriesInPlace(state, next, {
       status: next.status,
       injectFinishedAt: nowIso(),
-      retryAfterAt
+      retryAfterAt,
+      leaseUntil: null
     });
-    appendLog(config.paths.activityFile, `INJECT_BUSY thread=${resolvedThreadId} message=${next.messageId}`);
+    appendLog(config.paths.activityFile, `INJECT_BUSY thread=${resolvedThreadId} message=${next.messageId} overloaded=${result.overloaded ? 1 : 0} retry_ms=${retryMs}`);
     const latestState = loadState(config);
     markMatchingQueueEntriesInPlace(latestState, next, {
       status: next.status,
@@ -3968,9 +4015,12 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  next.status = result.ok ? "delivered" : "error";
-  next.deliveredAt = nowIso();
+  const injectFinishedAt = nowIso();
+  next.status = result.ok ? "submitted" : "error";
+  next.submittedAt = result.ok ? injectFinishedAt : null;
+  next.deliveredAt = result.ok ? null : injectFinishedAt;
   next.retryAfterAt = null;
+  next.leaseUntil = null;
   next.threadId = resolvedThreadId;
   next.turnId = String(result.turnId || "").trim() || null;
   next.responsePreview = result.responseText.slice(0, 400);
@@ -3979,13 +4029,15 @@ export async function injectNext(threadId, options = {}) {
   const injectResultUpdates = {
     status: next.status,
     deliveredAt: next.deliveredAt,
+    submittedAt: next.submittedAt,
     threadId: next.threadId,
     turnId: next.turnId,
     responsePreview: next.responsePreview,
     stderr: next.stderr,
     stdout: next.stdout,
-    injectFinishedAt: next.deliveredAt,
-    retryAfterAt: null
+    injectFinishedAt,
+    retryAfterAt: null,
+    leaseUntil: null
   };
   markMatchingDeliveryStateInPlace(state, next, injectResultUpdates);
   if (result.ok) {
@@ -3995,7 +4047,14 @@ export async function injectNext(threadId, options = {}) {
     }
   }
   if (useAppServer && result.ok) {
-    if (!shouldTrackPendingReply(config, next)) {
+    const trackPendingReply = shouldTrackPendingReply(config, next);
+    if (!trackPendingReply) {
+      next.status = "delivered";
+      next.deliveredAt = injectFinishedAt;
+      markMatchingQueueEntriesInPlace(state, next, {
+        status: next.status,
+        deliveredAt: next.deliveredAt
+      });
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
     } else {
       const pendingReply = buildPendingReplyEntry(next, resolvedThreadId, next.turnId, sessionPath, sessionOffset);
@@ -4023,7 +4082,7 @@ export async function injectNext(threadId, options = {}) {
   appendLog(config.paths.activityFile, `INJECT_${result.ok ? "OK" : "ERROR"} thread=${resolvedThreadId} message=${next.messageId}`);
   return {
     ok: result.ok,
-    status: result.ok ? "delivered" : "error",
+    status: result.ok ? next.status : "error",
     threadId: resolvedThreadId,
     message: next,
     responsePreview: result.responseText.slice(0, 400),
@@ -4033,6 +4092,15 @@ export async function injectNext(threadId, options = {}) {
 
 export async function relayRepliesOnce() {
   const config = loadConfig();
+  if (config.appServerWsUrl) {
+    const state = loadState(config);
+    return {
+      ok: true,
+      status: "app_server_events",
+      delivered: 0,
+      pending: (state.pendingReplies || []).filter((entry) => isNonTerminalPendingReply(entry)).length
+    };
+  }
   scheduleMnemoOutboundRetryDrain(config);
   const state = loadState(config);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
@@ -4347,6 +4415,199 @@ export async function reply(text, options = {}) {
   });
   saveStateForConfig(config, state);
   return result;
+}
+
+export function enqueueRuntimeMessage(text, options = {}) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const value = String(text || "").trim();
+  if (!value) {
+    throw new Error("Runtime queue text is empty.");
+  }
+  if (value.length > 100000) {
+    const error = new Error("Runtime queue text exceeds 100000 characters.");
+    error.statusCode = 413;
+    throw error;
+  }
+  const createdAt = nowIso();
+  const messageId = String(options.messageId || randomUUID()).trim();
+  const chatId = String(options.chatId || `runtime:${config.agentName}`).trim();
+  const item = {
+    id: `runtime:${messageId}`,
+    source: String(options.source || "mcp"),
+    sourceMessageId: messageId,
+    chatId,
+    messageId,
+    replyToMessageId: "",
+    telegramThreadId: "",
+    chatType: "runtime",
+    senderIsBot: false,
+    conversationKey: String(options.conversationKey || `${chatId}:runtime`),
+    groupTitle: "",
+    user: String(options.user || "CodexLink MCP"),
+    userId: "",
+    text: value,
+    ts: createdAt,
+    createdAt,
+    availableAt: createdAt,
+    leaseUntil: null,
+    intent: "message",
+    relevance: "direct",
+    updateType: "runtime",
+    status: "queued",
+    attempts: 0,
+    lastAttemptAt: null,
+    noTelegramReply: options.noTelegramReply !== false
+  };
+  if (hasKnownInboundMessage(state, item)) {
+    return { ok: true, duplicate: true, item: state.queue.find((entry) => queueKey(entry) === queueKey(item)) || item };
+  }
+  state.queue.push(item);
+  state.lastInbound = item;
+  appendJsonl(config.paths.inboxFile, item);
+  appendLog(config.paths.activityFile, `RUNTIME_ENQUEUE id=${item.id} source=${item.source}`);
+  saveStateForConfig(config, state);
+  return { ok: true, duplicate: false, item };
+}
+
+export function cancelRuntimeQueueItem(identifier) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const key = String(identifier || "").trim();
+  if (!key) {
+    throw new Error("Queue item id is required.");
+  }
+  const item = (state.queue || []).find((entry) => {
+    return String(entry.id || "") === key
+      || String(entry.messageId || "") === key
+      || queueKey(entry) === key;
+  });
+  if (!item) {
+    throw new Error(`Queue item not found: ${key}`);
+  }
+  if (!["queued", "parked", "error", "failed"].includes(String(item.status || "").toLowerCase())) {
+    const error = new Error(`Queue item ${key} cannot be cancelled while status is ${item.status}.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  item.status = "cancelled";
+  item.cancelledAt = nowIso();
+  item.leaseUntil = null;
+  item.retryAfterAt = null;
+  saveStateForConfig(config, state);
+  appendLog(config.paths.activityFile, `RUNTIME_CANCEL id=${item.id || item.messageId}`);
+  return { ok: true, item };
+}
+
+export async function completeRuntimeTurnFromEvent(event) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const turnId = String(event?.turnId || "").trim();
+  const threadId = String(event?.threadId || "").trim();
+  const status = String(event?.status || "completed").trim().toLowerCase();
+  const finalText = String(event?.finalText || "").trim();
+  const pending = (state.pendingReplies || []).find((entry) => {
+    if (!isReplyAwaitingOutcome(entry)) {
+      return false;
+    }
+    if (turnId && String(entry.turnId || "").trim() === turnId) {
+      return true;
+    }
+    return !entry.turnId && threadId && String(entry.threadId || "").trim() === threadId;
+  });
+
+  if (!pending) {
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_EVENT_UNMATCHED thread=${threadId || "-"} turn=${turnId || "-"} status=${status}`);
+    return { ok: true, matched: false, turnId, status };
+  }
+
+  pending.turnId = pending.turnId || turnId;
+  pending.lastSignalAt = event.completedAt || nowIso();
+  if (status !== "completed") {
+    pending.sentAt = pending.lastSignalAt;
+    pending.status = status === "interrupted" ? "aborted" : "error";
+    pending.responsePreview = String(event?.error?.message || `[turn ${status}]`).slice(0, 400);
+    markMatchingQueueEntriesInPlace(state, pending, {
+      status: status === "interrupted" ? "cancelled" : "failed",
+      deliveredAt: pending.sentAt,
+      threadId: pending.threadId,
+      turnId: pending.turnId,
+      responsePreview: pending.responsePreview
+    });
+    saveStateForConfig(config, state);
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_${status.toUpperCase()} thread=${threadId || "-"} turn=${turnId || "-"}`);
+    return { ok: true, matched: true, delivered: false, turnId, status };
+  }
+
+  if (!finalText) {
+    pending.sentAt = pending.lastSignalAt;
+    pending.status = "no_reply_completed";
+    pending.responsePreview = "[turn completed without reply]";
+    markMatchingQueueEntriesInPlace(state, pending, {
+      status: "delivered",
+      deliveredAt: pending.sentAt,
+      threadId: pending.threadId,
+      turnId: pending.turnId,
+      responsePreview: pending.responsePreview
+    });
+    enqueueCatchupTurnIfNeeded(config, state, pending);
+    saveStateForConfig(config, state);
+    return { ok: true, matched: true, delivered: false, turnId, status };
+  }
+
+  if (pending.intent === "continue_nudge" && (looksLikeAckOnly(finalText) || looksLikeContextRequestOnly(finalText))) {
+    pending.sentAt = pending.lastSignalAt;
+    pending.status = "suppressed_ack";
+    pending.responsePreview = finalText.slice(0, 400);
+    markMatchingQueueEntriesInPlace(state, pending, {
+      status: "delivered",
+      deliveredAt: pending.sentAt,
+      threadId: pending.threadId,
+      turnId: pending.turnId,
+      responsePreview: pending.responsePreview
+    });
+    saveStateForConfig(config, state);
+    return { ok: true, matched: true, delivered: false, suppressed: true, turnId, status };
+  }
+
+  if (isPrivateChatType(pending.chatType) && isPrivateReplySuppressed(config)) {
+    pending.sentAt = pending.lastSignalAt;
+    pending.status = "suppressed_private_reply";
+    pending.responsePreview = finalText.slice(0, 400);
+    markMatchingQueueEntriesInPlace(state, pending, {
+      status: "delivered",
+      deliveredAt: pending.sentAt,
+      threadId: pending.threadId,
+      turnId: pending.turnId,
+      responsePreview: pending.responsePreview
+    });
+    saveStateForConfig(config, state);
+    return { ok: true, matched: true, delivered: false, suppressed: true, turnId, status };
+  }
+
+  const outbound = await sendOutboundChunks(config, state, {
+    chatId: pending.chatId,
+    text: finalText,
+    replyToMessageId: pending.replyToMessageId,
+    telegramThreadId: pending.telegramThreadId,
+    source: "auto",
+    sourceTurnId: pending.turnId
+  });
+  pending.sentAt = nowIso();
+  pending.status = "sent";
+  pending.responsePreview = finalText.slice(0, 400);
+  pending.responseMessageIds = outbound.messageIds;
+  markMatchingQueueEntriesInPlace(state, pending, {
+    status: "replied",
+    deliveredAt: pending.sentAt,
+    threadId: pending.threadId,
+    turnId: pending.turnId,
+    responsePreview: pending.responsePreview
+  });
+  enqueueCatchupTurnIfNeeded(config, state, pending);
+  saveStateForConfig(config, state);
+  appendLog(config.paths.activityFile, `RUNTIME_REPLY_SENT thread=${threadId || "-"} turn=${turnId || "-"} outbound=${outbound.messageIds.join(",")}`);
+  return { ok: true, matched: true, delivered: true, turnId, status, messageIds: outbound.messageIds };
 }
 
 export function tailActivity(lines = 20) {

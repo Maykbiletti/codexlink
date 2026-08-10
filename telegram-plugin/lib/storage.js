@@ -88,6 +88,7 @@ export function readTail(path, lines = 20) {
 
 export function defaultState() {
   return {
+    schemaVersion: 2,
     offset: 0,
     currentThreadId: "",
     queue: [],
