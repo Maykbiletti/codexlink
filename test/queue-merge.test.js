@@ -16,7 +16,7 @@ test("a stale submitted snapshot cannot overwrite a replied queue item", () => {
     status: "submitted",
     turnId: "turn-1",
     injectFinishedAt: "2026-01-01T00:00:02.000Z",
-    responsePreview: "turn_queued thread=thread-1 app_server=turn_start"
+    responsePreview: "turn_started thread=thread-1 app_server=turn_start"
   };
 
   const merged = mergeQueueEntry(replied, stale);

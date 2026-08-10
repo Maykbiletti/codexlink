@@ -1156,7 +1156,7 @@ function pickIsoLater(left, right) {
 }
 
 function hasRuntimeTurnQueueResult(entry) {
-  return /^turn_queued\b/i.test(String(entry?.responsePreview || ""))
+  return /^turn_(?:queued|started)\b/i.test(String(entry?.responsePreview || ""))
     || Boolean(entry?.turnId && (entry?.deliveredAt || entry?.injectFinishedAt));
 }
 
@@ -3593,11 +3593,24 @@ function compareQueuedDispatchOrder(left, right) {
   return String(left?.messageId || "").localeCompare(String(right?.messageId || ""));
 }
 
-async function resolveRuntimeActiveTurnId(config, threadId) {
+async function resolveRuntimeDispatchState(config, threadId, runtimeDispatchGate) {
   const wsUrl = String(config?.appServerWsUrl || "").trim();
   const resolvedThreadId = String(threadId || "").trim();
   if (!wsUrl || !resolvedThreadId) {
-    return "";
+    return { ready: false, reason: "thread_unbound", activeTurnId: "", threadStatus: "unknown" };
+  }
+  if (typeof runtimeDispatchGate === "function") {
+    try {
+      const state = await runtimeDispatchGate(resolvedThreadId);
+      return {
+        ready: state?.ready === true,
+        reason: String(state?.reason || (state?.ready ? "ready" : "status_unknown")),
+        activeTurnId: String(state?.activeTurnId || "").trim(),
+        threadStatus: String(state?.threadStatus || "unknown")
+      };
+    } catch {
+      return { ready: false, reason: "event_stream_unavailable", activeTurnId: "", threadStatus: "unknown" };
+    }
   }
   try {
     const result = await getActiveTurnIdOverWs({
@@ -3605,9 +3618,19 @@ async function resolveRuntimeActiveTurnId(config, threadId) {
       threadId: resolvedThreadId,
       timeoutMs: Math.min(Number(config.resumeTimeoutMs || 10000) || 10000, 5000)
     });
-    return result?.ok ? String(result.activeTurnId || "").trim() : "";
+    if (!result?.ok) {
+      return { ready: false, reason: "status_unknown", activeTurnId: "", threadStatus: "unknown" };
+    }
+    const threadStatus = String(result.statusType || "").trim();
+    const activeTurnId = String(result.activeTurnId || "").trim();
+    return {
+      ready: threadStatus.toLowerCase() === "idle" && !activeTurnId,
+      reason: activeTurnId ? "active_turn" : (threadStatus.toLowerCase() === "idle" ? "ready" : "status_unknown"),
+      activeTurnId,
+      threadStatus: threadStatus || "unknown"
+    };
   } catch {
-    return "";
+    return { ready: false, reason: "status_unknown", activeTurnId: "", threadStatus: "unknown" };
   }
 }
 
@@ -3984,9 +4007,14 @@ export async function injectNext(threadId, options = {}) {
     || (useAppServer ? state.currentThreadId : config.currentThreadId)
     || ""
   ).trim();
-  let resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId, {
-    forcePreferred: Boolean(explicitThreadId || config.currentThreadId)
-  });
+  const runtimeDispatchGate = typeof options.runtimeDispatchGate === "function"
+    ? options.runtimeDispatchGate
+    : null;
+  let resolvedThreadId = runtimeDispatchGate && preferredThreadId
+    ? preferredThreadId
+    : await resolveActiveThreadId(config, state, preferredThreadId, {
+      forcePreferred: Boolean(explicitThreadId || config.currentThreadId)
+    });
   if (!resolvedThreadId) {
     throw new Error("No bound thread id. Use runtime_bind_thread first.");
   }
@@ -4039,33 +4067,32 @@ export async function injectNext(threadId, options = {}) {
       }
     }
   }
-  if (useRuntimeTurnQueue && !bypassDeferredGate) {
+  if (useRuntimeTurnQueue) {
     appendLog(config.paths.activityFile, `RUNTIME_TURN_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
-    const activeTurnId = await resolveRuntimeActiveTurnId(config, resolvedThreadId);
-    if (activeTurnId) {
-      const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
-      const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
+    const dispatchState = await resolveRuntimeDispatchState(config, resolvedThreadId, runtimeDispatchGate);
+    if (!dispatchState.ready) {
       const checkedAt = nowIso();
       next.status = "queued";
       next.lastAttemptAt = checkedAt;
-      next.retryAfterAt = retryAfterAt;
-      next.activeTurnId = activeTurnId;
-      next.responsePreview = "waiting_for_active_turn";
+      next.retryAfterAt = null;
+      next.activeTurnId = dispatchState.activeTurnId || null;
+      next.responsePreview = `waiting_for_${dispatchState.reason}`;
       markMatchingQueueEntriesInPlace(state, next, {
         status: next.status,
         lastAttemptAt: next.lastAttemptAt,
-        retryAfterAt,
-        activeTurnId,
+        retryAfterAt: null,
+        activeTurnId: next.activeTurnId,
         responsePreview: next.responsePreview
       });
-      appendLog(config.paths.activityFile, `RUNTIME_TURN_DEFER message=${next.messageId} active_turn=${activeTurnId} retry_after=${retryAfterAt}`);
+      appendLog(config.paths.activityFile, `RUNTIME_TURN_DEFER message=${next.messageId} reason=${dispatchState.reason} thread_status=${dispatchState.threadStatus} active_turn=${dispatchState.activeTurnId || "-"}`);
       saveStateForConfig(config, state);
       return {
         ok: false,
         status: "deferred",
-        reason: "runtime_active_turn",
-        activeTurnId,
-        retryAfterAt,
+        reason: `runtime_${dispatchState.reason}`,
+        activeTurnId: dispatchState.activeTurnId || "",
+        threadStatus: dispatchState.threadStatus,
+        retryAfterAt: null,
         message: next
       };
     }

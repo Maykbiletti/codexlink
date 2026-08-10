@@ -95,3 +95,91 @@ test("completed app-server items are correlated with their turn", async (t) => {
   assert.equal(completions[0].finalText, "Fertig.");
   assert.equal(completions[0].turnId, "turn-1");
 });
+
+test("runtime dispatch waits for an authoritative idle thread event", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  });
+  bridge.connected = true;
+  bridge.threadId = "thread-1";
+  bridge.client = {};
+
+  assert.equal(bridge.getDispatchState("thread-1").ready, false);
+  assert.equal(bridge.getDispatchState("thread-1").reason, "status_unknown");
+
+  await bridge._handleNotification({
+    method: "thread/status/changed",
+    params: { threadId: "thread-1", status: { type: "active" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "active_turn");
+
+  await bridge._handleNotification({
+    method: "thread/status/changed",
+    params: { threadId: "thread-1", status: { type: "idle" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  await bridge._handleNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-cli-1", status: "completed" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").ready, true);
+});
+
+test("one started runtime turn locks dispatch until its matching completion and idle", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let releaseStart;
+  const startBarrier = new Promise((resolve) => { releaseStart = resolve; });
+  let markStartEntered;
+  const startEntered = new Promise((resolve) => { markStartEntered = resolve; });
+  let starts = 0;
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  });
+  bridge.connected = true;
+  bridge.threadId = "thread-1";
+  bridge.threadStatus = "idle";
+  bridge.client = {
+    startTurn: async () => {
+      starts += 1;
+      markStartEntered();
+      await startBarrier;
+      return { ok: true, busy: false, turnId: "turn-runtime-1" };
+    }
+  };
+
+  const first = bridge.startTurn({ threadId: "thread-1", text: "first" });
+  await startEntered;
+  const competing = await bridge.startTurn({ threadId: "thread-1", text: "second" });
+  assert.equal(competing.ok, false);
+  assert.equal(competing.reason, "dispatch_in_flight");
+  assert.equal(starts, 1);
+
+  releaseStart();
+  const started = await first;
+  assert.equal(started.turnId, "turn-runtime-1");
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  await bridge._handleNotification({
+    method: "thread/status/changed",
+    params: { threadId: "thread-1", status: { type: "idle" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").reason, "turn_completion_pending");
+
+  await bridge._handleNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-runtime-1", status: "completed" } }
+  });
+  assert.equal(bridge.getDispatchState("thread-1").ready, true);
+});

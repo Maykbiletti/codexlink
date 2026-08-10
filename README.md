@@ -144,6 +144,14 @@ claims one eligible item, starts it with app-server `turn/start`, and leaves all
 later items queued while that turn is active. Normal inbound work never uses
 `turn/steer`, keyboard injection, or `codex exec resume`.
 
+The persistent app-server event stream is the dispatch gate. A message can
+leave `queued` only after the bound thread reports `idle`; `active`, an unknown
+status, or a disconnected event stream fails closed. After `turn/start`, the
+next item remains locked until the matching `turn/completed` event has arrived
+and the thread is idle again. This gives Telegram turns the same serial
+follow-up behavior as CLI input without trying to write into the TUI's private
+composer buffer.
+
 The lifecycle is:
 
 ```text

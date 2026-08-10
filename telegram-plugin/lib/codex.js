@@ -1,4 +1,4 @@
-import { startQueuedTextTurnOverWs } from "./app-server-client.js";
+import { startTextTurnWhenIdleOverWs } from "./app-server-client.js";
 
 let runtimeTurnStarter = null;
 
@@ -246,7 +246,7 @@ export async function injectIntoThread(config, message, threadId) {
   const promptMessage = Object.assign({}, message, { mnemoContextBlock: "" });
   const turnInput = buildTurnInput(config, promptMessage);
   if (config.appServerWsUrl) {
-    const startTurn = runtimeTurnStarter || startQueuedTextTurnOverWs;
+    const startTurn = runtimeTurnStarter || startTextTurnWhenIdleOverWs;
     const result = await startTurn({
       wsUrl: config.appServerWsUrl,
       threadId,
@@ -266,10 +266,9 @@ export async function injectIntoThread(config, message, threadId) {
         turnId: result.turnId || "",
         code: 0,
         signal: null,
-        responseText: `turn_queued thread=${threadId} app_server=turn_start${result.queuedBehindActiveTurn ? " behind_active_turn=1" : ""}`,
+        responseText: `turn_started thread=${threadId} app_server=turn_start`,
         stdout: "",
         stderr: "",
-        queuedBehindActiveTurn: Boolean(result.queuedBehindActiveTurn),
         activeTurnId: result.activeTurnId || ""
       };
     }

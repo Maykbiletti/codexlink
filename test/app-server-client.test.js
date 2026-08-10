@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import test from "node:test";
 import { WebSocketServer } from "ws";
-import { AppServerClient } from "../telegram-plugin/lib/app-server-client.js";
+import { AppServerClient, startTextTurnWhenIdleOverWs } from "../telegram-plugin/lib/app-server-client.js";
 
 test("app-server WebSockets are restricted to loopback", () => {
   assert.throws(
@@ -67,4 +67,41 @@ test("app-server client uses Codex wire framing and starts a turn", async (t) =>
   assert.equal("responsesapiClientMetadata" in turn.params, false);
   assert.equal("model" in turn.params, false);
   assert.deepEqual(approval, { id: 91, result: { decision: "decline" } });
+});
+
+test("fallback turn submission fails closed while the thread is active", async (t) => {
+  let starts = 0;
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  server.on("connection", (socket) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.method === "initialize") {
+        socket.send(JSON.stringify({ id: message.id, result: { userAgent: "test" } }));
+      }
+      if (message.method === "thread/read") {
+        socket.send(JSON.stringify({
+          id: message.id,
+          result: { thread: { id: "thread-1", status: { type: "active" } } }
+        }));
+      }
+      if (message.method === "turn/start") {
+        starts += 1;
+      }
+    });
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const address = server.address();
+  const result = await startTextTurnWhenIdleOverWs({
+    wsUrl: `ws://127.0.0.1:${address.port}`,
+    threadId: "thread-1",
+    text: "must wait",
+    timeoutMs: 2000
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.busy, true);
+  assert.equal(result.reason, "active_turn");
+  assert.equal(starts, 0);
 });

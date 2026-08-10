@@ -12,14 +12,20 @@ The runtime daemon owns the durable queue and all transport loops:
 2. the dispatcher claims the oldest eligible item
 3. when the bound thread is idle, the daemon submits it with app-server
    `turn/start`
-4. app-server `item/completed` and `turn/completed` events complete the queue
+4. the next item stays locked until the matching `turn/completed` event and a
+   confirmed idle thread state
+5. app-server `item/completed` and `turn/completed` events complete the queue
    item and route the final answer back to Telegram
-5. on restart, `thread/read` recovers turns that completed while the daemon was
+6. on restart, `thread/read` recovers turns that completed while the daemon was
    offline
 
 Ordinary inbound work never uses `turn/steer`, terminal keyboard injection, or
 `codex exec resume`. The MCP server is a thin control plane over the same daemon
 and never owns a second queue.
+
+The daemon tracks `thread/status/changed` on its persistent app-server
+connection. Active, unknown, or disconnected states keep the head item queued;
+there is no fail-open status poll and no direct bypass for escalations.
 
 Queue lifecycle:
 

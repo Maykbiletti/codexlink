@@ -45,6 +45,21 @@ if (eventBridge) {
   setRuntimeTurnStarter((options) => eventBridge.startTurn(options));
 }
 
+function resolveBoundThreadId(current = loadConfig()) {
+  return String(current.currentThreadId || bridgeStatus().boundThreadId || "").trim();
+}
+
+async function dispatchRuntimeQueue(threadId = "", options = {}) {
+  const current = loadConfig();
+  const resolvedThreadId = String(threadId || resolveBoundThreadId(current)).trim();
+  return injectNext(resolvedThreadId, {
+    ...options,
+    runtimeDispatchGate: eventBridge
+      ? (candidateThreadId) => eventBridge.checkDispatchReady(candidateThreadId)
+      : null
+  });
+}
+
 const controller = new RuntimeController(config, {
   status: bridgeStatus,
   listQueue,
@@ -52,7 +67,7 @@ const controller = new RuntimeController(config, {
   cancel: cancelRuntimeQueueItem,
   bindThread: bindCurrentThread,
   poll: pollOnce,
-  dispatch: injectNext,
+  dispatch: dispatchRuntimeQueue,
   reply,
   relayReplies: relayRepliesOnce,
   teamRelay: consumeTeamRelayOnce,
@@ -116,11 +131,6 @@ async function tick() {
     void runExclusive("poll", pollOnce);
   }
 
-  if (now >= schedule.dispatch && !controller.paused && current.appServerWsUrl) {
-    schedule.dispatch = now + Math.max(250, current.injectIntervalMs);
-    void runExclusive("dispatch", () => injectNext("", { auto: true }));
-  }
-
   if (now >= schedule.teamRelay) {
     schedule.teamRelay = now + 1000;
     void runExclusive("team_relay", consumeTeamRelayOnce);
@@ -135,10 +145,15 @@ async function tick() {
 
   if (eventBridge && now >= schedule.eventStream) {
     schedule.eventStream = now + 1500;
-    const threadId = String(current.currentThreadId || bridgeStatus().boundThreadId || "").trim();
+    const threadId = resolveBoundThreadId(current);
     if (threadId) {
       void runExclusive("event_stream", () => eventBridge.ensureConnected(threadId));
     }
+  }
+
+  if (now >= schedule.dispatch && !controller.paused && current.appServerWsUrl) {
+    schedule.dispatch = now + Math.max(250, current.injectIntervalMs);
+    void runExclusive("dispatch", () => dispatchRuntimeQueue("", { auto: true }));
   }
 }
 

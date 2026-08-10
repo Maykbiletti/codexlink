@@ -70,6 +70,10 @@ function isThreadActive(response) {
   return String(response?.result?.thread?.status?.type || "").trim().toLowerCase() === "active";
 }
 
+function threadStatusType(response) {
+  return String(response?.result?.thread?.status?.type || "").trim();
+}
+
 function extractThreadPath(response) {
   return response?.result?.thread?.path
     || response?.result?.path
@@ -359,12 +363,14 @@ export async function getActiveTurnIdOverWs(options) {
     return {
       ok: true,
       activeTurnId: isThreadActive(response) ? "active" : "",
+      statusType: threadStatusType(response),
       response
     };
   } catch (error) {
     return {
       ok: false,
       activeTurnId: "",
+      statusType: "unknown",
       error
     };
   } finally {
@@ -372,22 +378,37 @@ export async function getActiveTurnIdOverWs(options) {
   }
 }
 
-export async function startQueuedTextTurnOverWs(options) {
+export async function startTextTurnWhenIdleOverWs(options) {
   const client = new AppServerClient(options.wsUrl, { timeoutMs: options.timeoutMs || 20000 });
   try {
     const input = Array.isArray(options.input) && options.input.length > 0
       ? normalizeUserInput(options.input)
       : buildTextInput(options.text);
 
-    let activeTurnId = "";
+    let statusResponse;
     try {
-      const statusResponse = await client.request("thread/read", {
+      statusResponse = await client.request("thread/read", {
         threadId: options.threadId,
         includeTurns: false
       }, { timeoutMs: Math.min(options.timeoutMs || 20000, 5000) });
-      activeTurnId = isThreadActive(statusResponse) ? "active" : "";
-    } catch {
-      activeTurnId = "";
+    } catch (error) {
+      return {
+        ok: false,
+        busy: true,
+        waitingForIdle: true,
+        reason: "status_unknown",
+        error
+      };
+    }
+    const statusType = threadStatusType(statusResponse).toLowerCase();
+    if (statusType !== "idle") {
+      return {
+        ok: false,
+        busy: true,
+        waitingForIdle: true,
+        reason: statusType === "active" ? "active_turn" : "status_unknown",
+        activeTurnId: statusType === "active" ? "active" : ""
+      };
     }
 
     const response = await client.request("turn/start", omitEmptyOverrides({
@@ -401,9 +422,7 @@ export async function startQueuedTextTurnOverWs(options) {
     return {
       ok: true,
       busy: false,
-      queuedBehindActiveTurn: Boolean(activeTurnId),
       turnId: extractTurnId(response),
-      activeTurnId,
       response
     };
   } catch (error) {
