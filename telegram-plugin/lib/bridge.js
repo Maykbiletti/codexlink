@@ -1687,6 +1687,15 @@ function isTrustedBotSender(config, entry) {
   return trustedBots.map((value) => foldTriggerText(value)).includes(sender);
 }
 
+function isOwnTelegramBotSender(config, entry) {
+  if (!looksLikeBotSender(entry) || String(entry?.source || "").trim().toLowerCase() !== "telegram") {
+    return false;
+  }
+  const ownBotId = String(config?.botToken || "").split(":", 1)[0].trim();
+  const senderId = String(entry?.userId || "").trim();
+  return Boolean(ownBotId && senderId && /^\d+$/.test(ownBotId) && senderId === ownBotId);
+}
+
 function shouldReplyToTeamBotSender(config, entry) {
   if (!looksLikeBotSender(entry)) {
     return true;
@@ -1715,7 +1724,13 @@ function shouldAcceptBotRelayEntry(config, entry) {
   if (!looksLikeBotSender(entry)) {
     return true;
   }
+  if (isOwnTelegramBotSender(config, entry) || !isGroupChatEntry(entry)) {
+    return false;
+  }
   if (isTrustedBotSender(config, entry)) {
+    return true;
+  }
+  if (shouldDeliverAllGroupMessages(config) || shouldObserveAllGroupMessages(config)) {
     return true;
   }
   const text = String(entry?.sourceText || entry?.text || "");
@@ -3434,7 +3449,8 @@ export async function pollOnce() {
     }
     if (!shouldAcceptBotRelayEntry(config, inbound)) {
       ignored += 1;
-      appendLog(config.paths.activityFile, `IGNORED_BOT_RELAY chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+      const reason = isOwnTelegramBotSender(config, inbound) ? "IGNORED_OWN_BOT" : "IGNORED_BOT_RELAY";
+      appendLog(config.paths.activityFile, `${reason} chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
       continue;
     }
     if (hasKnownInboundMessage(state, inbound)) {
@@ -3646,7 +3662,11 @@ function selectNextQueuedEntry(queue, options = {}) {
   const eligible = queued.filter((item) => {
     const relevance = String(item.relevance || "").toLowerCase();
     const chatType = String(item.chatType || "").toLowerCase();
-    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane";
+    return relevance === "escalation"
+      || chatType === "private"
+      || relevance === "direct"
+      || relevance === "lane"
+      || relevance === "observe";
   });
   return eligible.sort(compareQueuedDispatchOrder)[0] || null;
 }

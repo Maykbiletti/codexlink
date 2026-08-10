@@ -144,7 +144,10 @@ resolves them with `accept`, `acceptForSession`, `decline`, or `cancel`.
 
 `observe` is the safe default for group context. Direct messages and explicit
 agent mentions remain actionable. Non-addressed group messages can be supplied
-as context without generating an automatic Telegram reply.
+as context without generating an automatic Telegram reply. Messages from other
+bots in an allowed group follow the same route and enter the durable queue;
+messages from the current bot's own Telegram user id remain blocked to prevent
+feedback loops.
 
 Use strict routing when several agents share a group:
 

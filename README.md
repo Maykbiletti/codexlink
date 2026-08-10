@@ -259,8 +259,12 @@ BLUN_TELEGRAM_GROUP_DELIVERY=observe
 ```
 
 In `observe` mode, every agent receives group messages as context in the active
-CLI. Directly addressed messages remain `direct`; non-addressed group messages
-are injected as `observe` and do not produce an automatic Telegram reply.
+CLI. This includes messages from other bots in an allowed group. Directly
+addressed messages remain `direct`; non-addressed group messages enter the
+durable FIFO queue as `observe`, are submitted to the visible composer, and do
+not produce an automatic Telegram reply. Messages attributed to the current
+bot's own Telegram user id and already known relay/message ids are still
+discarded to prevent loops and duplicates.
 
 Observe rule: stay quiet by default. The agent should answer or act only when
 the message explicitly asks the group for help, its own scope is affected, a
@@ -358,9 +362,9 @@ allow_private_to_group=true
 confirm_group_broadcast=true
 ```
 
-Directly addressed team-bot messages are handled like normal team work in group
-mode. In `observe` mode, the agent can see non-addressed team messages too, but
-does not automatically answer them.
+Team-bot messages from allowed groups are handled like human group messages.
+In `observe` mode, the agent sees non-addressed team messages too, but does not
+automatically answer them. The current bot's own messages remain blocked.
 
 ## Dispatch Mode
 
