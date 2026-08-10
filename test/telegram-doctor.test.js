@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { doctorStateTransition, runTelegramDoctor } from "../telegram-plugin/lib/doctor.js";
+import { doctorStateTransition, inspectTelegramDoctor, runTelegramDoctor } from "../telegram-plugin/lib/doctor.js";
 import { callRuntimeRpc, createRuntimeRpcServer } from "../telegram-plugin/lib/runtime-rpc.js";
 import { currentProcessInstanceId, inspectStateLock } from "../telegram-plugin/lib/state-lock.js";
 
@@ -17,6 +17,7 @@ function fixture(t) {
     doctorWatchEnabled: false,
     doctorRpcTimeoutMs: 1000,
     doctorQueueStallMs: 10000,
+    pendingReplyTimeoutMs: 1000,
     runtimePort: 0,
     runtimeRpcTimeoutMs: 1000,
     paths: {
@@ -143,6 +144,127 @@ test("doctor reports only failure and recovery state changes", () => {
     previous: "stale_state_lock",
     next: "healthy"
   });
+});
+
+test("doctor reports a stale active turn even before the runtime claims idle", async (t) => {
+  const config = fixture(t);
+  config.appServerWsUrl = "ws://127.0.0.1:1";
+  config.currentThreadId = "thread-active";
+  writeFileSync(config.paths.stateFile, JSON.stringify({ offset: 1, queue: [], pendingReplies: [] }), "utf8");
+  writeFileSync(config.paths.runtimePidFile, `${process.pid}\n`, "utf8");
+  writeFileSync(`${config.paths.runtimePidFile}.meta.json`, JSON.stringify({
+    pid: process.pid,
+    scriptName: "runtime-daemon.js",
+    agentName: config.agentName,
+    stateDir: config.paths.root,
+    instanceId: currentProcessInstanceId(),
+    startedAt: new Date().toISOString()
+  }), "utf8");
+  const rpc = await createRuntimeRpcServer(config, async () => ({
+    ok: true,
+    pid: process.pid,
+    instanceId: currentProcessInstanceId(),
+    startedAt: new Date().toISOString(),
+    lastTickAt: new Date().toISOString(),
+    appServerEvents: {
+      connected: true,
+      threadId: "thread-active",
+      reason: "turn_completion_pending",
+      threadStatus: "active",
+      activeTurnId: "turn-stale",
+      statusUpdatedAt: new Date(Date.now() - 120000).toISOString()
+    }
+  }));
+  t.after(() => rpc.close());
+
+  const report = await inspectTelegramDoctor(config);
+
+  assert.equal(report.ok, false);
+  assert.equal(report.issues.some((entry) => entry.code === "active_turn_stalled"), true);
+});
+
+test("doctor reconciles a stale pending reply through runtime RPC without deleting history", async (t) => {
+  const config = fixture(t);
+  const old = new Date(Date.now() - 60000).toISOString();
+  writeFileSync(config.paths.stateFile, JSON.stringify({
+    offset: 1,
+    queue: [{
+      id: "telegram:1:77",
+      chatId: "1",
+      messageId: "77",
+      status: "running",
+      turnId: "turn-77"
+    }],
+    pendingReplies: [{
+      queueItemId: "telegram:1:77",
+      chatId: "1",
+      messageId: "77",
+      status: "pending",
+      turnId: "turn-77",
+      createdAt: old,
+      lastSignalAt: old,
+      sentAt: null,
+      responseMessageIds: []
+    }]
+  }), "utf8");
+  writeFileSync(config.paths.runtimePidFile, `${process.pid}\n`, "utf8");
+  writeFileSync(`${config.paths.runtimePidFile}.meta.json`, JSON.stringify({
+    pid: process.pid,
+    scriptName: "runtime-daemon.js",
+    agentName: config.agentName,
+    stateDir: config.paths.root,
+    instanceId: currentProcessInstanceId(),
+    startedAt: new Date().toISOString()
+  }), "utf8");
+
+  const methods = [];
+  const rpc = await createRuntimeRpcServer(config, async (method) => {
+    methods.push(method);
+    if (method === "runtime_health") {
+      return {
+        ok: true,
+        pid: process.pid,
+        instanceId: currentProcessInstanceId(),
+        startedAt: new Date().toISOString(),
+        lastTickAt: new Date().toISOString(),
+        appServerEvents: null
+      };
+    }
+    if (method === "runtime_events_reconcile") {
+      const state = JSON.parse(readFileSync(config.paths.stateFile, "utf8"));
+      state.pendingReplies[0].status = "sent";
+      state.pendingReplies[0].sentAt = new Date().toISOString();
+      state.pendingReplies[0].responseMessageIds = ["7001"];
+      state.queue[0].status = "replied";
+      writeFileSync(config.paths.stateFile, JSON.stringify(state), "utf8");
+      return { ok: true, reason: "idle_completion_recovered" };
+    }
+    if (method === "runtime_pending_replies_reconcile") {
+      const state = JSON.parse(readFileSync(config.paths.stateFile, "utf8"));
+      state.pendingReplies[0].status = "timeout_retry";
+      state.pendingReplies[0].sentAt = null;
+      state.pendingReplies[0].lastSignalAt = new Date().toISOString();
+      state.pendingReplies[0].replyRetryAttempts = 1;
+      writeFileSync(config.paths.stateFile, JSON.stringify(state), "utf8");
+      return { ok: true, retrying: 1, timedOut: 0, orphaned: 0, superseded: 0, open: 1 };
+    }
+    throw new Error(`unexpected method: ${method}`);
+  });
+  t.after(() => rpc.close());
+
+  const report = await runTelegramDoctor(config, { repair: true });
+
+  assert.equal(report.ok, true);
+  assert.equal(methods.includes("runtime_events_reconcile"), true);
+  assert.equal(methods.includes("runtime_pending_replies_reconcile"), true);
+  assert.equal(methods.indexOf("runtime_pending_replies_reconcile") < methods.indexOf("runtime_events_reconcile"), true);
+  assert.equal(report.actions.some((entry) => entry.startsWith("pending_replies_reconciled retrying=1")), true);
+  const saved = JSON.parse(readFileSync(config.paths.stateFile, "utf8"));
+  assert.equal(saved.pendingReplies.length, 1);
+  assert.equal(saved.pendingReplies[0].status, "sent");
+  assert.deepEqual(saved.pendingReplies[0].responseMessageIds, ["7001"]);
+  assert.equal(saved.queue.length, 1);
+  assert.equal(saved.queue[0].status, "replied");
 });
 
 test("doctor restarts a missing runtime daemon with the same profile", async (t) => {

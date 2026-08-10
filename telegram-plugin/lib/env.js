@@ -147,6 +147,8 @@ export function loadConfig() {
     idleCooldownMs: Number.parseInt(env.BLUN_TELEGRAM_IDLE_COOLDOWN_MS || "3000", 10) || 3000,
     ambientQueueTtlMs: Number.parseInt(env.BLUN_TELEGRAM_AMBIENT_QUEUE_TTL_MS || "600000", 10) || 600000,
     pendingReplyTimeoutMs: Number.parseInt(env.BLUN_TELEGRAM_PENDING_REPLY_TIMEOUT_MS || "1800000", 10) || 1800000,
+    pendingReplyRetryMax: Math.max(1, Number.parseInt(env.BLUN_TELEGRAM_PENDING_REPLY_RETRY_MAX || "3", 10) || 3),
+    pendingReplyRetryDelayMs: Math.max(1000, Number.parseInt(env.BLUN_TELEGRAM_PENDING_REPLY_RETRY_DELAY_MS || "30000", 10) || 30000),
     attachmentMaxBytes: Number.parseInt(env.BLUN_TELEGRAM_ATTACHMENT_MAX_BYTES || "52428800", 10) || 52428800,
     progressFallbackMs: Number.parseInt(env.BLUN_TELEGRAM_PROGRESS_FALLBACK_MS || "20000", 10) || 20000,
     progressRelayMode: env.BLUN_TELEGRAM_PROGRESS_RELAY?.trim().toLowerCase() || "status",

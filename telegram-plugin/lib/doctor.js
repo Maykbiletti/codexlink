@@ -43,13 +43,76 @@ function issue(code, severity, detail, repairable = false) {
 function queueSnapshot(config) {
   const state = readJson(config.paths.stateFile) || {};
   const queue = Array.isArray(state.queue) ? state.queue : [];
+  const pendingReplies = Array.isArray(state.pendingReplies) ? state.pendingReplies : [];
+  const terminalPendingStatuses = new Set([
+    "sent",
+    "suppressed_ack",
+    "suppressed_private_reply",
+    "error",
+    "ignored_bot",
+    "superseded",
+    "timeout",
+    "stale_thread",
+    "aborted",
+    "no_reply_completed",
+    "orphaned"
+  ]);
+  const terminalQueueStatuses = new Set([
+    "replied",
+    "cancelled",
+    "error",
+    "failed",
+    "reply_timeout",
+    "ignored_bot",
+    "suppressed_ack",
+    "stale_thread"
+  ]);
+  const timeoutMs = Math.max(0, Number(config.pendingReplyTimeoutMs || 1800000));
+  const pending = pendingReplies.map((entry) => {
+    const status = String(entry?.status || "pending").trim().toLowerCase();
+    const hasResponse = Array.isArray(entry?.responseMessageIds) && entry.responseMessageIds.some(Boolean);
+    const legacyExpired = status === "expired" && !hasResponse;
+    const open = (legacyExpired || !terminalPendingStatuses.has(status))
+      && (legacyExpired || !entry?.sentAt)
+      && !hasResponse;
+    const activityAt = entry?.lastSignalAt || entry?.progressSentAt || entry?.createdAt || "";
+    const pendingAgeMs = ageMs(activityAt);
+    const queueItemId = String(entry?.queueItemId || "").trim();
+    const queueEntry = queue.find((candidate) => {
+      if (queueItemId && String(candidate?.id || "").trim() === queueItemId) return true;
+      return String(candidate?.chatId || "") === String(entry?.chatId || "")
+        && String(candidate?.messageId || "") === String(entry?.messageId || "");
+    });
+    const queueStatus = String(queueEntry?.status || "").trim().toLowerCase();
+    const retryAfterMs = Date.parse(String(entry?.replyRetryAfterAt || ""));
+    const timeoutRetryDue = status === "timeout_retry"
+      && (!Number.isFinite(retryAfterMs) || retryAfterMs <= Date.now());
+    return {
+      status,
+      open,
+      ageMs: pendingAgeMs,
+      stalled: legacyExpired
+        || timeoutRetryDue
+        || (open && timeoutMs > 0 && pendingAgeMs !== null && pendingAgeMs >= timeoutMs),
+      orphaned: open && (!queueEntry || terminalQueueStatuses.has(queueStatus)),
+      expiredUnreconciled: legacyExpired
+    };
+  });
   return {
     depth: queue.filter((entry) => String(entry.status || "") === "queued").length,
     injecting: queue.filter((entry) => String(entry.status || "") === "injecting").length,
     submitted: queue.filter((entry) => ["submitted", "running"].includes(String(entry.status || ""))).length,
     lastPollAt: state.lastPollAt || null,
     lastInjectAt: state.lastInjectAt || null,
-    lastInboundAt: state.lastInbound?.ts || state.lastInbound?.createdAt || null
+    lastInboundAt: state.lastInbound?.ts || state.lastInbound?.createdAt || null,
+    pendingReplyOpen: pending.filter((entry) => entry.open).length,
+    pendingReplyExpired: pending.filter((entry) => entry.status === "expired").length,
+    pendingReplyStalled: pending.filter((entry) => entry.stalled).length,
+    pendingReplyOrphaned: pending.filter((entry) => entry.orphaned).length,
+    pendingReplyExpiredUnreconciled: pending.filter((entry) => entry.expiredUnreconciled).length,
+    oldestPendingReplyAgeMs: pending
+      .filter((entry) => entry.open && entry.ageMs !== null)
+      .reduce((oldest, entry) => Math.max(oldest, entry.ageMs), 0)
   };
 }
 
@@ -175,6 +238,17 @@ export async function inspectTelegramDoctor(config, options = {}) {
   const staleGateAge = statusAgeMs === null || statusAgeMs > Number(config.doctorQueueStallMs || 60000);
   const completionMissingWhileIdle = blockedReason === "turn_completion_pending"
     && String(events?.threadStatus || "") === "idle";
+  const activeTurnStalled = ["active_turn", "turn_completion_pending"].includes(blockedReason)
+    && String(events?.threadStatus || "") === "active"
+    && staleGateAge;
+  if (activeTurnStalled) {
+    issues.push(issue(
+      "active_turn_stalled",
+      "critical",
+      `turn=${events?.activeTurnId || "unknown"}; status_age_ms=${statusAgeMs === null ? "unknown" : Math.round(statusAgeMs)}`,
+      true
+    ));
+  }
   const stalledGate = (
     ["event_stream_unavailable", "status_unknown"].includes(blockedReason)
     || completionMissingWhileIdle
@@ -185,6 +259,17 @@ export async function inspectTelegramDoctor(config, options = {}) {
       "critical",
       `queued=${queue.depth}; reason=${blockedReason}; status_age_ms=${statusAgeMs === null ? "unknown" : Math.round(statusAgeMs)}`,
       false
+    ));
+  }
+  const stalePendingReplyCount = queue.pendingReplyStalled
+    + queue.pendingReplyOrphaned
+    + queue.pendingReplyExpiredUnreconciled;
+  if (stalePendingReplyCount > 0) {
+    issues.push(issue(
+      "pending_reply_stalled",
+      "critical",
+      `open=${queue.pendingReplyOpen}; stalled=${queue.pendingReplyStalled}; orphaned=${queue.pendingReplyOrphaned}; expired_unreconciled=${queue.pendingReplyExpiredUnreconciled}; oldest_age_ms=${Math.round(queue.oldestPendingReplyAgeMs || 0)}`,
+      true
     ));
   }
 
@@ -284,9 +369,23 @@ export async function runTelegramDoctor(config, options = {}) {
     actions.push(`telegram_doctor_${started.reason} pid=${started.pid || 0}`);
   }
 
+  const shouldReconcilePendingReplies = repair
+    && before.runtime.rpcReachable
+    && before.issues.some((entry) => entry.code === "pending_reply_stalled");
+  if (shouldReconcilePendingReplies) {
+    try {
+      const result = await callRuntimeRpc(config, "runtime_pending_replies_reconcile", {}, {
+        timeoutMs: Math.max(2000, Number(config.doctorRpcTimeoutMs || 1500) * 3)
+      });
+      actions.push(`pending_replies_reconciled retrying=${result?.retrying || 0} timeout=${result?.timedOut || 0} orphaned=${result?.orphaned || 0} superseded=${result?.superseded || 0} open=${result?.open || 0}`);
+    } catch (error) {
+      actions.push(`pending_replies_reconcile_failed error=${compactError(error)}`);
+    }
+  }
+
   const shouldReconcileEvents = repair
     && before.runtime.rpcReachable
-    && before.issues.some((entry) => ["app_server_event_stream_down", "queue_dispatch_gate_stalled"].includes(entry.code));
+    && before.issues.some((entry) => ["app_server_event_stream_down", "queue_dispatch_gate_stalled", "active_turn_stalled", "pending_reply_stalled"].includes(entry.code));
   if (shouldReconcileEvents) {
     try {
       const result = await callRuntimeRpc(config, "runtime_events_reconcile", {

@@ -100,6 +100,8 @@ export class RuntimeController {
         });
       case "runtime_relay_once":
         return this.operations.relayReplies();
+      case "runtime_pending_replies_reconcile":
+        return this.operations.reconcilePendingReplies();
       case "runtime_team_relay_once":
         return this.operations.teamRelay();
       case "runtime_tail_activity":

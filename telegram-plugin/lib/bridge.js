@@ -1097,6 +1097,8 @@ function statusWeight(status) {
     case "cancelled":
     case "error":
     case "failed":
+    case "expired":
+    case "reply_timeout":
       return 4;
     case "running":
       return 3;
@@ -1231,7 +1233,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "no_reply_completed", "suppressed_private_reply"].includes(String(entry.status || ""));
+    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "timeout", "stale_thread", "aborted", "no_reply_completed", "suppressed_private_reply", "orphaned"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -1244,7 +1246,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "no_reply_completed"].includes(status)) {
+  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "timeout", "stale_thread", "aborted", "no_reply_completed", "orphaned"].includes(status)) {
     return false;
   }
   if (entry.sentAt && !hasResponseMessageIds(entry)) {
@@ -1284,11 +1286,8 @@ function supersedeOlderPendingRepliesInPlace(pendingReplies) {
     if (!isReplyAwaitingOutcome(entry)) {
       continue;
     }
-    const key = [
-      String(entry.chatId || "").trim(),
-      String(entry.conversationKey || "").trim(),
-      String(entry.telegramThreadId || "").trim()
-    ].join("|");
+    const key = String(entry.queueItemId || "").trim()
+      || `${String(entry.chatId || "").trim()}|${String(entry.messageId || "").trim()}`;
     const current = newestByConversation.get(key);
     const stamp = String(entry.createdAt || "");
     if (!current || stamp > current.stamp) {
@@ -1301,11 +1300,8 @@ function supersedeOlderPendingRepliesInPlace(pendingReplies) {
     if (!isReplyAwaitingOutcome(entry)) {
       continue;
     }
-    const key = [
-      String(entry.chatId || "").trim(),
-      String(entry.conversationKey || "").trim(),
-      String(entry.telegramThreadId || "").trim()
-    ].join("|");
+    const key = String(entry.queueItemId || "").trim()
+      || `${String(entry.chatId || "").trim()}|${String(entry.messageId || "").trim()}`;
     const newest = newestByConversation.get(key)?.entry || null;
     if (!newest || newest === entry) {
       continue;
@@ -1356,32 +1352,71 @@ function scrubIdleBriefArtifactsInPlace(state) {
   return state;
 }
 
-function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
+function reconcileTimedOutPendingRepliesInPlace(config, pendingReplies, state = null) {
   const replies = Array.isArray(pendingReplies) ? pendingReplies : [];
   const timeoutMs = getEffectivePendingReplyTimeoutMs(config);
   if (timeoutMs <= 0) {
-    return 0;
+    return { retrying: 0, timedOut: 0 };
   }
 
-  let expired = 0;
+  const retryMax = Math.max(1, Number(config.pendingReplyRetryMax || 3));
+  const retryDelayMs = Math.max(1000, Number(config.pendingReplyRetryDelayMs || 30000));
+  let retrying = 0;
+  let timedOut = 0;
   for (const entry of replies) {
     if (hasResponseMessageIds(entry)) {
       entry.status = String(entry.status || "").trim().toLowerCase() === "suppressed_ack" ? "suppressed_ack" : "sent";
       entry.sentAt = entry.sentAt || getPendingReplyActivityAt(entry) || nowIso();
       continue;
     }
-    if (!isNonTerminalPendingReply(entry)) {
+    const status = String(entry.status || "pending").trim().toLowerCase();
+    const legacyExpired = status === "expired" && !hasResponseMessageIds(entry);
+    if (!legacyExpired && !isNonTerminalPendingReply(entry)) {
       continue;
     }
-    if (isoAgeMs(getPendingReplyActivityAt(entry)) < timeoutMs) {
+    const retryAfterMs = Date.parse(String(entry.replyRetryAfterAt || ""));
+    const retryDue = status === "timeout_retry"
+      ? (!Number.isFinite(retryAfterMs) || retryAfterMs <= Date.now())
+      : (legacyExpired || isoAgeMs(getPendingReplyActivityAt(entry)) >= timeoutMs);
+    if (!retryDue) {
       continue;
     }
-    entry.status = "expired";
-    entry.sentAt = nowIso();
-    entry.responsePreview = entry.responsePreview || `[pending reply expired after ${timeoutMs}ms]`;
-    expired += 1;
+    const attempts = Math.max(0, Number(entry.replyRetryAttempts || 0));
+    const timeoutAt = nowIso();
+    if (attempts >= retryMax) {
+      entry.status = "timeout";
+      entry.sentAt = timeoutAt;
+      entry.timeoutAt = timeoutAt;
+      entry.replyRetryAfterAt = null;
+      entry.responsePreview = `[Telegram reply timed out after ${attempts} recovery attempts]`;
+      if (state) {
+        markMatchingQueueEntriesInPlace(state, entry, {
+          status: "reply_timeout",
+          replyTimeoutAt: timeoutAt,
+          leaseUntil: null,
+          responsePreview: entry.responsePreview
+        });
+      }
+      timedOut += 1;
+      continue;
+    }
+    entry.status = "timeout_retry";
+    entry.sentAt = null;
+    entry.timeoutAt = timeoutAt;
+    entry.replyRetryAttempts = attempts + 1;
+    entry.replyRetryAfterAt = new Date(Date.now() + retryDelayMs).toISOString();
+    entry.lastSignalAt = timeoutAt;
+    entry.responsePreview = `[Telegram reply timeout; recovery attempt ${entry.replyRetryAttempts}/${retryMax}]`;
+    if (state) {
+      markMatchingQueueEntriesInPlace(state, entry, {
+        replyTimeoutAt: timeoutAt,
+        replyRetryAttempts: entry.replyRetryAttempts,
+        responsePreview: entry.responsePreview
+      });
+    }
+    retrying += 1;
   }
-  return expired;
+  return { retrying, timedOut };
 }
 
 function getEffectivePendingReplyTimeoutMs(config) {
@@ -1537,7 +1572,7 @@ export function mergeQueueEntry(current, incoming) {
     ? selectQueueMergeAnchor(current, incoming)
     : (incomingHasRuntimeResult ? incoming : (currentHasRuntimeResult ? current : null));
   if (runtimeQueueSource) {
-    const terminal = ["delivered", "replied", "cancelled", "error", "failed"].includes(String(runtimeQueueSource.status || "").toLowerCase());
+    const terminal = ["delivered", "replied", "cancelled", "error", "failed", "expired", "reply_timeout"].includes(String(runtimeQueueSource.status || "").toLowerCase());
     merged.status = terminal ? runtimeQueueSource.status : "submitted";
     merged.relevance = "direct";
     merged.threadId = runtimeQueueSource.threadId || merged.threadId || null;
@@ -1712,7 +1747,8 @@ function reconcilePendingRepliesInPlace(pendingReplies) {
   const groups = new Map();
 
   for (const entry of replies) {
-    const key = `${entry.chatId || ""}:${entry.conversationKey || ""}`;
+    const key = String(entry.queueItemId || "").trim()
+      || `${String(entry.chatId || "").trim()}:${String(entry.messageId || "").trim()}`;
     if (!groups.has(key)) {
       groups.set(key, []);
     }
@@ -1854,7 +1890,7 @@ function mergeStateSnapshots(currentState, incomingState) {
 function compactQueueHistory(queue) {
   const configured = Number.parseInt(process.env.BLUN_TELEGRAM_QUEUE_HISTORY_LIMIT || "500", 10);
   const historyLimit = Number.isFinite(configured) && configured >= 50 ? configured : 500;
-  const terminalStatuses = new Set(["delivered", "replied", "cancelled", "failed", "expired", "ignored_bot", "suppressed_ack", "stale_thread"]);
+  const terminalStatuses = new Set(["delivered", "replied", "cancelled", "failed", "expired", "reply_timeout", "ignored_bot", "suppressed_ack", "stale_thread"]);
   const active = [];
   const terminal = [];
   for (const entry of queue || []) {
@@ -3129,14 +3165,65 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
   }
 }
 
+export function reconcileRuntimePendingReplies() {
+  const config = loadConfig();
+  const state = loadState(config);
+  state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  const superseded = supersedeOlderPendingRepliesInPlace(state.pendingReplies || []);
+  const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
+  const terminalQueueStatuses = new Set([
+    "replied",
+    "cancelled",
+    "error",
+    "failed",
+    "reply_timeout",
+    "ignored_bot",
+    "suppressed_ack",
+    "stale_thread"
+  ]);
+  let orphaned = 0;
+  for (const entry of state.pendingReplies || []) {
+    if (!isReplyAwaitingOutcome(entry)) continue;
+    const queueItemId = String(entry.queueItemId || "").trim();
+    const queueEntry = (state.queue || []).find((candidate) => {
+      return (queueItemId && String(candidate.id || "").trim() === queueItemId)
+        || queueKey(candidate) === queueKey(entry);
+    });
+    const queueStatus = String(queueEntry?.status || "").trim().toLowerCase();
+    if (queueEntry && !terminalQueueStatuses.has(queueStatus)) continue;
+    entry.status = "orphaned";
+    entry.sentAt = nowIso();
+    entry.responsePreview = entry.responsePreview || (queueEntry
+      ? `[pending reply closed because queue item is ${queueStatus}]`
+      : "[pending reply closed because queue item is missing]");
+    orphaned += 1;
+  }
+  saveStateForConfig(config, state);
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || orphaned > 0 || superseded > 0) {
+    appendLog(
+      config.paths.activityFile,
+      `PENDING_REPLY_RECONCILED retrying=${timeoutResult.retrying} timeout=${timeoutResult.timedOut} orphaned=${orphaned} superseded=${superseded} retained=${state.pendingReplies.length}`
+    );
+  }
+  return {
+    ok: true,
+    retrying: timeoutResult.retrying,
+    timedOut: timeoutResult.timedOut,
+    orphaned,
+    superseded,
+    retained: state.pendingReplies.length,
+    open: (state.pendingReplies || []).filter((entry) => isReplyAwaitingOutcome(entry)).length
+  };
+}
+
 export function bridgeStatus() {
   const config = loadConfig();
   const state = loadState(config);
   const runtimeOwner = getRuntimeOwner(config);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
-  const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0) {
+  const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || parkedAmbient > 0) {
     if (parkedAmbient > 0) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
@@ -3149,7 +3236,7 @@ export function bridgeStatus() {
   const ambient = queued.filter((item) => item.relevance === "ambient");
   const observe = queued.filter((item) => item.relevance === "observe");
   const pendingReplies = (state.pendingReplies || []).filter((item) => isNonTerminalPendingReply(item));
-  const expiredReplies = (state.pendingReplies || []).filter((item) => String(item.status || "") === "expired");
+  const expiredReplies = (state.pendingReplies || []).filter((item) => ["expired", "timeout_retry", "timeout"].includes(String(item.status || "")));
   return {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
@@ -3865,8 +3952,8 @@ export async function injectNext(threadId, options = {}) {
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
-  const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0) {
+  const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0) {
     if (recoveredInjecting > 0) {
       appendLog(config.paths.activityFile, `INJECT_STALE_RECOVERED count=${recoveredInjecting}`);
     }
@@ -3876,7 +3963,9 @@ export async function injectNext(threadId, options = {}) {
     if (parkedAmbient > 0) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
-    appendLog(config.paths.activityFile, `PENDING_REPLY_EXPIRED count=${expiredPendingReplies}`);
+    if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0) {
+      appendLog(config.paths.activityFile, `PENDING_REPLY_TIMEOUT retrying=${timeoutResult.retrying} terminal=${timeoutResult.timedOut}`);
+    }
     saveStateForConfig(config, state);
   }
   const auto = Boolean(options.auto);
@@ -4368,7 +4457,7 @@ export async function relayRepliesOnce() {
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const supersededPendingReplies = supersedeOlderPendingRepliesInPlace(state.pendingReplies || []);
-  closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
+  reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
   if (parkedAmbient > 0 || supersededPendingReplies > 0) {
     appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     if (supersededPendingReplies > 0) {
@@ -4841,6 +4930,14 @@ export async function completeRuntimeTurnFromEvent(event) {
     saveStateForConfig(config, state);
     appendLog(config.paths.activityFile, `RUNTIME_TURN_${status.toUpperCase()} thread=${threadId || "-"} turn=${turnId || "-"}`);
     return { ok: true, matched: true, delivered: false, turnId, status };
+  }
+
+  if (!finalText && event?.finalMissingConfirmed !== true) {
+    pending.status = "completed_waiting_final";
+    pending.responsePreview = "[turn completed; waiting for final answer event]";
+    saveStateForConfig(config, state);
+    appendLog(config.paths.activityFile, `RUNTIME_REPLY_WAITING_FINAL thread=${threadId || "-"} turn=${turnId || "-"}`);
+    return { ok: true, matched: true, delivered: false, awaitingFinal: true, turnId, status };
   }
 
   if (!finalText) {

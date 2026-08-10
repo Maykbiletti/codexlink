@@ -155,6 +155,10 @@ test("runtime queue keeps visible-composer delivery strict FIFO until completion
     finalText: ""
   });
   assert.equal(completed.matched, true);
+  assert.equal(completed.awaitingFinal, true);
+  state = JSON.parse(readFileSync(join(root, "state.json"), "utf8"));
+  assert.equal(state.pendingReplies[0].status, "completed_waiting_final");
+  assert.equal(state.pendingReplies[0].sentAt, null);
   gate = { ready: false, reason: "status_unknown", threadStatus: "unknown", activeTurnId: "" };
   const blockedUntilIdle = await injectNext("thread-1", dispatchOptions);
   assert.equal(blockedUntilIdle.status, "deferred");

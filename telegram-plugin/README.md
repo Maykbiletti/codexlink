@@ -110,6 +110,17 @@ idle thread is stuck behind a missed completion event, the Doctor uses
 `thread/read` and releases the FIFO lock only after finding the matching
 CodexLink queue marker in the persisted turn.
 
+The same recovery path protects Telegram replies. A `turn/completed` event with
+no final text no longer closes the pending reply immediately: CodexLink waits
+for a late final `item/completed` and then falls back to `thread/read`. Every 30
+seconds the runtime marks genuinely stale pending replies for recovery before
+reconciling missed completions. A timeout changes the entry to `timeout_retry`, performs
+an idempotent delivery retry after `thread/read`, and becomes `reply_timeout`
+only after the bounded recovery budget is exhausted. A stale `active_turn` is
+reported independently; authoritative `idle` synthesizes its missed completion.
+All changes happen in place and keep the queue, pending-reply records, inbox,
+and message history intact.
+
 Messages explicitly tagged `[Health Smoke]`, `[BotDoctor Smoke]`, `manualtest`,
 or with a diagnostic smoke scope are recorded as
 `ignored_diagnostic_smoke`. They are rejected before Mnemo capture, queueing,
@@ -147,6 +158,10 @@ Relevant optional values:
 - `BLUN_CODEXLINK_DOCTOR_INTERVAL_MS`: watcher interval, `5000` by default
 - `BLUN_CODEXLINK_DOCTOR_QUEUE_STALL_MS`: age before an idle/unknown dispatch
   gate is reported as stalled, `60000` by default
+- `BLUN_TELEGRAM_PENDING_REPLY_RETRY_MAX`: bounded Telegram reply recovery
+  attempts, `3` by default
+- `BLUN_TELEGRAM_PENDING_REPLY_RETRY_DELAY_MS`: delay between timeout recovery
+  attempts, `30000` by default
 
 The public profile uses `workspace-write` with `on-request` approvals. Mnemo
 sync and Telegram capture are off unless explicitly enabled.

@@ -96,6 +96,80 @@ test("completed app-server items are correlated with their turn", async (t) => {
   assert.equal(completions[0].turnId, "turn-1");
 });
 
+test("a late final-answer item is delivered after turn completion instead of being lost", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-late-final-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const completions = [];
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  }, {
+    onTurnCompleted: async (event) => {
+      completions.push(event);
+      return event.finalText
+        ? { matched: true, delivered: true }
+        : { matched: true, awaitingFinal: true };
+    }
+  });
+  t.after(() => bridge.close());
+
+  await bridge._handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-late", status: "completed" }
+    }
+  });
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].finalText, "");
+
+  await bridge._handleNotification({
+    method: "item/completed",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-late",
+      item: { type: "agentMessage", phase: "final_answer", text: "Jetzt auch auf Telegram." }
+    }
+  });
+
+  assert.equal(completions.length, 2);
+  assert.equal(completions[1].finalText, "Jetzt auch auf Telegram.");
+  assert.equal(bridge.pendingFinalCompletions.size, 0);
+});
+
+test("turn completion uses an embedded final answer when the item event was missed", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-embedded-final-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const completions = [];
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  }, {
+    onTurnCompleted: async (event) => completions.push(event)
+  });
+
+  await bridge._handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-embedded",
+        status: "completed",
+        items: [{ type: "agentMessage", phase: "final_answer", text: "Persistierte Antwort." }]
+      }
+    }
+  });
+
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].finalText, "Persistierte Antwort.");
+});
+
 test("visible-composer user messages bind their CodexLink queue id to the app-server turn", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "codexlink-events-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -343,4 +417,67 @@ test("doctor reconciliation recovers a missed matching completion without releas
   assert.equal(observed[0].queueItemId, "runtime:1");
   assert.equal(completed.length, 1);
   assert.equal(completed[0].turnId, "turn-runtime-1");
+});
+
+test("authoritative idle recovers a stale active turn whose completion event was missed", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "codexlink-events-stale-active-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const observed = [];
+  const completions = [];
+  const bridge = new AppServerEventBridge({
+    appServerWsUrl: "ws://127.0.0.1:1",
+    paths: {
+      runtimeEventsFile: join(root, "events.jsonl"),
+      activityFile: join(root, "activity.log")
+    }
+  }, {
+    onUserMessageObserved: async (event) => observed.push(event),
+    onTurnCompleted: async (event) => {
+      completions.push(event);
+      return { matched: true, delivered: true };
+    }
+  });
+  bridge.connected = true;
+  bridge.threadId = "thread-1";
+  bridge.threadStatus = "active";
+  bridge.activeTurnId = "turn-stale-active";
+  bridge.ownedTurnId = "turn-stale-active";
+  bridge.ownedQueueItemId = "runtime:stale-active";
+  bridge.awaitingTurnCompletion = true;
+  bridge.statusUpdatedAt = new Date(Date.now() - 120000).toISOString();
+  bridge.client = {
+    request: async (method) => {
+      assert.equal(method, "thread/read");
+      return {
+        result: {
+          thread: {
+            status: { type: "idle" },
+            turns: [{
+              id: "turn-stale-active",
+              status: "inProgress",
+              items: [
+                {
+                  type: "userMessage",
+                  content: [{ type: "text", text: "Auftrag\n\n[CodexLink Queue ID: runtime:stale-active]" }]
+                },
+                { type: "agentMessage", phase: "final_answer", text: "Nachgeholte Antwort." }
+              ]
+            }]
+          }
+        }
+      };
+    }
+  };
+
+  const result = await bridge.reconcileThread("thread-1");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ready, true);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].synthesizedFromIdle, true);
+  assert.equal(completions[0].finalText, "Nachgeholte Antwort.");
+  assert.equal(observed[0].queueItemId, "runtime:stale-active");
+  assert.equal(bridge.activeTurnId, "");
+  assert.equal(bridge.ownedTurnId, "");
+  assert.equal(bridge.awaitingTurnCompletion, false);
 });

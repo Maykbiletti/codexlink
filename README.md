@@ -133,10 +133,16 @@ blun-codex telegram-doctor --fix
 
 The automatic Telegram Doctor runs beside the runtime by default. It checks
 the state lock, PID ownership, authenticated runtime RPC, app-server event
-stream, and queue dispatch gate. It repairs only conditions with provable
-ownership: orphaned locks are renamed into quarantine, a healthy runtime's PID
-record is reconciled from its authenticated endpoint, and a dead daemon is
-restarted. Active locks and unverified processes are never killed.
+stream, queue dispatch gate, and stale pending replies. Before expiring a
+pending reply, it marks a timeout-retry and reconciles the completed turn
+through `thread/read`; this recovers a final answer whose event arrived late or
+was missed. Delivery is idempotent by turn and content, retries are bounded, and
+only a reply that exhausts its recovery attempts becomes `reply_timeout`. The
+queue, pending-reply records, inbox, and message history are preserved. It
+repairs only conditions with provable ownership: orphaned locks are renamed
+into quarantine, a healthy runtime's PID record is reconciled from its
+authenticated endpoint, and a dead daemon is restarted. Active locks and
+unverified processes are never killed.
 
 Doctor alerts are state-change based: one log entry when a condition breaks and
 one when it recovers, with no repeated healthy heartbeat noise. Use
@@ -407,6 +413,16 @@ is blocked by a stale state lock, whether daemon PID/RPC identity agrees, and
 whether an idle TUI is stuck behind a missed app-server completion. For the last
 case it reconciles through `thread/read` and releases the FIFO claim only when
 the persisted turn contains the matching CodexLink queue marker.
+
+If `turn/completed` arrives before the final `item/completed`, the pending reply
+now remains open briefly instead of being recorded as “completed without
+reply.” A late final item is delivered immediately; otherwise the runtime reads
+the persisted turn once before confirming that no Telegram reply exists.
+
+An `active_turn` whose app-server status has not changed within the configured
+Doctor threshold is also an error. The Doctor reads the authoritative thread;
+if it is truly `idle`, CodexLink synthesizes the missed completion, releases the
+stale active-turn gate, and retries the associated Telegram reply safely.
 
 When an agent does not see other bot messages, the decisive check is this: the
 message must appear in `activity.log`, `inbox.jsonl`, or the shared relay. If it

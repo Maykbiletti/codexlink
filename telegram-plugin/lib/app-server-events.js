@@ -39,6 +39,26 @@ function activeTurnFromThread(thread) {
   return String(active?.id || "").trim();
 }
 
+function finalTextFromAgentItem(item) {
+  if (item?.type !== "agentMessage" || String(item.phase || "final_answer") !== "final_answer") {
+    return "";
+  }
+  const direct = String(item.text || "").trim();
+  if (direct) return direct;
+  const content = Array.isArray(item.content) ? item.content : [];
+  return content
+    .map((entry) => String(entry?.text || "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function finalTextFromTurn(turn) {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  const finalItem = [...items].reverse().find((item) => finalTextFromAgentItem(item));
+  return finalTextFromAgentItem(finalItem);
+}
+
 export class AppServerEventBridge {
   constructor(config, handlers = {}) {
     this.config = config;
@@ -46,6 +66,7 @@ export class AppServerEventBridge {
     this.client = null;
     this.threadId = "";
     this.finalAnswers = new Map();
+    this.pendingFinalCompletions = new Map();
     this.pendingApprovals = new Map();
     this.connected = false;
     this.connecting = null;
@@ -129,6 +150,16 @@ export class AppServerEventBridge {
       }, { timeoutMs: this.config.resumeTimeoutMs || 20000 });
       const thread = response?.result?.thread || {};
       const turns = Array.isArray(thread.turns) ? thread.turns : [];
+      const staleTurnId = String(this.ownedTurnId || this.activeTurnId || "").trim();
+      const staleQueueItemId = String(this.ownedQueueItemId || "").trim();
+      const hadStaleActiveState = Boolean(
+        this.threadStatus === "active"
+        || this.awaitingTurnCompletion
+        || this.ownedTurnId
+        || this.activeTurnId
+      );
+      const authoritativeStatus = normalizeThreadStatus(thread.status);
+      const recoveredTurnIds = new Set();
       this._setThreadStatus(thread.status, {
         threadId,
         turnId: activeTurnFromThread(thread),
@@ -154,18 +185,22 @@ export class AppServerEventBridge {
             recovered: true
           });
         }
-        const finalItem = [...items].reverse().find((item) => {
-          return item?.type === "agentMessage" && String(item.phase || "final_answer") === "final_answer";
-        });
-        await this.handlers.onTurnCompleted({
+        const completion = {
           threadId,
           turnId: String(turn.id || "").trim(),
           status,
-          finalText: String(finalItem?.text || "").trim(),
+          finalText: finalTextFromTurn(turn),
           error: turn.error || null,
           completedAt: nowIso(),
           recovered: true
-        });
+        };
+        recoveredTurnIds.add(String(turn.id || "").trim());
+        const completionResult = await this.handlers.onTurnCompleted(completion);
+        if (completionResult?.matched === false) {
+          this._retryUnmatchedCompletion(completion, 1);
+        } else if (completionResult?.awaitingFinal) {
+          this._scheduleMissingFinalCompletion(completion);
+        }
         const recoveredTurnId = String(turn.id || "").trim();
         const matchesOwnedTurn = Boolean(recoveredTurnId) && (
           this.ownedTurnId === recoveredTurnId
@@ -186,6 +221,62 @@ export class AppServerEventBridge {
             this.config.paths.activityFile,
             `APP_EVENT_RECOVERED_OWNED_TURN thread=${threadId} turn=${recoveredTurnId} queue=${queueItemId || "-"}`
           );
+        }
+      }
+      if (authoritativeStatus === "idle" && hadStaleActiveState) {
+        const persistedTurn = [...turns].reverse().find((turn) => {
+          const candidateTurnId = String(turn?.id || "").trim();
+          if (staleTurnId && !["active", "pending-turn-id"].includes(staleTurnId) && candidateTurnId === staleTurnId) {
+            return true;
+          }
+          if (!staleQueueItemId) return false;
+          const userItem = (Array.isArray(turn?.items) ? turn.items : []).find((item) => item?.type === "userMessage");
+          return extractRuntimeQueueIdFromThreadItem(userItem) === staleQueueItemId;
+        });
+        const recoveredTurnId = String(
+          persistedTurn?.id
+          || (!["active", "pending-turn-id"].includes(staleTurnId) ? staleTurnId : "")
+        ).trim();
+        if (recoveredTurnId && !recoveredTurnIds.has(recoveredTurnId) && this.handlers.onTurnCompleted) {
+          const userItem = (Array.isArray(persistedTurn?.items) ? persistedTurn.items : [])
+            .find((item) => item?.type === "userMessage");
+          const queueItemId = extractRuntimeQueueIdFromThreadItem(userItem) || staleQueueItemId;
+          if (queueItemId && this.handlers.onUserMessageObserved) {
+            await this.handlers.onUserMessageObserved({
+              threadId,
+              turnId: recoveredTurnId,
+              queueItemId,
+              observedAt: nowIso(),
+              recovered: true
+            });
+          }
+          const completion = {
+            threadId,
+            turnId: recoveredTurnId,
+            status: "completed",
+            finalText: finalTextFromTurn(persistedTurn),
+            error: null,
+            completedAt: nowIso(),
+            recovered: true,
+            synthesizedFromIdle: true
+          };
+          const result = await this.handlers.onTurnCompleted(completion);
+          if (result?.matched === false) {
+            this._retryUnmatchedCompletion(completion, 1);
+          } else if (result?.awaitingFinal) {
+            this._scheduleMissingFinalCompletion(completion);
+          }
+          appendLog(
+            this.config.paths.activityFile,
+            `APP_EVENT_IDLE_COMPLETION_RECOVERED thread=${threadId} turn=${recoveredTurnId} queue=${queueItemId || "-"}`
+          );
+        }
+        if (this.threadStatus === "idle") {
+          this.activeTurnId = "";
+          this.ownedTurnId = "";
+          this.ownedQueueItemId = "";
+          this.awaitingTurnCompletion = false;
+          this.dispatchInFlight = false;
         }
       }
     } catch (error) {
@@ -455,7 +546,24 @@ export class AppServerEventBridge {
     if (method === "item/completed") {
       const item = message?.params?.item || {};
       if (item.type === "agentMessage" && String(item.phase || "final_answer") === "final_answer" && turnId) {
-        this.finalAnswers.set(turnId, String(item.text || "").trim());
+        const finalText = finalTextFromAgentItem(item);
+        if (finalText) {
+          this.finalAnswers.set(turnId, finalText);
+          const waiting = this.pendingFinalCompletions.get(turnId);
+          if (waiting && this.handlers.onTurnCompleted) {
+            clearTimeout(waiting.timer);
+            this.pendingFinalCompletions.delete(turnId);
+            this.finalAnswers.delete(turnId);
+            const result = await this.handlers.onTurnCompleted({
+              ...waiting.completion,
+              finalText,
+              recovered: false
+            });
+            if (result?.matched === false) {
+              this._retryUnmatchedCompletion({ ...waiting.completion, finalText }, 1);
+            }
+          }
+        }
       }
     }
 
@@ -510,8 +618,8 @@ export class AppServerEventBridge {
         this.threadStatus = "unknown";
         this.statusUpdatedAt = nowIso();
       }
-      const finalText = this.finalAnswers.get(completedTurnId) || "";
-      this.finalAnswers.delete(completedTurnId);
+      const finalText = this.finalAnswers.get(completedTurnId) || finalTextFromTurn(turn);
+      if (finalText) this.finalAnswers.delete(completedTurnId);
       if (this.handlers.onTurnCompleted) {
         const completion = {
           threadId,
@@ -524,9 +632,54 @@ export class AppServerEventBridge {
         const result = await this.handlers.onTurnCompleted(completion);
         if (result?.matched === false) {
           this._retryUnmatchedCompletion(completion, 1);
+        } else if (result?.awaitingFinal) {
+          this._scheduleMissingFinalCompletion(completion);
         }
       }
     }
+  }
+
+  _scheduleMissingFinalCompletion(completion) {
+    const turnId = String(completion?.turnId || "").trim();
+    if (!turnId || !this.handlers.onTurnCompleted || this.pendingFinalCompletions.has(turnId)) {
+      return;
+    }
+    const timer = setTimeout(async () => {
+      this.pendingFinalCompletions.delete(turnId);
+      let finalText = this.finalAnswers.get(turnId) || "";
+      this.finalAnswers.delete(turnId);
+      if (!finalText && this.client && completion.threadId) {
+        try {
+          const response = await this.client.request("thread/read", {
+            threadId: completion.threadId,
+            includeTurns: true
+          }, { timeoutMs: this.config.resumeTimeoutMs || 20000 });
+          const turns = Array.isArray(response?.result?.thread?.turns)
+            ? response.result.thread.turns
+            : [];
+          const persistedTurn = turns.find((turn) => String(turn?.id || "").trim() === turnId);
+          finalText = finalTextFromTurn(persistedTurn);
+        } catch (error) {
+          appendLog(this.config.paths.activityFile, `APP_EVENT_FINAL_RECOVERY_ERROR turn=${turnId} ${compactError(error)}`);
+        }
+      }
+      try {
+        const result = await this.handlers.onTurnCompleted({
+          ...completion,
+          finalText,
+          finalMissingConfirmed: !finalText,
+          recovered: true
+        });
+        if (result?.matched === false) {
+          this._retryUnmatchedCompletion({ ...completion, finalText }, 1);
+        }
+      } catch (error) {
+        appendLog(this.config.paths.activityFile, `APP_EVENT_FINAL_RETRY_ERROR turn=${turnId} ${compactError(error)}`);
+      }
+    }, 1000);
+    timer.unref?.();
+    this.pendingFinalCompletions.set(turnId, { completion, timer });
+    appendLog(this.config.paths.activityFile, `APP_EVENT_WAITING_FINAL turn=${turnId}`);
   }
 
   _retryUnmatchedCompletion(completion, attempt) {
@@ -535,9 +688,14 @@ export class AppServerEventBridge {
     }
     const timer = setTimeout(async () => {
       try {
-        const result = await this.handlers.onTurnCompleted(completion);
+        const finalText = completion.finalText || this.finalAnswers.get(completion.turnId) || "";
+        if (finalText) this.finalAnswers.delete(completion.turnId);
+        const retriedCompletion = { ...completion, finalText };
+        const result = await this.handlers.onTurnCompleted(retriedCompletion);
         if (result?.matched === false) {
           this._retryUnmatchedCompletion(completion, attempt + 1);
+        } else if (result?.awaitingFinal) {
+          this._scheduleMissingFinalCompletion(retriedCompletion);
         }
       } catch (error) {
         appendLog(this.config.paths.activityFile, `APP_EVENT_COMPLETION_RETRY_ERROR turn=${completion.turnId || "-"} ${compactError(error)}`);
@@ -613,6 +771,10 @@ export class AppServerEventBridge {
   }
 
   async close() {
+    for (const waiting of this.pendingFinalCompletions.values()) {
+      clearTimeout(waiting.timer);
+    }
+    this.pendingFinalCompletions.clear();
     this.connected = false;
     if (this.client) {
       await this.client.close().catch((error) => {

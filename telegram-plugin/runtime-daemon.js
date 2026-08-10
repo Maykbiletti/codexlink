@@ -11,6 +11,7 @@ import {
   injectNext,
   listQueue,
   pollOnce,
+  reconcileRuntimePendingReplies,
   relayRepliesOnce,
   reply,
   tailActivity
@@ -93,6 +94,7 @@ const controller = new RuntimeController(config, {
   dispatch: dispatchRuntimeQueue,
   reply,
   relayReplies: relayRepliesOnce,
+  reconcilePendingReplies: reconcileRuntimePendingReplies,
   teamRelay: consumeTeamRelayOnce,
   tailActivity
 }, eventBridge);
@@ -160,11 +162,20 @@ async function tick() {
     void runExclusive("team_relay", consumeTeamRelayOnce);
   }
 
-  // App-server events are authoritative. This slower pass only recovers a reply
-  // if the runtime was offline while a turn completed.
+  // App-server events are authoritative. This slower pass marks stale replies
+  // for bounded retry, then reconciles missed completion events.
   if (now >= schedule.replyRecovery) {
     schedule.replyRecovery = now + 30000;
-    void runExclusive("reply_recovery", relayRepliesOnce);
+    void runExclusive("reply_recovery", async () => {
+      const pendingRecovery = reconcileRuntimePendingReplies();
+      const threadId = resolveBoundThreadId(current);
+      if (eventBridge && threadId) {
+        await eventBridge.reconcileThread(threadId);
+      } else {
+        await relayRepliesOnce();
+      }
+      return pendingRecovery;
+    });
   }
 
   if (eventBridge && now >= schedule.eventStream) {
