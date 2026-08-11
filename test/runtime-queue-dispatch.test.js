@@ -103,7 +103,7 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
   ]);
 
   let state = JSON.parse(readFileSync(statePath, "utf8"));
-  assert.deepEqual(state.queue.map((item) => item.status), ["queued", "submitted"]);
+  assert.deepEqual(state.queue.map((item) => item.status), ["parked", "submitted"]);
   assert.equal(state.pendingReplies.length, 1);
   assert.equal(state.pendingReplies[0].turnId, "cli-turn");
 
@@ -130,7 +130,7 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
   assert.equal(steeredPending.message.turnId, null);
   assert.equal(claimCalls, 0, "follow-up steering must not claim a new-turn composer lock");
   state = JSON.parse(readFileSync(statePath, "utf8"));
-  assert.deepEqual(state.queue.map((item) => item.status), ["queued", "running", "submitted"]);
+  assert.deepEqual(state.queue.map((item) => item.status), ["parked", "running", "submitted"]);
   assert.equal(state.pendingReplies.find((item) => item.queueItemId === "runtime:2")?.status, "running");
   assert.equal(state.pendingReplies.find((item) => item.queueItemId === "runtime:3")?.turnId, "");
 
@@ -164,17 +164,16 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
   gate = { ready: false, reason: "status_unknown", threadStatus: "unknown", activeTurnId: "" };
   const blockedUntilIdle = await injectNext("thread-1", dispatchOptions);
   assert.equal(blockedUntilIdle.status, "deferred");
-  assert.equal(blockedUntilIdle.reason, "runtime_status_unknown");
+  assert.equal(blockedUntilIdle.reason, "no_eligible_message");
   assert.equal(composerSubmissions.length, 2);
 
   gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
   const backlogResult = await injectNext("thread-1", dispatchOptions);
-  assert.equal(backlogResult.status, "submitted");
-  assert.equal(backlogResult.message.messageId, "1");
-  assert.equal(claimCalls, 1);
+  assert.equal(backlogResult.status, "deferred");
+  assert.equal(backlogResult.reason, "no_eligible_message");
+  assert.equal(claimCalls, 0);
   assert.deepEqual(composerSubmissions, [
     { id: "runtime:2", threadId: "thread-1" },
-    { id: "runtime:3", threadId: "thread-1" },
-    { id: "runtime:1", threadId: "thread-1" }
+    { id: "runtime:3", threadId: "thread-1" }
   ]);
 });

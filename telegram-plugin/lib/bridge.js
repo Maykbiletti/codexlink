@@ -2315,6 +2315,7 @@ function normalizeTeamRelayInbound(config, state, event) {
     intent: "message",
     relevance: "ambient",
     status: "queued",
+    activeTurnSubmit: true,
     attempts: 0,
     lastAttemptAt: null,
     relay: {
@@ -4013,6 +4014,7 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
     relevance: "direct",
     intent: "catchup",
     status: "queued",
+    activeTurnSubmit: true,
     ts: now,
     createdAt: now,
     availableAt: now,
@@ -4030,16 +4032,63 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
   return entries.length;
 }
 
+function retireLegacyRuntimeBacklogInPlace(state) {
+  const retiredQueueIds = new Set();
+  const retiredQueueKeys = new Set();
+  const retiredAt = nowIso();
+  let parked = 0;
+  let cancelled = 0;
+  let superseded = 0;
+
+  for (const entry of state.queue || []) {
+    if (!entry || entry.activeTurnSubmit === true) continue;
+    const status = String(entry.status || "").trim().toLowerCase();
+    if (status === "queued") {
+      entry.status = "parked";
+      entry.parkedAt = retiredAt;
+      parked += 1;
+    } else if (["submitted", "running", "injecting"].includes(status)) {
+      entry.status = "cancelled";
+      entry.deliveredAt = retiredAt;
+      entry.leaseUntil = null;
+      cancelled += 1;
+    } else {
+      continue;
+    }
+    entry.parkReason = "legacy_pre_active_turn_backlog";
+    entry.responsePreview = "[legacy queue item retained without automatic replay]";
+    retiredQueueIds.add(String(entry.id || "").trim());
+    retiredQueueKeys.add(queueKey(entry));
+  }
+
+  for (const pending of state.pendingReplies || []) {
+    if (!isReplyAwaitingOutcome(pending)) continue;
+    const queueItemId = String(pending.queueItemId || "").trim();
+    if (!retiredQueueIds.has(queueItemId) && !retiredQueueKeys.has(queueKey(pending))) continue;
+    pending.status = "superseded";
+    pending.sentAt = retiredAt;
+    pending.lastSignalAt = retiredAt;
+    pending.responsePreview = "[legacy queue item retained without automatic replay]";
+    superseded += 1;
+  }
+
+  return { parked, cancelled, superseded, changed: parked + cancelled + superseded };
+}
+
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
   let state = loadState(config);
+  const auto = Boolean(options.auto);
   const recoveredInjecting = recoverStaleInjectingEntriesInPlace(state.queue || []);
   const reclassified = reclassifyQueuedEntriesInPlace(config, state.queue || []);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  const legacyBacklog = auto
+    ? retireLegacyRuntimeBacklogInPlace(state)
+    : { parked: 0, cancelled: 0, superseded: 0, changed: 0 };
   const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
-  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0) {
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0 || legacyBacklog.changed > 0) {
     if (recoveredInjecting > 0) {
       appendLog(config.paths.activityFile, `INJECT_STALE_RECOVERED count=${recoveredInjecting}`);
     }
@@ -4052,9 +4101,11 @@ export async function injectNext(threadId, options = {}) {
     if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0) {
       appendLog(config.paths.activityFile, `PENDING_REPLY_TIMEOUT retrying=${timeoutResult.retrying} terminal=${timeoutResult.timedOut}`);
     }
+    if (legacyBacklog.changed > 0) {
+      appendLog(config.paths.activityFile, `LEGACY_BACKLOG_RETIRED parked=${legacyBacklog.parked} cancelled=${legacyBacklog.cancelled} replies=${legacyBacklog.superseded}`);
+    }
     saveStateForConfig(config, state);
   }
-  const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
   const useTuiComposerQueue = auto && useAppServer && usesTuiComposerTransport(config);
   const useRuntimeTurnQueue = auto && useAppServer && !useTuiComposerQueue;
