@@ -9,6 +9,7 @@ import {
   consumeTeamRelayOnce,
   enqueueRuntimeMessage,
   injectNext,
+  initializeActiveTurnQueueGeneration,
   listQueue,
   pollOnce,
   reconcileRuntimePendingReplies,
@@ -28,6 +29,7 @@ import { currentProcessInstanceId } from "./lib/state-lock.js";
 
 ensureStateLayout();
 const config = loadConfig();
+initializeActiveTurnQueueGeneration();
 let stopping = false;
 let rpc = null;
 let stateRecoveryBlocked = false;

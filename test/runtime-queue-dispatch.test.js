@@ -7,6 +7,7 @@ import {
   bindRuntimeTurnFromUserMessage,
   completeRuntimeTurnFromEvent,
   enqueueRuntimeMessage,
+  initializeActiveTurnQueueGeneration,
   injectNext
 } from "../telegram-plugin/lib/bridge.js";
 import { setRuntimeComposerInjector, setRuntimeTurnStarter } from "../telegram-plugin/lib/codex.js";
@@ -49,9 +50,10 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
 
   enqueueRuntimeMessage("legacy backlog", { messageId: "1", noTelegramReply: false });
   const statePath = join(root, "state.json");
-  const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
-  delete legacyState.queue[0].activeTurnSubmit;
-  writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+  const initialized = initializeActiveTurnQueueGeneration();
+  assert.equal(initialized.changed, true);
+  assert.equal(initialized.parked, 1);
+  assert.equal(initializeActiveTurnQueueGeneration().changed, false);
   enqueueRuntimeMessage("new steering input", { messageId: "2", noTelegramReply: false });
 
   let gate = {

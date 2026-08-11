@@ -4032,17 +4032,40 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
   return entries.length;
 }
 
-function retireLegacyRuntimeBacklogInPlace(state) {
+const ACTIVE_TURN_QUEUE_GENERATION = 1;
+
+function retireLegacyRuntimeBacklogInPlace(state, options = {}) {
+  const retireAllExisting = Boolean(options.retireAllExisting);
+  const preserveBoundRunning = Boolean(options.preserveBoundRunning);
   const retiredQueueIds = new Set();
   const retiredQueueKeys = new Set();
+  const preservedQueueIds = new Set();
+  const preservedQueueKeys = new Set();
   const retiredAt = nowIso();
   let parked = 0;
   let cancelled = 0;
   let superseded = 0;
+  let preserved = 0;
 
   for (const entry of state.queue || []) {
-    if (!entry || entry.activeTurnSubmit === true) continue;
+    if (!entry) continue;
     const status = String(entry.status || "").trim().toLowerCase();
+    const queueItemId = String(entry.id || "").trim();
+    const entryQueueKey = queueKey(entry);
+    const preserveCurrent = retireAllExisting
+      && preserveBoundRunning
+      && entry.activeTurnSubmit === true
+      && status === "running"
+      && Boolean(String(entry.turnId || "").trim());
+    if (preserveCurrent) {
+      preservedQueueIds.add(queueItemId);
+      preservedQueueKeys.add(entryQueueKey);
+      preserved += 1;
+      continue;
+    }
+    if (!retireAllExisting && entry.activeTurnSubmit === true) continue;
+    retiredQueueIds.add(queueItemId);
+    retiredQueueKeys.add(entryQueueKey);
     if (status === "queued") {
       entry.status = "parked";
       entry.parkedAt = retiredAt;
@@ -4057,14 +4080,15 @@ function retireLegacyRuntimeBacklogInPlace(state) {
     }
     entry.parkReason = "legacy_pre_active_turn_backlog";
     entry.responsePreview = "[legacy queue item retained without automatic replay]";
-    retiredQueueIds.add(String(entry.id || "").trim());
-    retiredQueueKeys.add(queueKey(entry));
   }
 
   for (const pending of state.pendingReplies || []) {
     if (!isReplyAwaitingOutcome(pending)) continue;
     const queueItemId = String(pending.queueItemId || "").trim();
-    if (!retiredQueueIds.has(queueItemId) && !retiredQueueKeys.has(queueKey(pending))) continue;
+    const pendingQueueKey = queueKey(pending);
+    const preservesCurrent = preservedQueueIds.has(queueItemId) || preservedQueueKeys.has(pendingQueueKey);
+    const retiresLegacy = retiredQueueIds.has(queueItemId) || retiredQueueKeys.has(pendingQueueKey);
+    if (preservesCurrent || (!retiresLegacy && !retireAllExisting)) continue;
     pending.status = "superseded";
     pending.sentAt = retiredAt;
     pending.lastSignalAt = retiredAt;
@@ -4072,7 +4096,50 @@ function retireLegacyRuntimeBacklogInPlace(state) {
     superseded += 1;
   }
 
-  return { parked, cancelled, superseded, changed: parked + cancelled + superseded };
+  return { parked, cancelled, superseded, preserved, retiredAt, changed: parked + cancelled + superseded };
+}
+
+export function initializeActiveTurnQueueGeneration() {
+  const config = loadConfig();
+  let result = {
+    changed: false,
+    generation: ACTIVE_TURN_QUEUE_GENERATION,
+    parked: 0,
+    cancelled: 0,
+    superseded: 0,
+    preserved: 0
+  };
+
+  withStateFileLock(config, () => {
+    const state = loadState(config);
+    const currentGeneration = Number(state.activeTurnQueueGeneration || 0);
+    if (currentGeneration >= ACTIVE_TURN_QUEUE_GENERATION) {
+      result = { ...result, generation: currentGeneration };
+      return;
+    }
+
+    const retired = retireLegacyRuntimeBacklogInPlace(state, {
+      retireAllExisting: true,
+      preserveBoundRunning: true
+    });
+    state.activeTurnQueueGeneration = ACTIVE_TURN_QUEUE_GENERATION;
+    state.activeTurnQueueCutoverAt = retired.retiredAt;
+    saveRuntimeStateWhileLocked(config, state);
+    appendLog(
+      config.paths.activityFile,
+      `ACTIVE_TURN_QUEUE_INITIALIZED generation=${ACTIVE_TURN_QUEUE_GENERATION} parked=${retired.parked} cancelled=${retired.cancelled} replies=${retired.superseded} preserved=${retired.preserved}`
+    );
+    result = {
+      changed: true,
+      generation: ACTIVE_TURN_QUEUE_GENERATION,
+      parked: retired.parked,
+      cancelled: retired.cancelled,
+      superseded: retired.superseded,
+      preserved: retired.preserved
+    };
+  });
+
+  return result;
 }
 
 export async function injectNext(threadId, options = {}) {
