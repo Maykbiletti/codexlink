@@ -2,149 +2,183 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { bindCurrentThread, bridgeStatus, consumeTeamRelayOnce, injectNext, listQueue, pollOnce, relayRepliesOnce, reply, tailActivity } from "./lib/bridge.js";
 import { loadConfig } from "./lib/env.js";
 import { ensureStateLayout } from "./lib/paths.js";
+import { callRuntimeRpc, waitForRuntimeRpc } from "./lib/runtime-rpc.js";
 import { ensureBackgroundSidecars } from "./lib/sidecars.js";
 
 ensureStateLayout();
-ensureBackgroundSidecars(loadConfig());
+let config = loadConfig();
+ensureBackgroundSidecars(config, { forceRuntime: true });
 
 function textResult(value) {
   return {
-    content: [
-      {
-        type: "text",
-        text: typeof value === "string" ? value : JSON.stringify(value, null, 2)
-      }
-    ]
+    content: [{
+      type: "text",
+      text: typeof value === "string" ? value : JSON.stringify(value, null, 2)
+    }]
   };
 }
 
 const server = new Server(
   {
-    name: "codexlink-telegram",
-    version: "0.1.0"
+    name: "codexlink-runtime",
+    version: "0.2.0"
   },
   {
-    capabilities: {
-      tools: {}
-    }
+    capabilities: { tools: {} },
+    instructions: "CodexLink's durable runtime queue is authoritative. Never create hidden Codex sessions or call turn/start or turn/steer for ordinary inbound work. Telegram intake is persisted by the runtime daemon, then submitted through the visible Codex TUI composer with the same Enter path as local CLI input. The TUI owns active-turn queueing; the app-server connection is used for lifecycle events, reply correlation, and approvals. Use status and queue tools for inspection; use write tools only when the user explicitly requests that action."
   }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "bridge_status",
-      description: "Show BLUN Telegram bridge status, bound thread, queue depth, and recent activity pointers.",
-      inputSchema: { type: "object", properties: {} }
+const tools = [
+  {
+    name: "runtime_health",
+    description: "Check whether the persistent CodexLink runtime daemon and app-server event stream are alive.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "runtime_status",
+    description: "Show the bound Codex thread, durable queue depths, runtime state, and Telegram transport status.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "runtime_queue_list",
+    description: "List durable runtime queue items and their lifecycle status.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number", minimum: 1, maximum: 200, description: "Maximum items to return. Default 20." } }
     },
-    {
-      name: "bridge_bind_current_thread",
-      description: "Bind the real Codex thread id that queued Telegram messages should inject into. If omitted, CODEX_THREAD_ID is used.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          thread_id: { type: "string", description: "Explicit Codex thread UUID to bind." }
-        }
-      }
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "runtime_queue_enqueue",
+    description: "Administratively append work to the durable runtime queue. Telegram messages use the daemon intake path automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", minLength: 1, maxLength: 100000, description: "Work item text." },
+        message_id: { type: "string", description: "Optional idempotency key." },
+        conversation_key: { type: "string", description: "Optional conversation grouping key." },
+        user: { type: "string", description: "Optional source label." }
+      },
+      required: ["text"]
     },
-    {
-      name: "bridge_poll_once",
-      description: "Poll Telegram one time and append any allowed inbound messages to the BLUN queue.",
-      inputSchema: { type: "object", properties: {} }
+    annotations: { readOnlyHint: false }
+  },
+  {
+    name: "runtime_queue_cancel",
+    description: "Cancel a queued, parked, or failed item before it starts. Running turns are not interrupted by this tool.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string", description: "Runtime id, message id, or chatId:messageId key." } },
+      required: ["id"]
     },
-    {
-      name: "bridge_list_queue",
-      description: "List the most recent queued or processed bridge messages.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          limit: { type: "number", description: "How many queue items to return. Default 10." }
-        }
-      }
+    annotations: { readOnlyHint: false, destructiveHint: true }
+  },
+  {
+    name: "runtime_bind_thread",
+    description: "Bind the visible Codex thread that receives queued work.",
+    inputSchema: {
+      type: "object",
+      properties: { thread_id: { type: "string", description: "Codex thread id." } },
+      required: ["thread_id"]
     },
-    {
-      name: "bridge_inject_next",
-      description: "Inject the next queued Telegram message into the bound real Codex thread. If that thread is busy, the message remains queued.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          thread_id: { type: "string", description: "Optional explicit thread id override for this injection." }
-        }
-      }
+    annotations: { readOnlyHint: false }
+  },
+  {
+    name: "runtime_reply",
+    description: "Send an explicit Telegram reply through the runtime outbox and private-to-group safety guard.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        chat_id: { type: "string" },
+        reply_to_message_id: { type: "string" },
+        telegram_thread_id: { type: "string" },
+        allow_private_to_group: { type: "boolean" },
+        confirm_group_broadcast: { type: "boolean" }
+      },
+      required: ["text"]
     },
-    {
-      name: "bridge_reply",
-      description: "Send an explicit manual Telegram reply from the real operator/CLI.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          text: { type: "string", description: "Reply text to send." },
-          chat_id: { type: "string", description: "Optional chat id override. Defaults to the latest inbound chat." },
-          reply_to_message_id: { type: "string", description: "Optional Telegram message id to reply under." },
-          telegram_thread_id: { type: "string", description: "Optional Telegram topic/thread id for forum-style group topics." },
-          allow_private_to_group: { type: "boolean", description: "First confirmation for sending a private-DM-context reply into another chat." },
-          confirm_group_broadcast: { type: "boolean", description: "Second confirmation that the user explicitly requested a group broadcast from private context." }
-        },
-        required: ["text"]
-      }
+    annotations: { readOnlyHint: false }
+  },
+  {
+    name: "runtime_pause",
+    description: "Pause FIFO dispatch while Telegram intake continues writing to the durable queue.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: false }
+  },
+  {
+    name: "runtime_resume",
+    description: "Resume FIFO dispatch from the durable queue.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: false }
+  },
+  {
+    name: "runtime_approvals_list",
+    description: "List unresolved app-server approval requests owned by the runtime connection.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: "runtime_approval_decide",
+    description: "Resolve an app-server approval request received on the persistent runtime connection.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        request_id: { type: "string" },
+        decision: { type: "string", enum: ["accept", "acceptForSession", "decline", "cancel"] }
+      },
+      required: ["request_id", "decision"]
     },
-    {
-      name: "bridge_relay_once",
-      description: "Read the active Codex session file and relay any completed Telegram-originated final answers back to Telegram.",
-      inputSchema: { type: "object", properties: {} }
+    annotations: { readOnlyHint: false }
+  },
+  {
+    name: "runtime_tail_activity",
+    description: "Read recent CodexLink runtime activity log entries.",
+    inputSchema: {
+      type: "object",
+      properties: { lines: { type: "number", minimum: 1, maximum: 500 } }
     },
-    {
-      name: "bridge_team_relay_once",
-      description: "Consume the shared team relay file once and queue relevant group messages that this bot did not receive raw from Telegram.",
-      inputSchema: { type: "object", properties: {} }
-    },
-    {
-      name: "bridge_tail_activity",
-      description: "Read the last lines from the local BLUN Telegram bridge activity log.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          lines: { type: "number", description: "Number of lines to read. Default 20." }
-        }
-      }
-    }
-  ]
-}));
+    annotations: { readOnlyHint: true }
+  }
+];
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+
+const legacyAliases = new Map([
+  ["bridge_status", "runtime_status"],
+  ["bridge_bind_current_thread", "runtime_bind_thread"],
+  ["bridge_poll_once", "runtime_poll_once"],
+  ["bridge_list_queue", "runtime_queue_list"],
+  ["bridge_inject_next", "runtime_dispatch_once"],
+  ["bridge_reply", "runtime_reply"],
+  ["bridge_relay_once", "runtime_relay_once"],
+  ["bridge_team_relay_once", "runtime_team_relay_once"],
+  ["bridge_tail_activity", "runtime_tail_activity"]
+]);
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments || {};
-  switch (request.params.name) {
-    case "bridge_status":
-      return textResult(bridgeStatus());
-    case "bridge_bind_current_thread":
-      return textResult(bindCurrentThread(args.thread_id || ""));
-    case "bridge_poll_once":
-      return textResult(await pollOnce());
-    case "bridge_list_queue":
-      return textResult(listQueue(Number(args.limit || 10)));
-    case "bridge_inject_next":
-      return textResult(await injectNext(args.thread_id || ""));
-    case "bridge_reply":
-      return textResult(
-        await reply(String(args.text || ""), {
-          chatId: args.chat_id || "",
-          replyToMessageId: args.reply_to_message_id || "",
-          telegramThreadId: args.telegram_thread_id || "",
-          allowPrivateToGroup: args.allow_private_to_group === true,
-          confirmGroupBroadcast: args.confirm_group_broadcast === true
-        })
-      );
-    case "bridge_relay_once":
-      return textResult(await relayRepliesOnce());
-    case "bridge_team_relay_once":
-      return textResult(await consumeTeamRelayOnce());
-    case "bridge_tail_activity":
-      return textResult(tailActivity(Number(args.lines || 20)));
-    default:
-      throw new Error(`Unknown tool: ${request.params.name}`);
+  const method = legacyAliases.get(request.params.name) || request.params.name;
+  config = loadConfig();
+  try {
+    const result = await callRuntimeRpc(config, method, args);
+    return textResult(result);
+  } catch (error) {
+    if (Number(error?.statusCode || 0) >= 400 && Number(error?.statusCode || 0) < 500) {
+      return { ...textResult({ ok: false, error: String(error.message || error) }), isError: true };
+    }
+    try {
+      ensureBackgroundSidecars(config, { forceRuntime: true });
+      await waitForRuntimeRpc(config, { timeoutMs: 10000 });
+      return textResult(await callRuntimeRpc(config, method, args));
+    } catch (retryError) {
+      return { ...textResult({ ok: false, error: String(retryError?.message || retryError) }), isError: true };
+    }
   }
 });
 

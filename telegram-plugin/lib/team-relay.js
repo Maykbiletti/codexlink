@@ -1,5 +1,6 @@
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { dirname } from "node:path";
+import { diagnosticSmokeKind } from "./diagnostic-smoke.js";
 import { appendJsonl, appendLog, loadJson, nowIso, saveJson } from "./storage.js";
 
 function normalizeMode(value) {
@@ -139,9 +140,10 @@ async function publishRelayUrl(config, event) {
 
   const headers = { "content-type": "application/json" };
   const secret = String(config?.teamRelaySecret || "").trim();
-  if (secret) {
-    headers.authorization = `Bearer ${secret}`;
+  if (!secret) {
+    throw new Error("BLUN_TELEGRAM_TEAM_RELAY_SECRET is required for HTTP relay publishing.");
   }
+  headers.authorization = `Bearer ${secret}`;
 
   const response = await fetch(url, relayFetchOptions(config, {
     method: "POST",
@@ -172,9 +174,10 @@ async function readRelayUrlDelta(config, after) {
 
   const headers = {};
   const secret = String(config?.teamRelaySecret || "").trim();
-  if (secret) {
-    headers.authorization = `Bearer ${secret}`;
+  if (!secret) {
+    throw new Error("BLUN_TELEGRAM_TEAM_RELAY_SECRET is required for HTTP relay consumption.");
   }
+  headers.authorization = `Bearer ${secret}`;
 
   const response = await fetch(url, relayFetchOptions(config, { headers }));
   if (!response.ok) {
@@ -192,6 +195,12 @@ async function readRelayUrlDelta(config, after) {
 export async function publishTeamRelayEvent(config, event) {
   if (!teamRelayPublishes(config)) {
     return { ok: true, published: false, reason: "disabled" };
+  }
+
+  const diagnosticKind = diagnosticSmokeKind(event);
+  if (diagnosticKind) {
+    appendLog(config.paths.activityFile, `TEAM_RELAY_DIAGNOSTIC_DROPPED kind=${diagnosticKind} message=${relayField(event, "messageId", "message_id") || "-"}`);
+    return { ok: true, published: false, reason: "diagnostic_smoke", diagnosticKind };
   }
 
   const relayEvent = normalizeRelayEvent(config, event);

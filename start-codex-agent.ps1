@@ -214,11 +214,11 @@ function Ensure-TeamRelayDefaults {
 
   $changed = $false
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
-    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "observe"
     $changed = $true
   }
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
-    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "off"
     $changed = $true
   }
   $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
@@ -257,10 +257,23 @@ function Write-TextFileWithRetry {
     [int]$DelayMs = 120
   )
   for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    $tempPath = $Path + "." + $PID + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
     try {
-      Set-Content -Path $Path -Value $Content -Encoding UTF8
+      $directory = [System.IO.Path]::GetDirectoryName($Path)
+      if ($directory -and -not [System.IO.Directory]::Exists($directory)) {
+        [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+      }
+      $encoding = New-Object System.Text.UTF8Encoding($false)
+      [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
+      if ([System.IO.File]::Exists($Path)) {
+        $backupPath = if ([System.IO.Path]::GetFileName($Path) -eq "state.json") { $Path + ".bak" } else { $null }
+        [System.IO.File]::Replace($tempPath, $Path, $backupPath, $true)
+      } else {
+        [System.IO.File]::Move($tempPath, $Path)
+      }
       return
     } catch {
+      try { [System.IO.File]::Delete($tempPath) } catch {}
       if ($attempt -eq $Attempts) { throw }
       Start-Sleep -Milliseconds $DelayMs
     }
@@ -521,7 +534,7 @@ if ($telegramEnabled) {
   }
   $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_PRIVATE = $(Quote-TomlLiteral $telegramTeamRelayPrivate)"
   $telegramEnvPairs += "BLUN_TELEGRAM_TEAM_RELAY_START = $(Quote-TomlLiteral $telegramTeamRelayStart)"
-  $telegramEnvOverride = "mcp_servers.codexlink_telegram.env={" + ($telegramEnvPairs -join ", ") + "}"
+  $telegramEnvOverride = "mcp_servers.codexlink_runtime.env={" + ($telegramEnvPairs -join ", ") + "}"
 }
 
 $useRemoteAppServer = ($TelegramMode -eq "plugin")
@@ -664,6 +677,7 @@ if ($useRemoteAppServer) {
       if ($previousRuntime.frontend_host_pid) { $oldPids += [int]$previousRuntime.frontend_host_pid }
       if ($previousRuntime.app_server_pid) { $oldPids += [int]$previousRuntime.app_server_pid }
       if ($previousRuntime.queue_notifier_pid) { $oldPids += [int]$previousRuntime.queue_notifier_pid }
+      if ($previousRuntime.runtime_pid) { $oldPids += [int]$previousRuntime.runtime_pid }
       if ($previousRuntime.poller_pid) { $oldPids += [int]$previousRuntime.poller_pid }
       if ($previousRuntime.dispatcher_pid) { $oldPids += [int]$previousRuntime.dispatcher_pid }
       if ($previousRuntime.responder_pid) { $oldPids += [int]$previousRuntime.responder_pid }
@@ -824,12 +838,8 @@ if ($useRemoteAppServer) {
       } else {
         $sidecarsStartedEarly = $true
         Write-DebugStage -Path $debugLogPath -Message "SIDECAR_MANAGER_EARLY_OK"
-        $pollerPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "poller.pid")
-        $dispatcherPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "dispatcher.pid")
-        $responderPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "responder.pid")
-        if ($pollerPid -gt 0) { $currentRuntime["poller_pid"] = $pollerPid }
-        if ($dispatcherPid -gt 0) { $currentRuntime["dispatcher_pid"] = $dispatcherPid }
-        if ($responderPid -gt 0) { $currentRuntime["responder_pid"] = $responderPid }
+        $runtimePid = Read-PidFileValue -Path (Join-Path $telegramStateDir "runtime-daemon.pid")
+        if ($runtimePid -gt 0) { $currentRuntime["runtime_pid"] = $runtimePid }
         Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 6)
       }
     } catch {
@@ -956,24 +966,18 @@ if ($useRemoteAppServer) {
         }
         Write-DebugStage -Path $debugLogPath -Message "SIDECAR_MANAGER_OK"
 
-        $pollerPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "poller.pid")
-        $dispatcherPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "dispatcher.pid")
-        $responderPid = Read-PidFileValue -Path (Join-Path $telegramStateDir "responder.pid")
+        $runtimePid = Read-PidFileValue -Path (Join-Path $telegramStateDir "runtime-daemon.pid")
         $remoteSessionInfo = [ordered]@{
           ws_url = $telegramAppServerWsUrl
           thread_id = $activeThreadId
           pid = $backendProcess.Id
           started_at = (Get-Date).ToUniversalTime().ToString("o")
           sidecars = [ordered]@{
-            poller = [ordered]@{ pid = $pollerPid }
-            dispatcher = [ordered]@{ pid = $dispatcherPid }
-            responder = [ordered]@{ pid = $responderPid }
+            runtime = [ordered]@{ pid = $runtimePid }
           }
         }
         Write-TextFileWithRetry -Path $appServerInfoFile -Content ($remoteSessionInfo | ConvertTo-Json -Depth 6)
-        if ($pollerPid -gt 0) { $currentRuntime["poller_pid"] = $pollerPid }
-        if ($dispatcherPid -gt 0) { $currentRuntime["dispatcher_pid"] = $dispatcherPid }
-        if ($responderPid -gt 0) { $currentRuntime["responder_pid"] = $responderPid }
+        if ($runtimePid -gt 0) { $currentRuntime["runtime_pid"] = $runtimePid }
         Write-TextFileWithRetry -Path $currentRuntimeFile -Content ($currentRuntime | ConvertTo-Json -Depth 6)
         Write-DebugStage -Path $debugLogPath -Message "APP_SERVER_INFO_WRITTEN"
       } else {
@@ -985,9 +989,7 @@ if ($useRemoteAppServer) {
             pid = $backendProcess.Id
             started_at = (Get-Date).ToUniversalTime().ToString("o")
             sidecars = [ordered]@{
-              poller = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "poller.pid") }
-              dispatcher = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "dispatcher.pid") }
-              responder = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "responder.pid") }
+              runtime = [ordered]@{ pid = Read-PidFileValue -Path (Join-Path $telegramStateDir "runtime-daemon.pid") }
             }
           }
           Write-TextFileWithRetry -Path $appServerInfoFile -Content ($remoteSessionInfo | ConvertTo-Json -Depth 6)

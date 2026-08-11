@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "codexlink_telegram": {
+    "codexlink_runtime": {
       "command": "node",
       "args": ["./server.js"]
     }

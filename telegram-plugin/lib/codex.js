@@ -1,12 +1,26 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startQueuedTextTurnOverWs } from "./app-server-client.js";
-import { runMnemoRuntimeSync } from "./mnemo-policy.js";
+import { startTextTurnWhenIdleOverWs } from "./app-server-client.js";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const runtimeRoot = join(here, "..", "..");
+const runtimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const RUNTIME_QUEUE_MARKER = /\[CodexLink Queue ID:\s*([A-Za-z0-9._:-]{1,240})\]/i;
+let runtimeTurnStarter = null;
+let runtimeComposerInjector = null;
+
+export function setRuntimeTurnStarter(starter) {
+  runtimeTurnStarter = typeof starter === "function" ? starter : null;
+}
+
+export function setRuntimeComposerInjector(injector) {
+  runtimeComposerInjector = typeof injector === "function" ? injector : null;
+}
+
+export function usesTuiComposerTransport(config) {
+  const value = String(config?.inputTransport || "tui_composer").trim().toLowerCase();
+  return !["app_server", "app-server", "turn_start", "turn-start"].includes(value);
+}
 
 function repairMojibake(value) {
   const input = String(value || "");
@@ -143,9 +157,9 @@ function formatAttachmentInstructions(message) {
   }
 
   if (attachments.some((attachment) => attachment?.isImage && attachment?.localPath)) {
-    lines.push("Die Bilddatei wurde als lokaler Bild-Input an diesen Turn angehaengt. Nutze sie direkt fuer Screenshot-/UI-Analyse.");
+    lines.push("Die Bilddatei wurde als lokaler Bild-Input an diesen Turn angehängt. Nutze sie direkt für Screenshot-/UI-Analyse.");
   } else {
-    lines.push("Nutze die lokalen Pfade, wenn du den Inhalt der Datei pruefen oder weiterverarbeiten sollst.");
+    lines.push("Nutze die lokalen Pfade, wenn du den Inhalt der Datei prüfen oder weiterverarbeiten sollst.");
   }
 
   return lines;
@@ -177,24 +191,6 @@ export function isAddressOnlyPing(config, text) {
   return names.includes(normalizedText);
 }
 
-function buildAgentRuntimeContext(config) {
-  const name = repairMojibake(String(config.displayName || config.agentName || "CodexLink")).trim() || "CodexLink";
-  const lane = repairMojibake(String(config.lane || "")).trim();
-  const customPrompt = repairMojibake(String(config.agentPrompt || "")).trim();
-  const lines = [
-    `[CodexLink Agent Context: You are ${name}.`,
-    lane ? `Assigned lane: ${lane}. Stay inside this lane unless the user explicitly redirects you.` : "Stay inside your assigned profile scope.",
-    "Treat short greetings or name-only pings as reachability checks, not translation/correction tasks.",
-    "For a greeting, reply briefly and naturally as this agent. Do not ask whether to translate, correct, or rewrite unless the user asks for that.",
-    "When writing to humans, be short, concrete, and natural. Avoid AI filler, long acknowledgements, corporate phrasing, and repeating the user's wording."
-  ];
-  if (customPrompt) {
-    lines.push(customPrompt);
-  }
-  lines[lines.length - 1] = `${lines[lines.length - 1]}]`;
-  return lines.join("\n");
-}
-
 function buildPrompt(config, message) {
   const compactText = compactInboundText(message);
   const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
@@ -210,7 +206,6 @@ function buildPrompt(config, message) {
     header.push("", agentGroupContextBlock);
   }
   header.push(...formatAttachmentInstructions(message));
-  return header.join("\n");
 
   if (message.intent === "continue_nudge") {
     header.push(
@@ -222,173 +217,18 @@ function buildPrompt(config, message) {
   if (String(message.relevance || "").toLowerCase() === "observe") {
     header.push(
       "",
-      "[Kontext: still mitlesen. Nur handeln bei direkter Frage, eigener Zustaendigkeit oder klarem Risiko.]"
+      "[Kontext: still mitlesen. Nur handeln bei direkter Frage, eigener Zuständigkeit oder klarem Risiko.]"
     );
   }
 
   if (isAddressOnlyPing(config, compactText)) {
     header.push(
       "",
-      "[Ping: Der User prueft nur, ob du erreichbar bist. Antworte kurz, dass du da bist. Starte keine Suche und keinen Tool-Lauf.]"
+      "[Ping: Der User prüft nur, ob du erreichbar bist. Antworte kurz, dass du da bist. Starte keine Suche und keinen Tool-Lauf.]"
     );
   }
 
   return header.join("\n");
-}
-
-function buildVisibleConsoleText(config, message) {
-  const compactText = compactInboundText(message);
-  const isBriefSummary = compactText.startsWith("Brief von ") || compactText.startsWith("Mnemo Idle");
-  const parts = [];
-  if (!isBriefSummary) {
-    parts.push(compactInboundLabel(message));
-  }
-  parts.push(compactText);
-  if (message.mnemoContextBlock) {
-    parts.push(message.mnemoContextBlock.trim());
-  }
-  if (message.agentGroupContextBlock) {
-    parts.push(String(message.agentGroupContextBlock).trim());
-  }
-  parts.push(...formatAttachmentInstructions(message));
-  if (message.intent === "continue_nudge") {
-    parts.push("Weiter-Signal: Bitte den laufenden Arbeitsfluss fortsetzen und nur antworten, wenn es ein konkretes Ergebnis, einen Blocker oder eine Entscheidung gibt.");
-  }
-  return parts
-    .join("\n")
-    .replace(/\s+\n/g, "\n")
-    .replace(/\n\s+/g, "\n")
-    .trim();
-}
-
-function readRuntime(config) {
-  try {
-    if (!config?.paths?.currentRuntimeFile || !existsSync(config.paths.currentRuntimeFile)) {
-      return null;
-    }
-    return JSON.parse(readFileSync(config.paths.currentRuntimeFile, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function isPidAlive(pid) {
-  const parsed = Number.parseInt(String(pid || "0"), 10);
-  if (!parsed || parsed <= 0) {
-    return false;
-  }
-  try {
-    process.kill(parsed, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getVisibleConsoleSkipReason(config, message) {
-  if (process.platform !== "win32") {
-    return "not_windows";
-  }
-  if (!config.appServerWsUrl) {
-    return "no_app_server";
-  }
-  const visibleConsoleMode = String(config.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "0").trim().toLowerCase();
-  if (visibleConsoleMode !== "force") {
-    return "env_disabled";
-  }
-  if (
-    config.visibleConsoleSkipAttachments
-    && Array.isArray(message.attachments)
-    && message.attachments.some((attachment) => attachment?.isImage && attachment?.localPath && !attachment.error)
-  ) {
-    return "image_attachment";
-  }
-  return "";
-}
-
-function visibleConsoleSubmitDelayMs(config, visibleText) {
-  const text = String(visibleText || "");
-  const configuredMin = Number.parseInt(String(config.visibleConsoleSubmitDelayMs || "260"), 10) || 260;
-  const configuredMax = Number.parseInt(String(config.visibleConsoleSubmitMaxDelayMs || "12000"), 10) || 12000;
-  const safeMax = Math.max(configuredMin, Math.min(30000, configuredMax));
-  const chars = text.length;
-  const lines = (text.match(/\n/g) || []).length;
-  // The console input writer queues keystrokes faster than the Codex TUI can
-  // consume long messages. Enter must wait for the TUI buffer, not just for
-  // WriteConsoleInputW to return.
-  const lengthDelay = Math.ceil(chars / 1.2);
-  const lineDelay = lines * 120;
-  return Math.min(safeMax, Math.max(configuredMin, 700, lengthDelay + lineDelay));
-}
-
-function injectVisibleConsole(config, message, options = {}) {
-  const skipReason = getVisibleConsoleSkipReason(config, message);
-  if (skipReason) {
-    return { ok: false, skipped: true, reason: skipReason };
-  }
-
-  const runtime = readRuntime(config);
-  const frontendPid = Number.parseInt(String(runtime?.frontend_host_pid || "0"), 10) || 0;
-  if (!isPidAlive(frontendPid)) {
-    return { ok: false, skipped: true, reason: "frontend_offline" };
-  }
-
-  const scriptPath = join(runtimeRoot, "telegram-console-input.ps1");
-  if (!existsSync(scriptPath)) {
-    return { ok: false, skipped: true, reason: "script_missing" };
-  }
-
-  const visibleText = buildVisibleConsoleText(config, message);
-  if (!visibleText) {
-    return { ok: false, skipped: true, reason: "empty" };
-  }
-  const submit = options.submit !== false;
-  const submitDelayMs = visibleConsoleSubmitDelayMs(config, visibleText);
-
-  const args = [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    scriptPath,
-    "-TargetPid",
-    String(frontendPid),
-    "-Text",
-    visibleText,
-    "-ClearBefore"
-  ];
-  if (submit) {
-    args.push(
-      "-Submit",
-      "-SubmitDelayMs",
-      String(submitDelayMs)
-    );
-  }
-
-  const result = spawnSync("powershell.exe", args, {
-    cwd: runtimeRoot,
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: Math.max(20000, submitDelayMs + 15000)
-  });
-
-  if (result.status === 0) {
-    return {
-      ok: true,
-      frontendPid,
-      visibleText,
-      submitDelayMs,
-      submit
-    };
-  }
-
-  return {
-    ok: false,
-    skipped: false,
-    reason: "script_failed",
-    stderr: String(result.stderr || result.error || "").trim(),
-    stdout: String(result.stdout || "").trim()
-  };
 }
 
 function buildTurnInput(config, message) {
@@ -418,92 +258,153 @@ function buildTurnInput(config, message) {
   };
 }
 
-function isEnabledValue(value) {
-  return value === true || /^(1|true|yes|on)$/i.test(String(value || ""));
+function runtimeQueueId(message) {
+  return String(message?.id || "")
+    .trim()
+    .replace(/[^A-Za-z0-9._:-]/g, "_")
+    .slice(0, 240);
 }
 
-function shouldHardBlockMnemoInject(config) {
-  return isEnabledValue(config?.mnemoHardBlockInject)
-    || isEnabledValue(config?.mnemoRuntimeEnforcement)
-    || isEnabledValue(process.env.BLUN_MNEMO_HARD_BLOCK_INJECT)
-    || isEnabledValue(process.env.BLUN_MNEMO_RUNTIME_ENFORCEMENT);
+function buildComposerText(config, message) {
+  const prompt = buildPrompt(config, message);
+  const queueId = runtimeQueueId(message);
+  if (!queueId) {
+    return prompt;
+  }
+  return `${prompt}\n\n[CodexLink Queue ID: ${queueId}]`;
 }
 
-function shouldHardBlockMnemoSyncFailure(config) {
-  return isEnabledValue(config?.mnemoHardBlockSyncFailure)
-    || isEnabledValue(config?.mnemoRuntimeEnforcement)
-    || isEnabledValue(process.env.BLUN_MNEMO_HARD_BLOCK_SYNC_FAILURE)
-    || isEnabledValue(process.env.BLUN_MNEMO_RUNTIME_ENFORCEMENT);
+function threadItemText(item) {
+  if (!item || item.type !== "userMessage" || !Array.isArray(item.content)) {
+    return "";
+  }
+  return item.content
+    .filter((part) => part?.type === "text")
+    .map((part) => String(part.text || ""))
+    .join("\n");
 }
 
-function isMnemoSyncFailure(sync) {
-  const status = String(sync?.status || "").trim().toLowerCase();
-  return status === "timeout"
-    || status === "error"
-    || Boolean(sync?.error)
-    || /Policy status:\s*(timeout|error)/i.test(String(sync?.promptBlock || ""));
+export function extractRuntimeQueueIdFromThreadItem(item) {
+  return threadItemText(item).match(RUNTIME_QUEUE_MARKER)?.[1] || "";
 }
 
-function buildMnemoHardBlockInjectResult(sync, reason) {
-  const status = sync?.status || (sync?.blocked ? "block" : "unknown");
-  const auditId = sync?.auditId || "-";
-  const detail = String(sync?.error || "").replace(/\s+/g, " ").slice(0, 300);
+function readRuntime(config) {
+  try {
+    if (!config?.paths?.currentRuntimeFile || !existsSync(config.paths.currentRuntimeFile)) {
+      return null;
+    }
+    return JSON.parse(readFileSync(config.paths.currentRuntimeFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid) {
+  const parsed = Number.parseInt(String(pid || "0"), 10);
+  if (!parsed || parsed <= 0) {
+    return false;
+  }
+  try {
+    process.kill(parsed, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function composerSubmitDelayMs(config, text) {
+  const configuredMin = Number.parseInt(String(config.composerSubmitDelayMs || "260"), 10) || 260;
+  const configuredMax = Number.parseInt(String(config.composerSubmitMaxDelayMs || "12000"), 10) || 12000;
+  const safeMax = Math.max(configuredMin, Math.min(30000, configuredMax));
+  const lineCount = (String(text || "").match(/\n/g) || []).length;
+  const lengthDelay = Math.ceil(String(text || "").length / 1.2);
+  return Math.min(safeMax, Math.max(configuredMin, 700, lengthDelay + lineCount * 120));
+}
+
+function injectThroughVisibleComposer(config, message) {
+  if (process.platform !== "win32") {
+    return { ok: false, reason: "not_windows" };
+  }
+  const runtime = readRuntime(config);
+  const frontendPid = Number.parseInt(String(runtime?.frontend_host_pid || "0"), 10) || 0;
+  if (!isPidAlive(frontendPid)) {
+    return { ok: false, reason: "frontend_offline" };
+  }
+  const scriptPath = join(runtimeRoot, "telegram-console-input.ps1");
+  if (!existsSync(scriptPath)) {
+    return { ok: false, reason: "script_missing" };
+  }
+  const text = buildComposerText(config, message);
+  if (!text.trim()) {
+    return { ok: false, reason: "empty" };
+  }
+  const submitDelayMs = composerSubmitDelayMs(config, text);
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    scriptPath,
+    "-TargetPid",
+    String(frontendPid),
+    "-Text",
+    text,
+    "-ClearBefore",
+    "-Submit",
+    "-SubmitDelayMs",
+    String(submitDelayMs)
+  ], {
+    cwd: runtimeRoot,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: Math.max(20000, submitDelayMs + 15000)
+  });
+  if (result.status === 0) {
+    return { ok: true, frontendPid, submitDelayMs };
+  }
   return {
     ok: false,
-    busy: false,
-    code: null,
-    signal: null,
-    responseText: "",
-    stdout: "",
-    stderr: [
-      "mnemo_runtime_hard_block",
-      `reason=${reason || "policy"}`,
-      `audit_id=${auditId}`,
-      `status=${status}`,
-      detail ? `detail=${detail}` : ""
-    ].filter(Boolean).join(" ")
+    reason: "script_failed",
+    stdout: String(result.stdout || "").trim(),
+    stderr: String(result.stderr || result.error || "").trim()
   };
-}
-
-function resolveMnemoPromptTimeoutMs(config) {
-  const configured = Number.parseInt(String(config?.mnemoPromptTimeoutMs || process.env.BLUN_MNEMO_PROMPT_TIMEOUT_MS || "0"), 10);
-  if (Number.isFinite(configured) && configured > 0) {
-    return configured;
-  }
-  return 12000;
-}
-
-function buildMnemoPromptTimeoutResult(timeoutMs) {
-  return {
-    promptBlock: `\n[Mnemo Runtime Sync]\nPolicy status: timeout\nSync error: mnemo_sync_timeout_after_${timeoutMs}ms\n[/Mnemo Runtime Sync]`,
-    status: "timeout",
-    blocked: false
-  };
-}
-
-async function runMnemoRuntimeSyncForPrompt(config, message, threadId) {
-  const timeoutMs = resolveMnemoPromptTimeoutMs(config);
-  let timer = null;
-  try {
-    return await Promise.race([
-      runMnemoRuntimeSync(config, message, threadId),
-      new Promise((resolve) => {
-        timer = setTimeout(() => resolve(buildMnemoPromptTimeoutResult(timeoutMs)), timeoutMs);
-        timer.unref?.();
-      })
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
 }
 
 export async function injectIntoThread(config, message, threadId) {
   const promptMessage = Object.assign({}, message, { mnemoContextBlock: "" });
   const turnInput = buildTurnInput(config, promptMessage);
   if (config.appServerWsUrl) {
-    const result = await startQueuedTextTurnOverWs({
+    if (usesTuiComposerTransport(config)) {
+      const injectComposer = runtimeComposerInjector || injectThroughVisibleComposer;
+      const result = await injectComposer(config, promptMessage, { threadId });
+      if (result?.ok) {
+        return {
+          ok: true,
+          busy: false,
+          turnId: "",
+          code: 0,
+          signal: null,
+          responseText: `composer_submitted thread=${threadId} frontend_pid=${result.frontendPid || "test"} key=enter`,
+          stdout: String(result.stdout || ""),
+          stderr: "",
+          queuedInComposer: true,
+          queueItemId: runtimeQueueId(promptMessage)
+        };
+      }
+      const reason = String(result?.reason || "unavailable");
+      return {
+        ok: false,
+        busy: true,
+        turnId: "",
+        code: null,
+        signal: null,
+        responseText: "",
+        stdout: String(result?.stdout || ""),
+        stderr: `composer_transport_unavailable reason=${reason}${result?.stderr ? ` ${result.stderr}` : ""}`
+      };
+    }
+    const startTurn = runtimeTurnStarter || startTextTurnWhenIdleOverWs;
+    const result = await startTurn({
       wsUrl: config.appServerWsUrl,
       threadId,
       text: turnInput.prompt,
@@ -511,28 +412,28 @@ export async function injectIntoThread(config, message, threadId) {
       model: config.model || null,
       effort: config.reasoningEffort || null,
       personality: config.personality || null,
-      timeoutMs: config.resumeTimeoutMs
+      timeoutMs: config.resumeTimeoutMs,
+      overloadBaseMs: config.runtimeOverloadBaseMs || 500
     });
 
     if (result.ok) {
-      const action = result.steered ? "turn_steered" : "turn_queued";
       return {
         ok: true,
         busy: result.busy,
         turnId: result.turnId || "",
         code: 0,
         signal: null,
-        responseText: `${action} thread=${threadId} console_skip=ws_only${result.queuedBehindActiveTurn ? " behind_active_turn=1" : ""}`,
+        responseText: `turn_started thread=${threadId} app_server=turn_start`,
         stdout: "",
         stderr: "",
-        queuedBehindActiveTurn: Boolean(result.queuedBehindActiveTurn),
         activeTurnId: result.activeTurnId || ""
       };
     }
 
     return {
       ok: false,
-      busy: result.busy,
+      busy: result.busy || result.overloaded,
+      overloaded: Boolean(result.overloaded),
       turnId: result.turnId || "",
       code: null,
       signal: null,
@@ -541,136 +442,13 @@ export async function injectIntoThread(config, message, threadId) {
       stderr: result.error ? String(result.error.message || result.error) : ""
     };
   }
-
-  const safeKey = `${message.chatId}_${message.messageId}`.replace(/[^0-9A-Za-z_-]/g, "_");
-  const promptFile = `${config.paths.promptsDir}\\${safeKey}.md`;
-  const responseFile = `${config.paths.responsesDir}\\${safeKey}.txt`;
-  writeFileSync(promptFile, turnInput.prompt, "utf8");
-
-  return await new Promise((resolve) => {
-    let timedOut = false;
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const command = resolveCodexCommand(config.codexBin);
-    const child = spawn(
-      command.file,
-      command.args.concat([
-        "exec",
-        "resume",
-        "--skip-git-repo-check",
-        "-o",
-        responseFile,
-        threadId,
-        "-"
-      ]),
-      command.options
-    );
-
-    const finish = (value) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve(value);
-    };
-
-    child.on("error", (error) => {
-      finish({
-        ok: false,
-        busy: false,
-        code: null,
-        signal: null,
-        responseText: "",
-        stdout: stdout.trim(),
-        stderr: `${stderr}\n${error}`.trim()
-      });
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      const hardKill = setTimeout(() => {
-        child.kill("SIGKILL");
-      }, 3000);
-      hardKill.unref?.();
-    }, config.resumeTimeoutMs);
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.stdin.write(readFileSync(promptFile, "utf8"));
-    child.stdin.end();
-
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      const responseText = existsSync(responseFile) ? readFileSync(responseFile, "utf8").trim() : "";
-      if (timedOut) {
-        finish({
-          ok: false,
-          busy: true,
-          code,
-          signal,
-          responseText,
-          stdout: stdout.trim(),
-          stderr: stderr.trim()
-        });
-        return;
-      }
-      finish({
-        ok: code === 0,
-        busy: false,
-        code,
-        signal,
-        responseText,
-        stdout: stdout.trim(),
-        stderr: stderr.trim()
-      });
-    });
-  });
-}
-
-function resolveCodexCommand(rawCodexBin) {
-  const requested = (rawCodexBin || "codex").trim();
-  if (process.platform !== "win32") {
-    return {
-      file: requested,
-      args: [],
-      options: {}
-    };
-  }
-
-  const appData = process.env.APPDATA || "";
-  const preferredCandidates = [
-    requested,
-    requested.endsWith(".cmd") ? requested : `${requested}.cmd`,
-    appData ? join(appData, "npm", "codex.cmd") : "",
-    appData ? join(appData, "npm", "codex") : ""
-  ].filter(Boolean);
-
-  for (const candidate of preferredCandidates) {
-    if (candidate === requested || existsSync(candidate)) {
-      if (candidate.toLowerCase().endsWith(".cmd")) {
-        return {
-          file: process.env.ComSpec || "cmd.exe",
-          args: ["/d", "/s", "/c", candidate],
-          options: { windowsHide: true }
-        };
-      }
-      return {
-        file: candidate,
-        args: [],
-        options: { windowsHide: true }
-      };
-    }
-  }
-
   return {
-    file: process.env.ComSpec || "cmd.exe",
-    args: ["/d", "/s", "/c", requested],
-    options: { windowsHide: true }
+    ok: false,
+    busy: false,
+    code: null,
+    signal: null,
+    responseText: "",
+    stdout: "",
+    stderr: "CodexLink requires BLUN_TELEGRAM_APP_SERVER_WS_URL; hidden codex exec sessions are disabled."
   };
 }

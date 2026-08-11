@@ -1,10 +1,30 @@
 param(
   [string]$Profile = "default",
   [switch]$Json,
-  [switch]$Fix
+  [switch]$Fix,
+  [switch]$DeepFix
 )
 
 $ErrorActionPreference = "Stop"
+
+function Write-StateJsonAtomic {
+  param(
+    [string]$Path,
+    [object]$Value
+  )
+  $tempPath = $Path + "." + $PID + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+  try {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tempPath, ($Value | ConvertTo-Json -Depth 10), $encoding)
+    if ([System.IO.File]::Exists($Path)) {
+      [System.IO.File]::Replace($tempPath, $Path, ($Path + ".bak"), $true)
+    } else {
+      [System.IO.File]::Move($tempPath, $Path)
+    }
+  } finally {
+    try { [System.IO.File]::Delete($tempPath) } catch {}
+  }
+}
 
 function Read-DotEnvFile {
   param([string]$Path)
@@ -39,6 +59,39 @@ function Get-DefaultTeamRelayFile {
     return (Join-Path $env:ProgramData "Blun\codexlink\blun-team-relay.jsonl")
   }
   return (Join-Path $env:USERPROFILE ".codex\channels\blun-team-relay.jsonl")
+}
+
+function Invoke-TelegramDoctorCore {
+  param(
+    [object]$Status,
+    [switch]$Repair
+  )
+  if (-not $Status.plugin_root -or -not $Status.state_dir) { return $null }
+  $scriptPath = Join-Path ([string]$Status.plugin_root) "telegram-doctor-cli.js"
+  if (-not (Test-Path $scriptPath)) { return $null }
+
+  $savedAgent = [Environment]::GetEnvironmentVariable("BLUN_TELEGRAM_AGENT_NAME", "Process")
+  $savedState = [Environment]::GetEnvironmentVariable("BLUN_TELEGRAM_STATE_DIR", "Process")
+  try {
+    [Environment]::SetEnvironmentVariable("BLUN_TELEGRAM_AGENT_NAME", [string]$Status.profile, "Process")
+    [Environment]::SetEnvironmentVariable("BLUN_TELEGRAM_STATE_DIR", [string]$Status.state_dir, "Process")
+    $args = @($scriptPath)
+    if ($Repair) { $args += "--repair" }
+    $raw = & node @args 2>$null
+    if (-not $raw) { return $null }
+    return ($raw | ConvertFrom-Json)
+  } catch {
+    return $null
+  } finally {
+    [Environment]::SetEnvironmentVariable("BLUN_TELEGRAM_AGENT_NAME", $savedAgent, "Process")
+    [Environment]::SetEnvironmentVariable("BLUN_TELEGRAM_STATE_DIR", $savedState, "Process")
+  }
+}
+
+function Test-DoctorIssue {
+  param([object]$Doctor, [string]$Code)
+  if (-not $Doctor) { return $false }
+  return @($Doctor.issues | Where-Object { [string]$_.code -eq $Code }).Count -gt 0
 }
 
 function Test-TelegramTokenFormat {
@@ -194,11 +247,11 @@ function Ensure-TeamRelayDefaults {
 
   $changed = $false
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_GROUP_DELIVERY") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_GROUP_DELIVERY"])) {
-    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "all"
+    $Values["BLUN_TELEGRAM_GROUP_DELIVERY"] = "observe"
     $changed = $true
   }
   if (-not $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_MODE") -or [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"])) {
-    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "both"
+    $Values["BLUN_TELEGRAM_TEAM_RELAY_MODE"] = "off"
     $changed = $true
   }
   $hasRelayFile = $Values.ContainsKey("BLUN_TELEGRAM_TEAM_RELAY_FILE") -and -not [string]::IsNullOrWhiteSpace([string]$Values["BLUN_TELEGRAM_TEAM_RELAY_FILE"])
@@ -251,20 +304,27 @@ function Invoke-RuntimeFix {
   )
   $actions = New-Object 'System.Collections.Generic.List[string]'
   $runtime = $Status.current_runtime
+  $doctorPidPath = Join-Path ([string]$Status.state_dir) "telegram-doctor.pid"
+  $doctorPid = if (Test-Path $doctorPidPath) { (Get-Content -Raw -Path $doctorPidPath).Trim() } else { $null }
+  $pids = @(
+    $doctorPid
+  )
   if ($runtime) {
-    $pids = @(
+    $pids += @(
       $runtime.frontend_host_pid,
       $runtime.app_server_pid,
       $runtime.queue_notifier_pid,
+      $runtime.runtime_pid,
       $runtime.poller_pid,
       $runtime.dispatcher_pid,
       $runtime.responder_pid,
       $runtime.team_relay_pid
-    ) | Where-Object { $_ } | Select-Object -Unique
-    foreach ($pidValue in $pids) {
-      if (Stop-PidQuiet -PidValue $pidValue) {
-        $actions.Add("stopped_pid=" + [string]$pidValue) | Out-Null
-      }
+    )
+  }
+  $pids = $pids | Where-Object { $_ } | Select-Object -Unique
+  foreach ($pidValue in $pids) {
+    if (Stop-PidQuiet -PidValue $pidValue) {
+      $actions.Add("stopped_pid=" + [string]$pidValue) | Out-Null
     }
   }
 
@@ -299,7 +359,7 @@ function Invoke-RuntimeFix {
       } else {
         $state | Add-Member -NotePropertyName "currentThreadId" -NotePropertyValue ""
       }
-      $state | ConvertTo-Json -Depth 10 | Set-Content -Path $stateFile -Encoding UTF8
+      Write-StateJsonAtomic -Path $stateFile -Value $state
       $actions.Add("cleared_state_thread") | Out-Null
     } catch {
       $actions.Add("state_thread_clear_failed") | Out-Null
@@ -401,7 +461,31 @@ if (Test-AllowedChatIdsFormat -Value $activeEnv["BLUN_TELEGRAM_ALLOWED_CHAT_ID"]
   $allowedChatIds = [string]$legacyEnv["TELEGRAM_ALLOWED_CHAT_ID"]
   $allowedChatSource = "legacy env fallback legacy key"
 }
-Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "warn" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No allowlist set. Telegram currently accepts any chat the bot can see." })
+Add-Check -List $checks -Name "allowed_chat_ids" -Status $(if ($allowedChatIds) { "ok" } else { "fail" }) -Detail $(if ($allowedChatIds) { $allowedChatIds } else { "No allowlist set. Telegram intake is disabled until pairing succeeds." })
+
+$stateGateStatus = if ($status.state_recovery_required) {
+  "fail"
+} elseif ($status.state_valid) {
+  "ok"
+} elseif ($status.state_backup_valid) {
+  "warn"
+} elseif (-not $status.state_file_exists) {
+  "warn"
+} else {
+  "fail"
+}
+$stateGateDetail = if ($status.state_recovery_required) {
+  "State recovery is required; Telegram intake is stopped. Restore state.json.bak or a known-good state before resuming."
+} elseif ($status.state_valid) {
+  "state.json valid; backup_valid=" + [string]$status.state_backup_valid
+} elseif ($status.state_backup_valid) {
+  "state.json invalid, but a valid backup exists and will be recovered by the runtime daemon."
+} elseif (-not $status.state_file_exists) {
+  "No state yet. First intake will initialize at the Telegram tail without replaying pending history."
+} else {
+  "state.json is invalid and no valid backup is available; intake must remain stopped."
+}
+Add-Check -List $checks -Name "state_recovery_gate" -Status $stateGateStatus -Detail $stateGateDetail
 
 $wsReachabilityKnown = $null -ne $status.active_ws_reachable
 $wsReachable = -not $wsReachabilityKnown -or [bool]$status.active_ws_reachable
@@ -434,9 +518,32 @@ if ($status.active_thread_id -and $loadedThreads.Count -gt 0 -and -not ($loadedT
 Add-Check -List $checks -Name "thread_visibility" -Status $threadVisibilityStatus -Detail $threadVisibilityDetail
 Add-Check -List $checks -Name "frontend_owner" -Status $(if ($status.frontend_owner_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.frontend_owner_pid + " alive=" + [string]$status.frontend_owner_alive)
 Add-Check -List $checks -Name "queue_notifier" -Status $(if (($null -eq $status.queue_notifier_pid) -or ($status.queue_notifier_alive)) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.queue_notifier_pid + " alive=" + [string]$status.queue_notifier_alive)
-Add-Check -List $checks -Name "poller" -Status $(if ($status.poller_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.poller_pid + " alive=" + [string]$status.poller_alive)
-Add-Check -List $checks -Name "dispatcher" -Status $(if ($status.dispatcher_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.dispatcher_pid + " alive=" + [string]$status.dispatcher_alive)
-Add-Check -List $checks -Name "responder" -Status $(if ($status.responder_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.responder_pid + " alive=" + [string]$status.responder_alive)
+Add-Check -List $checks -Name "runtime_daemon" -Status $(if ($status.runtime_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.runtime_pid + " alive=" + [string]$status.runtime_alive)
+$runtimeDoctor = if ($nodeCommand) { Invoke-TelegramDoctorCore -Status $status } else { $null }
+if ($runtimeDoctor) {
+  $lockStatus = if ($runtimeDoctor.stateLock.locked -and $runtimeDoctor.stateLock.recoverable) {
+    "fail"
+  } elseif ($runtimeDoctor.stateLock.locked) {
+    "ok"
+  } else {
+    "ok"
+  }
+  $lockDetail = if ($runtimeDoctor.stateLock.locked) {
+    "reason=" + [string]$runtimeDoctor.stateLock.reason + " owner_pid=" + [string]$runtimeDoctor.stateLock.ownerPid + " owner_alive=" + [string]$runtimeDoctor.stateLock.ownerAlive + " age_ms=" + [string]$runtimeDoctor.stateLock.ageMs + " recoverable=" + [string]$runtimeDoctor.stateLock.recoverable
+  } else {
+    "unlocked"
+  }
+  Add-Check -List $checks -Name "state_lock" -Status $lockStatus -Detail $lockDetail
+  Add-Check -List $checks -Name "runtime_rpc" -Status $(if ($runtimeDoctor.runtime.rpcReachable) { "ok" } else { "fail" }) -Detail $(if ($runtimeDoctor.runtime.rpcReachable) { "runtime_health reachable pid=" + [string]$runtimeDoctor.runtime.healthPid } else { [string]$runtimeDoctor.runtime.rpcError })
+  Add-Check -List $checks -Name "runtime_pid_identity" -Status $(if ($runtimeDoctor.runtime.identityConsistent) { "ok" } elseif ($runtimeDoctor.runtime.rpcReachable) { "fail" } else { "warn" }) -Detail ("pid_file=" + [string]$runtimeDoctor.runtime.pidFile + " endpoint_pid=" + [string]$runtimeDoctor.runtime.endpointPid + " health_pid=" + [string]$runtimeDoctor.runtime.healthPid + " meta_matches=" + [string]$runtimeDoctor.runtime.pidMetaMatches)
+  Add-Check -List $checks -Name "telegram_doctor_watch" -Status $(if (-not $runtimeDoctor.doctorWatch.enabled -or $runtimeDoctor.doctorWatch.alive) { "ok" } else { "warn" }) -Detail ("enabled=" + [string]$runtimeDoctor.doctorWatch.enabled + " pid=" + [string]$runtimeDoctor.doctorWatch.pid + " alive=" + [string]$runtimeDoctor.doctorWatch.alive)
+  Add-Check -List $checks -Name "app_server_event_stream" -Status $(if (Test-DoctorIssue -Doctor $runtimeDoctor -Code "app_server_event_stream_down") { "fail" } else { "ok" }) -Detail $(if (Test-DoctorIssue -Doctor $runtimeDoctor -Code "app_server_event_stream_down") { "event stream disconnected" } else { "connected or not required" })
+  Add-Check -List $checks -Name "active_turn" -Status $(if (Test-DoctorIssue -Doctor $runtimeDoctor -Code "active_turn_stalled") { "fail" } else { "ok" }) -Detail $(if (Test-DoctorIssue -Doctor $runtimeDoctor -Code "active_turn_stalled") { "active turn exceeded the stale threshold" } else { "active turn is fresh or not present" })
+  Add-Check -List $checks -Name "queue_dispatch_gate" -Status $(if (Test-DoctorIssue -Doctor $runtimeDoctor -Code "queue_dispatch_gate_stalled") { "fail" } else { "ok" }) -Detail ("queued=" + [string]$runtimeDoctor.queue.depth + " injecting=" + [string]$runtimeDoctor.queue.injecting + " submitted=" + [string]$runtimeDoctor.queue.submitted)
+  Add-Check -List $checks -Name "pending_replies" -Status $(if (Test-DoctorIssue -Doctor $runtimeDoctor -Code "pending_reply_stalled") { "fail" } else { "ok" }) -Detail ("open=" + [string]$runtimeDoctor.queue.pendingReplyOpen + " stalled=" + [string]$runtimeDoctor.queue.pendingReplyStalled + " orphaned=" + [string]$runtimeDoctor.queue.pendingReplyOrphaned + " expired_unreconciled=" + [string]$runtimeDoctor.queue.pendingReplyExpiredUnreconciled + " oldest_ms=" + [string]$runtimeDoctor.queue.oldestPendingReplyAgeMs)
+} else {
+  Add-Check -List $checks -Name "telegram_doctor_core" -Status "warn" -Detail "CodexLink doctor core could not be queried."
+}
 $teamRelayMode = ([string]$status.team_relay_mode).ToLower()
 $groupDeliveryMode = ([string]$status.group_delivery).ToLower()
 $teamRelayConfigured = $status.team_relay_file -or $status.team_relay_url_configured
@@ -459,7 +566,7 @@ if ($groupDeliveryMode -eq "observe" -and $teamRelayMode -eq "off") {
   Add-Check -List $checks -Name "observe_team_relay" -Status "ok" -Detail ("group_delivery=" + [string]$status.group_delivery + " relay_mode=" + [string]$status.team_relay_mode)
 }
 if ($teamRelayShouldRun -and $teamRelayConfigured) {
-  Add-Check -List $checks -Name "team_relay_consumer" -Status $(if ($status.team_relay_alive) { "ok" } else { "warn" }) -Detail ("pid=" + [string]$status.team_relay_pid + " alive=" + [string]$status.team_relay_alive)
+  Add-Check -List $checks -Name "team_relay_consumer" -Status $(if ($status.runtime_alive) { "ok" } else { "warn" }) -Detail ("owned_by_runtime_daemon pid=" + [string]$status.runtime_pid + " alive=" + [string]$status.runtime_alive)
 } else {
   Add-Check -List $checks -Name "team_relay_consumer" -Status "ok" -Detail "not required"
 }
@@ -502,8 +609,19 @@ $result = [ordered]@{
   status = $status
 }
 
-if ($Fix) {
-  $fixActions = Invoke-RuntimeFix -Status $status -RuntimeRoot $runtimeRoot
+if ($Fix -or $DeepFix) {
+  $fixActions = New-Object 'System.Collections.Generic.List[string]'
+  $safeRepair = if ($nodeCommand) { Invoke-TelegramDoctorCore -Status $status -Repair } else { $null }
+  if ($safeRepair) {
+    foreach ($action in @($safeRepair.actions)) {
+      if ($action) { $fixActions.Add([string]$action) | Out-Null }
+    }
+  }
+  if ($DeepFix) {
+    foreach ($action in @(Invoke-RuntimeFix -Status $status -RuntimeRoot $runtimeRoot)) {
+      if ($action) { $fixActions.Add([string]$action) | Out-Null }
+    }
+  }
   $result["fix_actions"] = $fixActions
   if ($Json) {
     $result | ConvertTo-Json -Depth 8
@@ -511,7 +629,11 @@ if ($Fix) {
   }
   Write-DoctorReport -Result $result -TokenSource $tokenSource -AllowedChatSource $allowedChatSource
   Write-Host ""
-  Write-Host "Fix angewendet. Starte danach neu: blun-codex --profile $($result.profile) telegram-plugin" -ForegroundColor Yellow
+  if ($DeepFix) {
+    Write-Host "Tiefe Reparatur angewendet. Starte danach neu: blun-codex --profile $($result.profile) telegram-plugin" -ForegroundColor Yellow
+  } else {
+    Write-Host "Sichere Doctor-Reparatur angewendet. Queue und Thread-Bindung bleiben erhalten." -ForegroundColor Yellow
+  }
   if ($fixActions.Count -gt 0) {
     Write-Host ("Aktionen: " + ($fixActions -join ", ")) -ForegroundColor DarkGray
   }

@@ -1,12 +1,16 @@
 {
   "name": "@blunking/codexlink",
-  "version": "0.1.48",
-  "description": "BLUN CLI launcher with Telegram channel support for one visible session.",
+  "version": "0.2.0",
+  "description": "Persistent Codex runtime queue with Telegram transport, app-server events, and an MCP control plane.",
   "license": "MIT",
   "private": false,
   "bin": {
     "blun-codex": "bin/blun-codex.js",
     "codexlink": "bin/blun-codex.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check telegram-plugin/runtime-daemon.js && node --check telegram-plugin/telegram-doctor-daemon.js && node --check telegram-plugin/telegram-doctor-cli.js && node --check telegram-plugin/server.js && node --test"
   },
   "files": [
     "bin/",
@@ -34,7 +38,8 @@
     "cli"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=20"

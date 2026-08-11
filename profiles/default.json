@@ -5,12 +5,12 @@
   "workspace": "",
   "model": "",
   "reasoning_effort": "xhigh",
-  "sandbox": "danger-full-access",
-  "approval_policy": "never",
+  "sandbox": "workspace-write",
+  "approval_policy": "on-request",
   "personality": "friendly",
   "mnemo": {
-    "inherit": true,
-    "notes": "Public default profile. Uses the host-default Mnemo binding unless a custom profile is selected."
+    "inherit": false,
+    "notes": "Mnemo is opt-in. Enable it explicitly only after configuring the target and reviewing the data policy."
   },
   "telegram": {
     "enabled": false,

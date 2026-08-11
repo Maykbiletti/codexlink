@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -33,10 +34,12 @@ function jsonResponse(res, statusCode, body) {
 function checkAuth(req, config) {
   const secret = String(config?.teamRelaySecret || "").trim();
   if (!secret) {
-    return true;
+    return false;
   }
   const header = String(req.headers.authorization || "").trim();
-  return header === `Bearer ${secret}`;
+  const expected = Buffer.from(`Bearer ${secret}`);
+  const actual = Buffer.from(header);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 function readJsonlDelta(path, after) {
@@ -220,6 +223,9 @@ async function handleRequest(req, res, config, file) {
 
 ensureStateLayout();
 const config = loadConfig();
+if (!String(config.teamRelaySecret || "").trim()) {
+  throw new Error("BLUN_TELEGRAM_TEAM_RELAY_SECRET is required to start the HTTP team relay server.");
+}
 const file = relayFilePath(config);
 const host = process.env.BLUN_TELEGRAM_TEAM_RELAY_HOST || config.teamRelayHost || "127.0.0.1";
 const port = Number.parseInt(process.env.BLUN_TELEGRAM_TEAM_RELAY_PORT || String(config.teamRelayPort || "28787"), 10) || 28787;

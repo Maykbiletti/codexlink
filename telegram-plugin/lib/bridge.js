@@ -1,16 +1,123 @@
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { basename, extname, join } from "node:path";
 import { getActiveTurnIdOverWs, listLoadedThreadsOverWs, readThreadOverWs } from "./app-server-client.js";
+import { diagnosticSmokeKind, isDiagnosticSmokeEntry } from "./diagnostic-smoke.js";
 import { loadConfig } from "./env.js";
-import { injectIntoThread, isAddressOnlyPing } from "./codex.js";
+import { injectIntoThread, isAddressOnlyPing, usesTuiComposerTransport } from "./codex.js";
 import { downloadFileBuffer, getFileInfo, getUpdates, sendChatAction, sendMessage } from "./telegram.js";
-import { appendJsonl, appendLog, defaultState, loadJson, nowIso, readTail, saveJson } from "./storage.js";
+import { appendJsonl, appendLog, defaultState, loadJson, loadJsonStrict, nowIso, readTail, saveJson, saveJsonWithBackup } from "./storage.js";
 import { buildTeamRelayEventId, publishTeamRelayEvent, readTeamRelayDelta, rememberTeamRelayIds, saveTeamRelayCursor, teamRelayStatus } from "./team-relay.js";
 import { captureTelegramLive, logMnemoOutboundReceipt } from "./mnemo-policy.js";
+import { withStateFileLock } from "./state-lock.js";
+
+let lastStateRecoveryReportAt = 0;
+
+function normalizeRuntimeState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Runtime state must be a JSON object.");
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "offset")) {
+    throw new Error("Runtime state is missing its Telegram offset.");
+  }
+  const offset = Number(value.offset);
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new Error(`Runtime state has an invalid Telegram offset: ${value.offset}`);
+  }
+  for (const key of ["queue", "pendingReplies"]) {
+    if (value[key] !== undefined && !Array.isArray(value[key])) {
+      throw new Error(`Runtime state field ${key} must be an array.`);
+    }
+  }
+  for (const key of ["replyOffsets", "replyBuffers"]) {
+    if (value[key] !== undefined && (!value[key] || typeof value[key] !== "object" || Array.isArray(value[key]))) {
+      throw new Error(`Runtime state field ${key} must be an object.`);
+    }
+  }
+  const normalized = {
+    ...defaultState(),
+    ...value,
+    schemaVersion: 3,
+    offset,
+    queue: Array.isArray(value.queue) ? value.queue : [],
+    pendingReplies: Array.isArray(value.pendingReplies) ? value.pendingReplies : [],
+    replyOffsets: value.replyOffsets || {},
+    replyBuffers: value.replyBuffers || {},
+    intakeCursorInitialized: typeof value.intakeCursorInitialized === "boolean"
+      ? value.intakeCursorInitialized
+      : true
+  };
+  return scrubIdleBriefArtifactsInPlace(normalized);
+}
+
+function stateRecoveryMarkerPath(config) {
+  return config.paths.stateRecoveryFile || join(config.paths.root, "state-recovery-required.json");
+}
+
+function stateBackupPath(config) {
+  return config.paths.stateBackupFile || `${config.paths.stateFile}.bak`;
+}
+
+function clearStateRecoveryMarker(config) {
+  try { unlinkSync(stateRecoveryMarkerPath(config)); } catch {}
+}
+
+function reportStateRecoveryRequired(config, primaryError, backupError) {
+  const error = new Error(
+    `Runtime state recovery required; Telegram intake is stopped. Primary: ${compactError(primaryError)}. Backup: ${compactError(backupError)}`
+  );
+  error.code = "STATE_RECOVERY_REQUIRED";
+  error.primaryError = primaryError;
+  error.backupError = backupError;
+  const markerPath = stateRecoveryMarkerPath(config);
+  const existingMarker = existsSync(markerPath) ? loadJson(markerPath, null) : null;
+  const marker = {
+    version: 1,
+    status: "recovery_required",
+    intakeStopped: true,
+    detectedAt: existingMarker?.detectedAt || nowIso(),
+    lastDetectedAt: nowIso(),
+    stateFile: config.paths.stateFile,
+    backupFile: stateBackupPath(config),
+    primaryError: compactError(primaryError),
+    backupError: compactError(backupError)
+  };
+  if (!existingMarker || Date.now() - lastStateRecoveryReportAt >= 30000) {
+    try { saveJson(markerPath, marker); } catch {}
+    appendLog(config.paths.activityFile, `STATE_RECOVERY_REQUIRED intake=stopped primary=${marker.primaryError} backup=${marker.backupError}`);
+    lastStateRecoveryReportAt = Date.now();
+  }
+  throw error;
+}
 
 function loadState(config) {
-  const state = loadJson(config.paths.stateFile, defaultState());
-  return scrubIdleBriefArtifactsInPlace(state);
+  const backupFile = stateBackupPath(config);
+  if (!existsSync(config.paths.stateFile) && !existsSync(backupFile)) {
+    const state = defaultState();
+    saveJsonWithBackup(config.paths.stateFile, state, backupFile);
+    clearStateRecoveryMarker(config);
+    appendLog(config.paths.activityFile, "STATE_INITIALIZED intake_cursor=tail_pending");
+    return state;
+  }
+
+  let primaryError = null;
+  try {
+    const state = normalizeRuntimeState(loadJsonStrict(config.paths.stateFile));
+    clearStateRecoveryMarker(config);
+    return state;
+  } catch (error) {
+    primaryError = error;
+  }
+
+  try {
+    const recovered = normalizeRuntimeState(loadJsonStrict(backupFile));
+    saveJsonWithBackup(config.paths.stateFile, recovered, backupFile);
+    clearStateRecoveryMarker(config);
+    appendLog(config.paths.activityFile, `STATE_RECOVERED source=backup offset=${recovered.offset} primary_error=${compactError(primaryError)}`);
+    return recovered;
+  } catch (backupError) {
+    return reportStateRecoveryRequired(config, primaryError, backupError);
+  }
 }
 
 let mnemoOutboundRetryDrainScheduled = false;
@@ -184,49 +291,15 @@ function scheduleMnemoOutboundRetryDrain(config) {
   }
 }
 
-function sleepStateLock(ms) {
-  const buffer = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
-}
-
-function withStateLock(config, callback) {
-  const lockPath = `${config.paths.stateFile}.lock`;
-  const deadline = Date.now() + 15000;
-  let descriptor = null;
-
-  while (descriptor === null) {
-    try {
-      descriptor = openSync(lockPath, "wx");
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(lockPath).mtimeMs > 60000) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for Telegram state lock: ${lockPath}`);
-      }
-      sleepStateLock(25);
-    }
-  }
-
-  try {
-    return callback();
-  } finally {
-    try { closeSync(descriptor); } catch {}
-    try { unlinkSync(lockPath); } catch {}
-  }
-}
-
 function saveStateForConfig(config, state) {
-  withStateLock(config, () => {
+  withStateFileLock(config, () => {
     const latestState = loadState(config);
     const mergedState = mergeStateSnapshots(latestState, state);
-    saveJson(config.paths.stateFile, scrubIdleBriefArtifactsInPlace(mergedState));
+    saveJsonWithBackup(
+      config.paths.stateFile,
+      scrubIdleBriefArtifactsInPlace(mergedState),
+      stateBackupPath(config)
+    );
   });
 }
 
@@ -302,7 +375,9 @@ async function captureInboundForMnemo(config, inbound, path) {
 }
 
 function pendingReplyKey(entry) {
-  return entry.turnId || `${entry.threadId || ""}:${entry.chatId}:${entry.messageId}`;
+  return entry.queueItemId
+    || entry.turnId
+    || `${entry.threadId || ""}:${entry.chatId}:${entry.messageId}`;
 }
 
 function containsToken(text, token) {
@@ -453,7 +528,7 @@ const UNIVERSAL_AGENT_PATTERNS = [
 ];
 
 function groupDeliveryMode(config) {
-  return String(config.groupDeliveryMode || "all").trim().toLowerCase();
+  return String(config.groupDeliveryMode || "observe").trim().toLowerCase();
 }
 
 function shouldDeliverAllGroupMessages(config) {
@@ -465,8 +540,7 @@ function shouldObserveAllGroupMessages(config) {
 }
 
 function shouldSubmitEveryAllowedMessage(config) {
-  const visibleConsoleMode = String(config?.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "").trim().toLowerCase();
-  return shouldDeliverAllGroupMessages(config) || visibleConsoleMode === "force";
+  return shouldDeliverAllGroupMessages(config);
 }
 
 function looksLikeUniversalAgentIntent(text) {
@@ -1019,8 +1093,15 @@ function classifyInboundRelevance(config, inbound) {
 function statusWeight(status) {
   switch (status) {
     case "delivered":
+    case "replied":
+    case "cancelled":
     case "error":
+    case "failed":
+    case "expired":
+    case "reply_timeout":
       return 4;
+    case "running":
+      return 3;
     case "submitted":
     case "injecting":
       return 2;
@@ -1043,7 +1124,10 @@ function pickIsoLater(left, right) {
 }
 
 function hasRuntimeTurnQueueResult(entry) {
-  return /^turn_(?:queued|steered)\b/i.test(String(entry?.responsePreview || ""))
+  if (String(entry?.inputTransport || "").trim() === "tui_composer") {
+    return false;
+  }
+  return /^turn_(?:queued|started)\b/i.test(String(entry?.responsePreview || ""))
     || Boolean(entry?.turnId && (entry?.deliveredAt || entry?.injectFinishedAt));
 }
 
@@ -1053,6 +1137,7 @@ function queueEvidenceTime(entry) {
     entry?.injectFinishedAt,
     entry?.lastAttemptAt,
     entry?.submittedAt,
+    entry?.runningAt,
     entry?.requeuedAt,
     entry?.parkedAt,
     entry?.ts
@@ -1148,7 +1233,7 @@ function isoAgeMs(isoString) {
 function isNonTerminalPendingReply(entry) {
   return Boolean(entry)
     && !entry.sentAt
-    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "no_reply_completed", "suppressed_private_reply"].includes(String(entry.status || ""));
+    && !["sent", "suppressed_ack", "error", "ignored_bot", "superseded", "timeout", "stale_thread", "aborted", "no_reply_completed", "suppressed_private_reply", "orphaned"].includes(String(entry.status || ""));
 }
 
 function hasResponseMessageIds(entry) {
@@ -1161,7 +1246,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "expired", "stale_thread", "aborted", "no_reply_completed"].includes(status)) {
+  if (["sent", "sending", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "timeout", "stale_thread", "aborted", "no_reply_completed", "orphaned"].includes(status)) {
     return false;
   }
   if (entry.sentAt && !hasResponseMessageIds(entry)) {
@@ -1201,11 +1286,8 @@ function supersedeOlderPendingRepliesInPlace(pendingReplies) {
     if (!isReplyAwaitingOutcome(entry)) {
       continue;
     }
-    const key = [
-      String(entry.chatId || "").trim(),
-      String(entry.conversationKey || "").trim(),
-      String(entry.telegramThreadId || "").trim()
-    ].join("|");
+    const key = String(entry.queueItemId || "").trim()
+      || `${String(entry.chatId || "").trim()}|${String(entry.messageId || "").trim()}`;
     const current = newestByConversation.get(key);
     const stamp = String(entry.createdAt || "");
     if (!current || stamp > current.stamp) {
@@ -1218,11 +1300,8 @@ function supersedeOlderPendingRepliesInPlace(pendingReplies) {
     if (!isReplyAwaitingOutcome(entry)) {
       continue;
     }
-    const key = [
-      String(entry.chatId || "").trim(),
-      String(entry.conversationKey || "").trim(),
-      String(entry.telegramThreadId || "").trim()
-    ].join("|");
+    const key = String(entry.queueItemId || "").trim()
+      || `${String(entry.chatId || "").trim()}|${String(entry.messageId || "").trim()}`;
     const newest = newestByConversation.get(key)?.entry || null;
     if (!newest || newest === entry) {
       continue;
@@ -1233,6 +1312,71 @@ function supersedeOlderPendingRepliesInPlace(pendingReplies) {
     superseded += 1;
   }
 
+  return superseded;
+}
+
+function supersedeOtherPendingRepliesForTurnInPlace(state, keepEntry) {
+  const turnId = String(keepEntry?.turnId || "").trim();
+  const keepQueueItemId = String(keepEntry?.queueItemId || "").trim();
+  if (!turnId || !keepQueueItemId) {
+    return 0;
+  }
+
+  if (looksLikeBotSender(keepEntry)) {
+    const humanOwner = (state.pendingReplies || []).find((entry) => {
+      return entry
+        && entry !== keepEntry
+        && isReplyAwaitingOutcome(entry)
+        && String(entry.turnId || "").trim() === turnId
+        && !looksLikeBotSender(entry);
+    });
+    if (humanOwner) {
+      const supersededAt = nowIso();
+      keepEntry.status = "superseded";
+      keepEntry.sentAt = supersededAt;
+      keepEntry.lastSignalAt = supersededAt;
+      keepEntry.responsePreview = "[bot input attached without taking reply ownership]";
+      markMatchingQueueEntriesInPlace(state, keepEntry, {
+        status: "delivered",
+        deliveredAt: supersededAt,
+        threadId: keepEntry.threadId,
+        turnId,
+        responsePreview: keepEntry.responsePreview
+      });
+      return 1;
+    }
+  }
+
+  const keepCreatedAt = Date.parse(String(keepEntry?.createdAt || ""));
+  let superseded = 0;
+  for (const entry of state.pendingReplies || []) {
+    if (!entry || entry === keepEntry || !isReplyAwaitingOutcome(entry)) {
+      continue;
+    }
+    if (String(entry.turnId || "").trim() !== turnId) {
+      continue;
+    }
+    if (String(entry.queueItemId || "").trim() === keepQueueItemId) {
+      continue;
+    }
+    const entryCreatedAt = Date.parse(String(entry.createdAt || ""));
+    if (Number.isFinite(keepCreatedAt) && Number.isFinite(entryCreatedAt) && entryCreatedAt > keepCreatedAt) {
+      continue;
+    }
+    const supersededAt = nowIso();
+    entry.status = "superseded";
+    entry.sentAt = supersededAt;
+    entry.lastSignalAt = supersededAt;
+    entry.responsePreview = "[superseded by newer input in the same turn]";
+    markMatchingQueueEntriesInPlace(state, entry, {
+      status: "delivered",
+      deliveredAt: supersededAt,
+      threadId: entry.threadId,
+      turnId,
+      responsePreview: entry.responsePreview
+    });
+    superseded += 1;
+  }
   return superseded;
 }
 
@@ -1273,32 +1417,73 @@ function scrubIdleBriefArtifactsInPlace(state) {
   return state;
 }
 
-function closeExpiredPendingRepliesInPlace(config, pendingReplies) {
+function reconcileTimedOutPendingRepliesInPlace(config, pendingReplies, state = null) {
   const replies = Array.isArray(pendingReplies) ? pendingReplies : [];
   const timeoutMs = getEffectivePendingReplyTimeoutMs(config);
   if (timeoutMs <= 0) {
-    return 0;
+    return { retrying: 0, timedOut: 0 };
   }
 
-  let expired = 0;
+  const retryMax = Math.max(1, Number(config.pendingReplyRetryMax || 3));
+  const retryDelayMs = Math.max(1000, Number(config.pendingReplyRetryDelayMs || 30000));
+  let retrying = 0;
+  let timedOut = 0;
   for (const entry of replies) {
     if (hasResponseMessageIds(entry)) {
       entry.status = String(entry.status || "").trim().toLowerCase() === "suppressed_ack" ? "suppressed_ack" : "sent";
       entry.sentAt = entry.sentAt || getPendingReplyActivityAt(entry) || nowIso();
       continue;
     }
-    if (!isNonTerminalPendingReply(entry)) {
+    const status = String(entry.status || "pending").trim().toLowerCase();
+    const legacyExpired = status === "expired" && !hasResponseMessageIds(entry);
+    if (!legacyExpired && !isNonTerminalPendingReply(entry)) {
       continue;
     }
-    if (isoAgeMs(getPendingReplyActivityAt(entry)) < timeoutMs) {
+    const retryAfterMs = Date.parse(String(entry.replyRetryAfterAt || ""));
+    const retryDue = status === "timeout_retry"
+      ? (!Number.isFinite(retryAfterMs) || retryAfterMs <= Date.now())
+      : (legacyExpired || isoAgeMs(getPendingReplyActivityAt(entry)) >= timeoutMs);
+    if (!retryDue) {
       continue;
     }
-    entry.status = "expired";
-    entry.sentAt = nowIso();
-    entry.responsePreview = entry.responsePreview || `[pending reply expired after ${timeoutMs}ms]`;
-    expired += 1;
+    const attempts = Math.max(0, Number(entry.replyRetryAttempts || 0));
+    const timeoutAt = nowIso();
+    if (attempts >= retryMax) {
+      entry.status = "timeout";
+      entry.sentAt = timeoutAt;
+      entry.timeoutAt = timeoutAt;
+      entry.replyRetryAfterAt = null;
+      entry.responsePreview = `[Telegram reply timed out after ${attempts} recovery attempts]`;
+      if (state) {
+        markMatchingQueueEntriesInPlace(state, entry, {
+          status: "reply_timeout",
+          replyTimeoutAt: timeoutAt,
+          leaseUntil: null,
+          responsePreview: entry.responsePreview
+        });
+      }
+      timedOut += 1;
+      continue;
+    }
+    entry.status = "timeout_retry";
+    entry.sentAt = null;
+    entry.replyDeliveryClaimId = null;
+    entry.replyDeliveryClaimedAt = null;
+    entry.timeoutAt = timeoutAt;
+    entry.replyRetryAttempts = attempts + 1;
+    entry.replyRetryAfterAt = new Date(Date.now() + retryDelayMs).toISOString();
+    entry.lastSignalAt = timeoutAt;
+    entry.responsePreview = `[Telegram reply timeout; recovery attempt ${entry.replyRetryAttempts}/${retryMax}]`;
+    if (state) {
+      markMatchingQueueEntriesInPlace(state, entry, {
+        replyTimeoutAt: timeoutAt,
+        replyRetryAttempts: entry.replyRetryAttempts,
+        responsePreview: entry.responsePreview
+      });
+    }
+    retrying += 1;
   }
-  return expired;
+  return { retrying, timedOut };
 }
 
 function getEffectivePendingReplyTimeoutMs(config) {
@@ -1398,12 +1583,15 @@ function recoverStaleInjectingEntriesInPlace(entries, staleMs = 1000 * 60 * 5) {
     }
     entry.status = "queued";
     entry.injectRecoveredAt = nowIso();
+    entry.requeuedAt = entry.injectRecoveredAt;
+    entry.requeueReason = "stale_injecting_lease";
+    entry.leaseUntil = null;
     recovered += 1;
   }
   return recovered;
 }
 
-function mergeQueueEntry(current, incoming) {
+export function mergeQueueEntry(current, incoming) {
   if (!current && !incoming) {
     return null;
   }
@@ -1445,13 +1633,18 @@ function mergeQueueEntry(current, incoming) {
     merged[field] = anchor[field] ?? other[field] ?? null;
   }
 
-  const runtimeQueueSource = hasRuntimeTurnQueueResult(incoming) ? incoming : (hasRuntimeTurnQueueResult(current) ? current : null);
+  const currentHasRuntimeResult = hasRuntimeTurnQueueResult(current);
+  const incomingHasRuntimeResult = hasRuntimeTurnQueueResult(incoming);
+  const runtimeQueueSource = currentHasRuntimeResult && incomingHasRuntimeResult
+    ? selectQueueMergeAnchor(current, incoming)
+    : (incomingHasRuntimeResult ? incoming : (currentHasRuntimeResult ? current : null));
   if (runtimeQueueSource) {
-    merged.status = "delivered";
+    const terminal = ["delivered", "replied", "cancelled", "error", "failed", "expired", "reply_timeout"].includes(String(runtimeQueueSource.status || "").toLowerCase());
+    merged.status = terminal ? runtimeQueueSource.status : "submitted";
     merged.relevance = "direct";
     merged.threadId = runtimeQueueSource.threadId || merged.threadId || null;
     merged.turnId = runtimeQueueSource.turnId || merged.turnId || null;
-    merged.responsePreview = runtimeQueueSource.responsePreview;
+    merged.responsePreview = runtimeQueueSource.responsePreview ?? merged.responsePreview;
     merged.retryAfterAt = null;
   }
 
@@ -1547,9 +1740,7 @@ function looksLikeBotSender(entry) {
 }
 
 function isTransportSmokeEntry(entry) {
-  const scope = String(entry?.scope || "").trim().toLowerCase();
-  const sourceText = String(entry?.sourceText || entry?.text || "").trim().toLowerCase();
-  return scope === "transport-smoke" || sourceText.startsWith("[botdoctor smoke]");
+  return isDiagnosticSmokeEntry(entry);
 }
 
 function isTrustedBotSender(config, entry) {
@@ -1559,6 +1750,15 @@ function isTrustedBotSender(config, entry) {
   const sender = foldTriggerText(entry?.user || "");
   const trustedBots = Array.isArray(config?.trustedBotSenders) ? config.trustedBotSenders : [];
   return trustedBots.map((value) => foldTriggerText(value)).includes(sender);
+}
+
+function isOwnTelegramBotSender(config, entry) {
+  if (!looksLikeBotSender(entry) || String(entry?.source || "").trim().toLowerCase() !== "telegram") {
+    return false;
+  }
+  const ownBotId = String(config?.botToken || "").split(":", 1)[0].trim();
+  const senderId = String(entry?.userId || "").trim();
+  return Boolean(ownBotId && senderId && /^\d+$/.test(ownBotId) && senderId === ownBotId);
 }
 
 function shouldReplyToTeamBotSender(config, entry) {
@@ -1589,7 +1789,13 @@ function shouldAcceptBotRelayEntry(config, entry) {
   if (!looksLikeBotSender(entry)) {
     return true;
   }
+  if (isOwnTelegramBotSender(config, entry) || !isGroupChatEntry(entry)) {
+    return false;
+  }
   if (isTrustedBotSender(config, entry)) {
+    return true;
+  }
+  if (shouldDeliverAllGroupMessages(config) || shouldObserveAllGroupMessages(config)) {
     return true;
   }
   const text = String(entry?.sourceText || entry?.text || "");
@@ -1608,7 +1814,8 @@ function reconcilePendingRepliesInPlace(pendingReplies) {
   const groups = new Map();
 
   for (const entry of replies) {
-    const key = `${entry.chatId || ""}:${entry.conversationKey || ""}`;
+    const key = String(entry.queueItemId || "").trim()
+      || `${String(entry.chatId || "").trim()}:${String(entry.messageId || "").trim()}`;
     if (!groups.has(key)) {
       groups.set(key, []);
     }
@@ -1750,7 +1957,7 @@ function mergeStateSnapshots(currentState, incomingState) {
 function compactQueueHistory(queue) {
   const configured = Number.parseInt(process.env.BLUN_TELEGRAM_QUEUE_HISTORY_LIMIT || "500", 10);
   const historyLimit = Number.isFinite(configured) && configured >= 50 ? configured : 500;
-  const terminalStatuses = new Set(["delivered", "expired", "ignored_bot", "suppressed_ack", "stale_thread"]);
+  const terminalStatuses = new Set(["delivered", "replied", "cancelled", "failed", "expired", "reply_timeout", "ignored_bot", "suppressed_ack", "stale_thread"]);
   const active = [];
   const terminal = [];
   for (const entry of queue || []) {
@@ -1898,7 +2105,11 @@ function normalizeInbound(message, updateType = "message") {
   const telegramThreadId = message.message_thread_id ? String(message.message_thread_id) : "";
   const chatId = String(message.chat.id);
   const sender = message.from || message.sender_chat || {};
+  const receivedAt = nowIso();
   return {
+    id: `telegram:${chatId}:${String(message.message_id)}`,
+    source: "telegram",
+    sourceMessageId: String(message.message_id),
     chatId,
     messageId: String(message.message_id),
     replyToMessageId: message.reply_to_message ? String(message.reply_to_message.message_id) : "",
@@ -1913,11 +2124,15 @@ function normalizeInbound(message, updateType = "message") {
     userId: sender.id ? String(sender.id) : "",
     text,
     attachment: pickTelegramAttachment(message),
-    ts: nowIso(),
+    ts: receivedAt,
+    createdAt: receivedAt,
+    availableAt: receivedAt,
+    leaseUntil: null,
     intent: "message",
     relevance: "ambient",
     updateType,
     status: "queued",
+    activeTurnSubmit: true,
     attempts: 0,
     lastAttemptAt: null
   };
@@ -2077,7 +2292,11 @@ function normalizeTeamRelayInbound(config, state, event) {
   const conversationKey = firstRelayText(event, "conversationKey", "conversation_key") || `${chatId}:${telegramThreadId || "root"}`;
   const scope = firstRelayText(event, "scope");
   const priority = firstRelayText(event, "priority");
+  const receivedAt = String(event.ts || "").trim() || nowIso();
   const inbound = {
+    id: `team-relay:${chatId}:${messageId}`,
+    source: "team-relay",
+    sourceMessageId: messageId,
     chatId,
     messageId,
     replyToMessageId: firstRelayText(event, "replyToMessageId", "reply_to_message_id"),
@@ -2089,10 +2308,14 @@ function normalizeTeamRelayInbound(config, state, event) {
     user: String(event.user || sourceAgent || "team-relay").trim() || "team-relay",
     userId: firstRelayText(event, "userId", "user_id"),
     text,
-    ts: String(event.ts || "").trim() || nowIso(),
+    ts: receivedAt,
+    createdAt: receivedAt,
+    availableAt: receivedAt,
+    leaseUntil: null,
     intent: "message",
     relevance: "ambient",
     status: "queued",
+    activeTurnSubmit: true,
     attempts: 0,
     lastAttemptAt: null,
     relay: {
@@ -2173,14 +2396,13 @@ function normalizeTelegramThreadId(value) {
   return String(value || "").trim();
 }
 
-function isAllowedChat(config, inbound) {
+export function isAllowedChat(config, inbound) {
   const allowed = Array.isArray(config.allowedChatIds) ? config.allowedChatIds : [];
   if (allowed.length === 0) {
-    return true;
+    return false;
   }
   const chatId = String(inbound?.chatId || inbound || "").trim();
-  const userId = String(inbound?.userId || "").trim();
-  return allowed.includes(chatId) || (userId && allowed.includes(userId));
+  return allowed.includes(chatId);
 }
 
 function splitTelegramText(text, maxLength = 3500) {
@@ -2710,6 +2932,8 @@ async function resolveSessionActivity(config, threadId, entry = null) {
 
 function buildPendingReplyEntry(message, threadId, turnId, sessionPath, sessionOffset) {
   return {
+    queueItemId: String(message.id || "").trim(),
+    inputTransport: String(message.inputTransport || "").trim(),
     turnId: String(turnId || "").trim(),
     threadId: String(threadId || "").trim(),
     sessionPath: String(sessionPath || "").trim(),
@@ -2739,6 +2963,9 @@ function shouldTrackPendingReply(config, message) {
   if (!message) {
     return false;
   }
+  if (message.noTelegramReply === true) {
+    return false;
+  }
   if (String(message.relevance || "").trim().toLowerCase() === "observe") {
     return false;
   }
@@ -2754,12 +2981,6 @@ function shouldTrackPendingReply(config, message) {
   }
   const chatType = String(message.chatType || "").trim().toLowerCase();
   return chatType === "group" || chatType === "supergroup";
-}
-
-function usesVisibleConsoleInject(config) {
-  return String(config?.visibleConsoleInject || process.env.BLUN_TELEGRAM_VISIBLE_CONSOLE_INJECT || "")
-    .trim()
-    .toLowerCase() === "force";
 }
 
 function parseUnixSeconds(isoString) {
@@ -3013,14 +3234,65 @@ async function resolveActiveThreadId(config, state, preferredThreadId, options =
   }
 }
 
+export function reconcileRuntimePendingReplies() {
+  const config = loadConfig();
+  const state = loadState(config);
+  state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
+  const superseded = supersedeOlderPendingRepliesInPlace(state.pendingReplies || []);
+  const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
+  const terminalQueueStatuses = new Set([
+    "replied",
+    "cancelled",
+    "error",
+    "failed",
+    "reply_timeout",
+    "ignored_bot",
+    "suppressed_ack",
+    "stale_thread"
+  ]);
+  let orphaned = 0;
+  for (const entry of state.pendingReplies || []) {
+    if (!isReplyAwaitingOutcome(entry)) continue;
+    const queueItemId = String(entry.queueItemId || "").trim();
+    const queueEntry = (state.queue || []).find((candidate) => {
+      return (queueItemId && String(candidate.id || "").trim() === queueItemId)
+        || queueKey(candidate) === queueKey(entry);
+    });
+    const queueStatus = String(queueEntry?.status || "").trim().toLowerCase();
+    if (queueEntry && !terminalQueueStatuses.has(queueStatus)) continue;
+    entry.status = "orphaned";
+    entry.sentAt = nowIso();
+    entry.responsePreview = entry.responsePreview || (queueEntry
+      ? `[pending reply closed because queue item is ${queueStatus}]`
+      : "[pending reply closed because queue item is missing]");
+    orphaned += 1;
+  }
+  saveStateForConfig(config, state);
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || orphaned > 0 || superseded > 0) {
+    appendLog(
+      config.paths.activityFile,
+      `PENDING_REPLY_RECONCILED retrying=${timeoutResult.retrying} timeout=${timeoutResult.timedOut} orphaned=${orphaned} superseded=${superseded} retained=${state.pendingReplies.length}`
+    );
+  }
+  return {
+    ok: true,
+    retrying: timeoutResult.retrying,
+    timedOut: timeoutResult.timedOut,
+    orphaned,
+    superseded,
+    retained: state.pendingReplies.length,
+    open: (state.pendingReplies || []).filter((entry) => isReplyAwaitingOutcome(entry)).length
+  };
+}
+
 export function bridgeStatus() {
   const config = loadConfig();
   const state = loadState(config);
   const runtimeOwner = getRuntimeOwner(config);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
-  const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0) {
+  const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || parkedAmbient > 0) {
     if (parkedAmbient > 0) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
@@ -3028,17 +3300,20 @@ export function bridgeStatus() {
   }
   const queued = state.queue.filter((item) => item.status === "queued");
   const submitted = state.queue.filter((item) => item.status === "submitted");
+  const running = state.queue.filter((item) => item.status === "running");
   const parked = state.queue.filter((item) => item.status === "parked");
   const ambient = queued.filter((item) => item.relevance === "ambient");
   const observe = queued.filter((item) => item.relevance === "observe");
   const pendingReplies = (state.pendingReplies || []).filter((item) => isNonTerminalPendingReply(item));
-  const expiredReplies = (state.pendingReplies || []).filter((item) => String(item.status || "") === "expired");
+  const expiredReplies = (state.pendingReplies || []).filter((item) => ["expired", "timeout_retry", "timeout"].includes(String(item.status || "")));
   return {
     agent: config.agentName,
     allowedChatId: config.allowedChatId || null,
+    allowlistConfigured: config.allowedChatIds.length > 0,
     boundThreadId: config.currentThreadId || state.currentThreadId || null,
     frontendOwnerPid: runtimeOwner?.frontendHostPid || null,
     frontendOwnerAlive: runtimeOwner?.frontendAlive ?? null,
+    inputTransport: config.inputTransport,
     dispatchMode: config.dispatchMode,
     groupDeliveryMode: config.groupDeliveryMode,
     idleCooldownMs: config.idleCooldownMs,
@@ -3048,6 +3323,7 @@ export function bridgeStatus() {
     ambientQueueDepth: ambient.length,
     parkedQueueDepth: parked.length,
     submittedDepth: submitted.length,
+    runningDepth: running.length,
     pendingReplyDepth: pendingReplies.length,
     expiredPendingReplyDepth: expiredReplies.length,
     progressRelayMode: getProgressRelayMode(config),
@@ -3057,7 +3333,7 @@ export function bridgeStatus() {
     lastInjectAt: state.lastInjectAt,
     teamRelay: teamRelayStatus(config),
     stateDir: config.paths.root,
-    note: "Telegram first lands in queue. Use BLUN_TELEGRAM_GROUP_DELIVERY=observe for team-wide group visibility without automatic Telegram replies, all for eager group delivery, mentions for strict routing."
+    note: "The durable runtime queue persists intake; the visible Codex TUI composer owns active-turn input queueing. Telegram intake is disabled until an allowlist is configured."
   };
 }
 
@@ -3201,7 +3477,33 @@ export async function pollOnce() {
   if (parkedAmbientAtStart > 0) {
     appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbientAtStart}`);
   }
-  const startOffset = Number(state.offset || 0);
+  if (state.intakeCursorInitialized !== true) {
+    const pending = await getUpdates(config, -1);
+    const updateIds = (pending || [])
+      .map((update) => Number(update?.update_id))
+      .filter((value) => Number.isSafeInteger(value) && value >= 0);
+    const latestUpdateId = updateIds.length > 0 ? Math.max(...updateIds) : -1;
+    state.offset = latestUpdateId >= 0 ? latestUpdateId + 1 : 0;
+    state.intakeCursorInitialized = true;
+    state.intakeInitializedAt = nowIso();
+    state.lastPollAt = state.intakeInitializedAt;
+    saveStateForConfig(config, state);
+    appendLog(
+      config.paths.activityFile,
+      `INTAKE_TAIL_INITIALIZED next_offset=${state.offset} discarded_pending=${updateIds.length}`
+    );
+    return {
+      ok: true,
+      status: "tail_initialized",
+      startOffset: null,
+      nextOffset: state.offset,
+      captured: 0,
+      ignored: updateIds.length,
+      discardedPending: updateIds.length
+    };
+  }
+
+  const startOffset = Number(state.offset);
   const updates = await getUpdates(config, startOffset);
   let captured = 0;
   let ignored = 0;
@@ -3231,9 +3533,21 @@ export async function pollOnce() {
       continue;
     }
     const inbound = normalizeInbound(message, updateType);
+    inbound.updateId = String(update.update_id);
     if (!isAllowedChat(config, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `IGNORED chat=${inbound.chatId} user=${inbound.userId || "-"} message=${inbound.messageId}`);
+      continue;
+    }
+    const diagnosticKind = diagnosticSmokeKind(inbound);
+    if (diagnosticKind) {
+      ignored += 1;
+      appendJsonl(config.paths.inboxFile, {
+        ...inbound,
+        status: "ignored_diagnostic_smoke",
+        diagnosticKind
+      });
+      appendLog(config.paths.activityFile, `DIAGNOSTIC_SMOKE_DROPPED kind=${diagnosticKind} chat=${inbound.chatId} message=${inbound.messageId}`);
       continue;
     }
     if (String(inbound.chatType || "") === "private" && looksLikeMnemoIdleLoopBrief(inbound.text)) {
@@ -3254,7 +3568,8 @@ export async function pollOnce() {
     }
     if (!shouldAcceptBotRelayEntry(config, inbound)) {
       ignored += 1;
-      appendLog(config.paths.activityFile, `IGNORED_BOT_RELAY chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
+      const reason = isOwnTelegramBotSender(config, inbound) ? "IGNORED_OWN_BOT" : "IGNORED_BOT_RELAY";
+      appendLog(config.paths.activityFile, `${reason} chat=${inbound.chatId} message=${inbound.messageId} user=${inbound.user}: ${inbound.text.replace(/\s+/g, " ").slice(0, 180)}`);
       continue;
     }
     if (hasKnownInboundMessage(state, inbound)) {
@@ -3321,11 +3636,29 @@ export async function consumeTeamRelayOnce() {
     seenIds.add(eventId);
     consumedIds.push(eventId);
 
+    const diagnosticKind = diagnosticSmokeKind(event);
+    if (diagnosticKind) {
+      ignored += 1;
+      appendJsonl(config.paths.inboxFile, {
+        id: eventId,
+        source: "team-relay",
+        chatId: firstRelayText(event, "chatId", "chat_id"),
+        messageId: firstRelayText(event, "messageId", "message_id"),
+        text: String(event?.text || ""),
+        ts: String(event?.ts || "") || nowIso(),
+        status: "ignored_diagnostic_smoke",
+        diagnosticKind
+      });
+      appendLog(config.paths.activityFile, `TEAM_RELAY_DIAGNOSTIC_DROPPED kind=${diagnosticKind} id=${eventId}`);
+      continue;
+    }
+
     const inbound = normalizeTeamRelayInbound(config, state, event);
     if (!inbound) {
       ignored += 1;
       continue;
     }
+    inbound.activeTurnSubmit = true;
     if (!isAllowedChat(config, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_CHAT id=${eventId} chat=${inbound.chatId} user=${inbound.userId || "-"}`);
@@ -3373,26 +3706,7 @@ export function listQueue(limit = 10) {
   return state.queue.slice(-Math.max(1, limit));
 }
 
-function getQueuedDispatchPriority(item) {
-  if (!item || item.status !== "queued") {
-    return Number.MAX_SAFE_INTEGER;
-  }
-  const relevance = String(item.relevance || "").toLowerCase();
-  const chatType = String(item.chatType || "").toLowerCase();
-  if (relevance === "escalation") {
-    return 0;
-  }
-  if (chatType === "private" || relevance === "direct" || relevance === "lane") {
-    return 2;
-  }
-  return 3;
-}
-
 function compareQueuedDispatchOrder(left, right) {
-  const priorityDiff = getQueuedDispatchPriority(left) - getQueuedDispatchPriority(right);
-  if (priorityDiff !== 0) {
-    return priorityDiff;
-  }
   const leftTs = String(left?.ts || "");
   const rightTs = String(right?.ts || "");
   if (leftTs !== rightTs) {
@@ -3406,11 +3720,24 @@ function compareQueuedDispatchOrder(left, right) {
   return String(left?.messageId || "").localeCompare(String(right?.messageId || ""));
 }
 
-async function resolveRuntimeActiveTurnId(config, threadId) {
+async function resolveRuntimeDispatchState(config, threadId, runtimeDispatchGate) {
   const wsUrl = String(config?.appServerWsUrl || "").trim();
   const resolvedThreadId = String(threadId || "").trim();
   if (!wsUrl || !resolvedThreadId) {
-    return "";
+    return { ready: false, reason: "thread_unbound", activeTurnId: "", threadStatus: "unknown" };
+  }
+  if (typeof runtimeDispatchGate === "function") {
+    try {
+      const state = await runtimeDispatchGate(resolvedThreadId);
+      return {
+        ready: state?.ready === true,
+        reason: String(state?.reason || (state?.ready ? "ready" : "status_unknown")),
+        activeTurnId: String(state?.activeTurnId || "").trim(),
+        threadStatus: String(state?.threadStatus || "unknown")
+      };
+    } catch {
+      return { ready: false, reason: "event_stream_unavailable", activeTurnId: "", threadStatus: "unknown" };
+    }
   }
   try {
     const result = await getActiveTurnIdOverWs({
@@ -3418,10 +3745,33 @@ async function resolveRuntimeActiveTurnId(config, threadId) {
       threadId: resolvedThreadId,
       timeoutMs: Math.min(Number(config.resumeTimeoutMs || 10000) || 10000, 5000)
     });
-    return result?.ok ? String(result.activeTurnId || "").trim() : "";
+    if (!result?.ok) {
+      return { ready: false, reason: "status_unknown", activeTurnId: "", threadStatus: "unknown" };
+    }
+    const threadStatus = String(result.statusType || "").trim();
+    const activeTurnId = String(result.activeTurnId || "").trim();
+    return {
+      ready: threadStatus.toLowerCase() === "idle" && !activeTurnId,
+      reason: activeTurnId ? "active_turn" : (threadStatus.toLowerCase() === "idle" ? "ready" : "status_unknown"),
+      activeTurnId,
+      threadStatus: threadStatus || "unknown"
+    };
   } catch {
-    return "";
+    return { ready: false, reason: "status_unknown", activeTurnId: "", threadStatus: "unknown" };
   }
+}
+
+function isSteerableRuntimeTurnState(dispatchState) {
+  if (!dispatchState || dispatchState.ready === true) {
+    return false;
+  }
+  const reason = String(dispatchState.reason || "").trim().toLowerCase();
+  const threadStatus = String(dispatchState.threadStatus || "").trim().toLowerCase();
+  const activeTurnId = String(dispatchState.activeTurnId || "").trim();
+  return ["active_turn", "turn_completion_pending"].includes(reason)
+    && threadStatus === "active"
+    && Boolean(activeTurnId)
+    && activeTurnId !== "pending-turn-id";
 }
 
 function isQueueRetryReady(item) {
@@ -3433,9 +3783,13 @@ function selectNextQueuedEntry(queue, options = {}) {
   const auto = Boolean(options.auto);
   const deferredMode = String(options.dispatchMode || "deferred").toLowerCase() !== "legacy";
   const submitAllQueued = Boolean(options.submitAllQueued);
-  const queued = Array.isArray(queue)
+  const activeTurnOnly = Boolean(options.activeTurnOnly);
+  let queued = Array.isArray(queue)
     ? queue.filter((item) => item?.status === "queued" && isQueueRetryReady(item))
     : [];
+  if (activeTurnOnly) {
+    queued = queued.filter((item) => item.activeTurnSubmit === true);
+  }
   if (!auto || !deferredMode) {
     return queued.sort(compareQueuedDispatchOrder)[0] || null;
   }
@@ -3445,7 +3799,11 @@ function selectNextQueuedEntry(queue, options = {}) {
   const eligible = queued.filter((item) => {
     const relevance = String(item.relevance || "").toLowerCase();
     const chatType = String(item.chatType || "").toLowerCase();
-    return relevance === "escalation" || chatType === "private" || relevance === "direct" || relevance === "lane";
+    return relevance === "escalation"
+      || chatType === "private"
+      || relevance === "direct"
+      || relevance === "lane"
+      || relevance === "observe";
   });
   return eligible.sort(compareQueuedDispatchOrder)[0] || null;
 }
@@ -3632,9 +3990,13 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
   }
   const now = nowIso();
   const sourceMessageId = String(sourceEntry.messageId || "").trim();
+  const catchupMessageId = `catchup-${sourceMessageId}-${Date.now()}`;
   const catchup = {
+    id: `runtime:${catchupMessageId}`,
+    source: "runtime",
+    sourceMessageId: catchupMessageId,
     chatId: String(sourceEntry.chatId || "").trim(),
-    messageId: `catchup-${sourceMessageId}-${Date.now()}`,
+    messageId: catchupMessageId,
     replyToMessageId: String(sourceEntry.replyToMessageId || sourceEntry.messageId || "").trim(),
     telegramThreadId: normalizeTelegramThreadId(sourceEntry.telegramThreadId),
     chatType: String(sourceEntry.chatType || "").trim(),
@@ -3646,14 +4008,17 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
     text: [
       "Catch-up nach direktem Telegram-Auftrag:",
       "Seit Start des letzten Alfred-Turns sind weitere Gruppenmeldungen eingetroffen.",
-      "Verarbeite sie ueber den Agentgruppen-Kontext. Wenn der letzte Auftrag Wiederholen/Test war, liefere die fehlenden Meldungen vollstaendig nach; sonst antworte nur bei konkretem Mehrwert."
+      "Verarbeite sie über den Agentgruppen-Kontext. Wenn der letzte Auftrag Wiederholen/Test war, liefere die fehlenden Meldungen vollständig nach; sonst antworte nur bei konkretem Mehrwert."
     ].join(" "),
     sourceText: "CodexLink catch-up turn for parked group messages.",
     relevance: "direct",
     intent: "catchup",
     status: "queued",
+    activeTurnSubmit: true,
     ts: now,
     createdAt: now,
+    availableAt: now,
+    leaseUntil: null,
     updateType: "catchup",
     catchupForMessageId: sourceMessageId,
     catchupObserveRefs: entries.map((entry) => String(entry.messageId || "").trim()).filter(Boolean),
@@ -3667,16 +4032,130 @@ function enqueueCatchupTurnIfNeeded(config, state, sourceEntry) {
   return entries.length;
 }
 
+const ACTIVE_TURN_QUEUE_GENERATION = 1;
+
+function retireLegacyRuntimeBacklogInPlace(state, options = {}) {
+  const retireAllExisting = Boolean(options.retireAllExisting);
+  const preserveBoundRunning = Boolean(options.preserveBoundRunning);
+  const retiredQueueIds = new Set();
+  const retiredQueueKeys = new Set();
+  const preservedQueueIds = new Set();
+  const preservedQueueKeys = new Set();
+  const retiredAt = nowIso();
+  let parked = 0;
+  let cancelled = 0;
+  let superseded = 0;
+  let preserved = 0;
+
+  for (const entry of state.queue || []) {
+    if (!entry) continue;
+    const status = String(entry.status || "").trim().toLowerCase();
+    const queueItemId = String(entry.id || "").trim();
+    const entryQueueKey = queueKey(entry);
+    const preserveCurrent = retireAllExisting
+      && preserveBoundRunning
+      && entry.activeTurnSubmit === true
+      && status === "running"
+      && Boolean(String(entry.turnId || "").trim());
+    if (preserveCurrent) {
+      preservedQueueIds.add(queueItemId);
+      preservedQueueKeys.add(entryQueueKey);
+      preserved += 1;
+      continue;
+    }
+    if (!retireAllExisting && entry.activeTurnSubmit === true) continue;
+    retiredQueueIds.add(queueItemId);
+    retiredQueueKeys.add(entryQueueKey);
+    if (status === "queued") {
+      entry.status = "parked";
+      entry.parkedAt = retiredAt;
+      parked += 1;
+    } else if (["submitted", "running", "injecting"].includes(status)) {
+      entry.status = "cancelled";
+      entry.deliveredAt = retiredAt;
+      entry.leaseUntil = null;
+      cancelled += 1;
+    } else {
+      continue;
+    }
+    entry.parkReason = "legacy_pre_active_turn_backlog";
+    entry.responsePreview = "[legacy queue item retained without automatic replay]";
+  }
+
+  for (const pending of state.pendingReplies || []) {
+    if (!isReplyAwaitingOutcome(pending)) continue;
+    const queueItemId = String(pending.queueItemId || "").trim();
+    const pendingQueueKey = queueKey(pending);
+    const preservesCurrent = preservedQueueIds.has(queueItemId) || preservedQueueKeys.has(pendingQueueKey);
+    const retiresLegacy = retiredQueueIds.has(queueItemId) || retiredQueueKeys.has(pendingQueueKey);
+    if (preservesCurrent || (!retiresLegacy && !retireAllExisting)) continue;
+    pending.status = "superseded";
+    pending.sentAt = retiredAt;
+    pending.lastSignalAt = retiredAt;
+    pending.responsePreview = "[legacy queue item retained without automatic replay]";
+    superseded += 1;
+  }
+
+  return { parked, cancelled, superseded, preserved, retiredAt, changed: parked + cancelled + superseded };
+}
+
+export function initializeActiveTurnQueueGeneration() {
+  const config = loadConfig();
+  let result = {
+    changed: false,
+    generation: ACTIVE_TURN_QUEUE_GENERATION,
+    parked: 0,
+    cancelled: 0,
+    superseded: 0,
+    preserved: 0
+  };
+
+  withStateFileLock(config, () => {
+    const state = loadState(config);
+    const currentGeneration = Number(state.activeTurnQueueGeneration || 0);
+    if (currentGeneration >= ACTIVE_TURN_QUEUE_GENERATION) {
+      result = { ...result, generation: currentGeneration };
+      return;
+    }
+
+    const retired = retireLegacyRuntimeBacklogInPlace(state, {
+      retireAllExisting: true,
+      preserveBoundRunning: true
+    });
+    state.activeTurnQueueGeneration = ACTIVE_TURN_QUEUE_GENERATION;
+    state.activeTurnQueueCutoverAt = retired.retiredAt;
+    saveRuntimeStateWhileLocked(config, state);
+    appendLog(
+      config.paths.activityFile,
+      `ACTIVE_TURN_QUEUE_INITIALIZED generation=${ACTIVE_TURN_QUEUE_GENERATION} parked=${retired.parked} cancelled=${retired.cancelled} replies=${retired.superseded} preserved=${retired.preserved}`
+    );
+    result = {
+      changed: true,
+      generation: ACTIVE_TURN_QUEUE_GENERATION,
+      parked: retired.parked,
+      cancelled: retired.cancelled,
+      superseded: retired.superseded,
+      preserved: retired.preserved
+    };
+  });
+
+  return result;
+}
+
 export async function injectNext(threadId, options = {}) {
   const config = loadConfig();
-  const state = loadState(config);
+  let state = loadState(config);
+  const auto = Boolean(options.auto);
   const recoveredInjecting = recoverStaleInjectingEntriesInPlace(state.queue || []);
   const reclassified = reclassifyQueuedEntriesInPlace(config, state.queue || []);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   const runtimeOwner = getRuntimeOwner(config);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
-  const expiredPendingReplies = closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
-  if (expiredPendingReplies > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0) {
+  const legacyBacklog = auto
+    ? retireLegacyRuntimeBacklogInPlace(state)
+    : { parked: 0, cancelled: 0, superseded: 0, changed: 0 };
+  const timeoutResult = reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
+  if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0 || parkedAmbient > 0 || reclassified.changed > 0 || recoveredInjecting > 0 || legacyBacklog.changed > 0) {
     if (recoveredInjecting > 0) {
       appendLog(config.paths.activityFile, `INJECT_STALE_RECOVERED count=${recoveredInjecting}`);
     }
@@ -3686,12 +4165,31 @@ export async function injectNext(threadId, options = {}) {
     if (parkedAmbient > 0) {
       appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     }
-    appendLog(config.paths.activityFile, `PENDING_REPLY_EXPIRED count=${expiredPendingReplies}`);
+    if (timeoutResult.retrying > 0 || timeoutResult.timedOut > 0) {
+      appendLog(config.paths.activityFile, `PENDING_REPLY_TIMEOUT retrying=${timeoutResult.retrying} terminal=${timeoutResult.timedOut}`);
+    }
+    if (legacyBacklog.changed > 0) {
+      appendLog(config.paths.activityFile, `LEGACY_BACKLOG_RETIRED parked=${legacyBacklog.parked} cancelled=${legacyBacklog.cancelled} replies=${legacyBacklog.superseded}`);
+    }
     saveStateForConfig(config, state);
   }
-  const auto = Boolean(options.auto);
   const useAppServer = Boolean(config.appServerWsUrl);
-  const useRuntimeTurnQueue = auto && useAppServer && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy";
+  const useTuiComposerQueue = auto && useAppServer && usesTuiComposerTransport(config);
+  const useRuntimeTurnQueue = auto && useAppServer && !useTuiComposerQueue;
+  const useStrictRuntimeQueue = useTuiComposerQueue || useRuntimeTurnQueue;
+  const useManagedRuntimeInput = useStrictRuntimeQueue;
+  const runtimeDispatchGate = typeof options.runtimeDispatchGate === "function"
+    ? options.runtimeDispatchGate
+    : null;
+  const earlyDispatchThreadId = String(threadId || config.currentThreadId || state.currentThreadId || "").trim();
+  const earlyDispatchState = useStrictRuntimeQueue && runtimeDispatchGate && earlyDispatchThreadId
+    ? await resolveRuntimeDispatchState(config, earlyDispatchThreadId, runtimeDispatchGate)
+    : null;
+  const activeTurnInputOnly = Boolean(
+    useTuiComposerQueue
+    && earlyDispatchState
+    && isSteerableRuntimeTurnState(earlyDispatchState)
+  );
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
     return {
@@ -3702,10 +4200,11 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  const next = selectNextQueuedEntry(state.queue || [], {
+  let next = selectNextQueuedEntry(state.queue || [], {
     auto,
     dispatchMode: config.dispatchMode,
-    submitAllQueued: shouldSubmitEveryAllowedMessage(config)
+    submitAllQueued: shouldSubmitEveryAllowedMessage(config),
+    activeTurnOnly: activeTurnInputOnly
   });
 
   if (!next) {
@@ -3791,11 +4290,19 @@ export async function injectNext(threadId, options = {}) {
     || (useAppServer ? state.currentThreadId : config.currentThreadId)
     || ""
   ).trim();
-  let resolvedThreadId = await resolveActiveThreadId(config, state, preferredThreadId, {
-    forcePreferred: Boolean(explicitThreadId || config.currentThreadId)
-  });
+  const runtimeDispatchClaim = typeof options.runtimeDispatchClaim === "function"
+    ? options.runtimeDispatchClaim
+    : null;
+  const runtimeDispatchSettled = typeof options.runtimeDispatchSettled === "function"
+    ? options.runtimeDispatchSettled
+    : null;
+  let resolvedThreadId = runtimeDispatchGate && preferredThreadId
+    ? preferredThreadId
+    : await resolveActiveThreadId(config, state, preferredThreadId, {
+      forcePreferred: Boolean(explicitThreadId || config.currentThreadId)
+    });
   if (!resolvedThreadId) {
-    throw new Error("No bound thread id. Use bridge_bind_current_thread first.");
+    throw new Error("No bound thread id. Use runtime_bind_thread first.");
   }
   const staleThreadPendingReplies = closeStaleThreadPendingRepliesInPlace(state.pendingReplies || [], resolvedThreadId);
   if (staleThreadPendingReplies > 0) {
@@ -3809,7 +4316,7 @@ export async function injectNext(threadId, options = {}) {
   }
   if (auto && !bypassDeferredGate && String(config.dispatchMode || "deferred").toLowerCase() !== "legacy") {
     const openPendingReplies = countOpenPendingReplies(state, config);
-    if (openPendingReplies > 0 && !useRuntimeTurnQueue) {
+    if (openPendingReplies > 0 && !useManagedRuntimeInput) {
         const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
       const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
       next.status = "queued";
@@ -3831,7 +4338,7 @@ export async function injectNext(threadId, options = {}) {
       };
     }
 
-    if (!useRuntimeTurnQueue) {
+    if (!useManagedRuntimeInput) {
       const sessionActivity = await resolveSessionActivity(config, resolvedThreadId, next);
       if (sessionActivity.active) {
         await maybeSendDeferredReceipt(config, state, next, "session_active");
@@ -3846,36 +4353,66 @@ export async function injectNext(threadId, options = {}) {
       }
     }
   }
-  if (useRuntimeTurnQueue && !bypassDeferredGate) {
-    appendLog(config.paths.activityFile, `RUNTIME_TURN_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
-    const activeTurnId = await resolveRuntimeActiveTurnId(config, resolvedThreadId);
-    if (activeTurnId) {
-      const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
-      const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
+  let steeringActiveTurn = false;
+  let steeringDispatchReason = "";
+  if (useStrictRuntimeQueue) {
+    appendLog(config.paths.activityFile, `RUNTIME_FIFO_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
+    const dispatchState = earlyDispatchState && resolvedThreadId === earlyDispatchThreadId
+      ? earlyDispatchState
+      : await resolveRuntimeDispatchState(config, resolvedThreadId, runtimeDispatchGate);
+    steeringActiveTurn = Boolean(
+      useTuiComposerQueue
+      && isSteerableRuntimeTurnState(dispatchState)
+      && next.activeTurnSubmit === true
+    );
+    steeringDispatchReason = steeringActiveTurn
+      ? String(dispatchState.reason || "").trim().toLowerCase()
+      : "";
+    if (!dispatchState.ready && !steeringActiveTurn) {
       const checkedAt = nowIso();
       next.status = "queued";
       next.lastAttemptAt = checkedAt;
-      next.retryAfterAt = retryAfterAt;
-      next.activeTurnId = activeTurnId;
-      next.responsePreview = "waiting_for_active_turn";
+      next.retryAfterAt = null;
+      next.activeTurnId = dispatchState.activeTurnId || null;
+      next.responsePreview = `waiting_for_${dispatchState.reason}`;
       markMatchingQueueEntriesInPlace(state, next, {
         status: next.status,
         lastAttemptAt: next.lastAttemptAt,
-        retryAfterAt,
-        activeTurnId,
+        retryAfterAt: null,
+        activeTurnId: next.activeTurnId,
         responsePreview: next.responsePreview
       });
-      appendLog(config.paths.activityFile, `RUNTIME_TURN_DEFER message=${next.messageId} active_turn=${activeTurnId} retry_after=${retryAfterAt}`);
+      appendLog(config.paths.activityFile, `RUNTIME_TURN_DEFER message=${next.messageId} reason=${dispatchState.reason} thread_status=${dispatchState.threadStatus} active_turn=${dispatchState.activeTurnId || "-"}`);
       saveStateForConfig(config, state);
       return {
         ok: false,
         status: "deferred",
-        reason: "runtime_active_turn",
-        activeTurnId,
-        retryAfterAt,
+        reason: `runtime_${dispatchState.reason}`,
+        activeTurnId: dispatchState.activeTurnId || "",
+        threadStatus: dispatchState.threadStatus,
+        retryAfterAt: null,
         message: next
       };
     }
+    if (steeringActiveTurn) {
+      next.activeTurnId = String(dispatchState.activeTurnId || "").trim() || null;
+      next.steeredActiveTurn = true;
+      appendLog(
+        config.paths.activityFile,
+        `RUNTIME_TURN_STEER message=${next.messageId} thread=${resolvedThreadId} active_turn=${next.activeTurnId || "-"} reason=${steeringDispatchReason || "-"}`
+      );
+    }
+  }
+  const selectedQueueKey = queueKey(next);
+  const latestBeforeClaim = loadState(config);
+  state = mergeStateSnapshots(latestBeforeClaim, state);
+  next = (state.queue || []).find((entry) => queueKey(entry) === selectedQueueKey) || null;
+  if (!next || String(next.status || "").toLowerCase() !== "queued") {
+    return {
+      ok: true,
+      status: "deferred",
+      reason: "queue_item_no_longer_claimable"
+    };
   }
   next = attachAgentGroupContextBlock(config, state, next);
 
@@ -3891,26 +4428,99 @@ export async function injectNext(threadId, options = {}) {
     saveStateForConfig(config, state);
   }
 
+  let composerDispatchClaimed = false;
+  if (useTuiComposerQueue && !steeringActiveTurn) {
+    let claimState = {
+      ready: false,
+      reason: "composer_lock_unavailable",
+      activeTurnId: "",
+      threadStatus: "unknown"
+    };
+    if (runtimeDispatchClaim) {
+      try {
+        claimState = await runtimeDispatchClaim({
+          threadId: resolvedThreadId,
+          queueItemId: String(next.id || "").trim()
+        });
+      } catch {
+        claimState = {
+          ready: false,
+          reason: "composer_lock_unavailable",
+          activeTurnId: "",
+          threadStatus: "unknown"
+        };
+      }
+    }
+    if (claimState?.ready !== true) {
+      const checkedAt = nowIso();
+      next.status = "queued";
+      next.lastAttemptAt = checkedAt;
+      next.retryAfterAt = null;
+      next.activeTurnId = String(claimState?.activeTurnId || "").trim() || null;
+      next.responsePreview = `waiting_for_${claimState?.reason || "composer_lock_unavailable"}`;
+      markMatchingQueueEntriesInPlace(state, next, {
+        status: next.status,
+        lastAttemptAt: next.lastAttemptAt,
+        retryAfterAt: null,
+        activeTurnId: next.activeTurnId,
+        responsePreview: next.responsePreview
+      });
+      appendLog(config.paths.activityFile, `RUNTIME_COMPOSER_CLAIM_DEFER message=${next.messageId} reason=${claimState?.reason || "composer_lock_unavailable"}`);
+      const latestState = loadState(config);
+      markMatchingQueueEntriesInPlace(latestState, next, {
+        status: next.status,
+        lastAttemptAt: next.lastAttemptAt,
+        retryAfterAt: null,
+        activeTurnId: next.activeTurnId,
+        responsePreview: next.responsePreview
+      });
+      saveStateForConfig(config, mergeStateSnapshots(latestState, state));
+      return {
+        ok: false,
+        status: "deferred",
+        reason: `runtime_${claimState?.reason || "composer_lock_unavailable"}`,
+        activeTurnId: next.activeTurnId || "",
+        threadStatus: String(claimState?.threadStatus || "unknown"),
+        retryAfterAt: null,
+        message: next
+      };
+    }
+    composerDispatchClaimed = true;
+  }
+
+  const settleComposerDispatch = async (result) => {
+    if (!composerDispatchClaimed || !runtimeDispatchSettled) {
+      return;
+    }
+    try {
+      await runtimeDispatchSettled({
+        threadId: resolvedThreadId,
+        queueItemId: String(next.id || "").trim(),
+        result
+      });
+    } catch (error) {
+      appendLog(config.paths.activityFile, `RUNTIME_COMPOSER_SETTLE_ERROR message=${next.messageId} ${String(error?.message || error).replace(/\s+/g, " ").slice(0, 300)}`);
+    }
+  };
+
   next.attempts = Number(next.attempts || 0) + 1;
   next.lastAttemptAt = nowIso();
   next.status = "injecting";
   next.injectStartedAt = next.lastAttemptAt;
+  next.leasedAt = next.lastAttemptAt;
+  next.leaseUntil = new Date(Date.now() + Math.max(60000, Number(config.resumeTimeoutMs || 15000) * 4)).toISOString();
   next.retryAfterAt = null;
   markMatchingQueueEntriesInPlace(state, next, {
     status: "injecting",
     attempts: next.attempts,
     lastAttemptAt: next.lastAttemptAt,
     injectStartedAt: next.injectStartedAt,
+    leasedAt: next.leasedAt,
+    leaseUntil: next.leaseUntil,
     retryAfterAt: null
   });
   let sessionPath = "";
   let sessionOffset = 0;
-  if (useAppServer) {
-    sessionPath = await resolveThreadSessionPath(config, resolvedThreadId);
-    if (sessionPath && existsSync(sessionPath)) {
-      sessionOffset = statSync(sessionPath).size;
-    }
-  }
   if (!useAppServer && !next.historyLoggedAt) {
     const historyEntry = appendHistoryEntry(config, resolvedThreadId, next);
     if (historyEntry) {
@@ -3919,11 +4529,27 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `HISTORY_APPEND thread=${resolvedThreadId} message=${next.messageId}`);
     }
   }
-  saveStateForConfig(config, state);
+  try {
+    saveStateForConfig(config, state);
+  } catch (error) {
+    await settleComposerDispatch({ ok: false, busy: false, error });
+    throw error;
+  }
+
   appendLog(config.paths.activityFile, `INJECT_START thread=${resolvedThreadId} message=${next.messageId}`);
-  let result = await injectIntoThread(config, next, resolvedThreadId);
+  let result;
+  try {
+    result = await injectIntoThread(config, next, resolvedThreadId);
+  } catch (error) {
+    await settleComposerDispatch({ ok: false, busy: false, error });
+    throw error;
+  }
+  if (steeringActiveTurn && result.ok) {
+    result.responseText = String(result.responseText || "").replace(/^composer_submitted\b/, "composer_steered");
+    result.activeTurnId = next.activeTurnId || "";
+  }
   const injectErrorText = `${result.responseText || ""}\n${result.stderr || ""}`;
-  if (useAppServer && !result.ok && /thread\s+not\s+found/i.test(injectErrorText)) {
+  if (useAppServer && !useTuiComposerQueue && !result.ok && /thread\s+not\s+found/i.test(injectErrorText)) {
     appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY old_thread=${resolvedThreadId} message=${next.messageId}`);
     const retryThreadId = await resolveActiveThreadId(config, state, "", {
       forcePreferred: false
@@ -3941,18 +4567,26 @@ export async function injectNext(threadId, options = {}) {
       appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY_SKIPPED thread=${resolvedThreadId} message=${next.messageId}`);
     }
   }
+  await settleComposerDispatch(result);
   if (result.busy) {
     const promotedThisAttempt = useAppServer ? false : promoteVisibleQueuedEntry(config, state, resolvedThreadId, next);
-    const retryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "75"), 10) || 75);
+    const activeRetryMs = Math.max(75, Number.parseInt(String(process.env.BLUN_TELEGRAM_ACTIVE_TURN_RETRY_MS || "750"), 10) || 750);
+    const overloadBaseMs = Math.max(250, Number(config.runtimeOverloadBaseMs || 500));
+    const overloadDelayMs = Math.min(30000, overloadBaseMs * Math.pow(2, Math.min(6, Math.max(0, next.attempts - 1))));
+    const retryMs = result.overloaded
+      ? overloadDelayMs + Math.floor(Math.random() * Math.max(100, overloadBaseMs))
+      : activeRetryMs;
     const retryAfterAt = new Date(Date.now() + retryMs).toISOString();
     next.status = promotedThisAttempt ? "submitted" : "queued";
     next.retryAfterAt = retryAfterAt;
+    next.leaseUntil = null;
     markMatchingQueueEntriesInPlace(state, next, {
       status: next.status,
       injectFinishedAt: nowIso(),
-      retryAfterAt
+      retryAfterAt,
+      leaseUntil: null
     });
-    appendLog(config.paths.activityFile, `INJECT_BUSY thread=${resolvedThreadId} message=${next.messageId}`);
+    appendLog(config.paths.activityFile, `INJECT_BUSY thread=${resolvedThreadId} message=${next.messageId} overloaded=${result.overloaded ? 1 : 0} retry_ms=${retryMs}`);
     const latestState = loadState(config);
     markMatchingQueueEntriesInPlace(latestState, next, {
       status: next.status,
@@ -3968,24 +4602,36 @@ export async function injectNext(threadId, options = {}) {
     };
   }
 
-  next.status = result.ok ? "delivered" : "error";
-  next.deliveredAt = nowIso();
+  const injectFinishedAt = nowIso();
+  next.status = result.ok ? "submitted" : "error";
+  next.submittedAt = result.ok ? injectFinishedAt : null;
+  next.deliveredAt = result.ok ? null : injectFinishedAt;
   next.retryAfterAt = null;
+  next.leaseUntil = null;
   next.threadId = resolvedThreadId;
-  next.turnId = String(result.turnId || "").trim() || null;
+  const steeredTurnId = steeringActiveTurn
+    && steeringDispatchReason === "active_turn"
+    && String(next.activeTurnId || "").trim() !== "active"
+    ? String(next.activeTurnId || "").trim()
+    : "";
+  next.turnId = String(result.turnId || steeredTurnId).trim() || null;
+  next.inputTransport = result.queuedInComposer ? "tui_composer" : "app_server";
   next.responsePreview = result.responseText.slice(0, 400);
   next.stderr = result.stderr.slice(0, 400);
   next.stdout = result.stdout.slice(0, 400);
   const injectResultUpdates = {
     status: next.status,
     deliveredAt: next.deliveredAt,
+    submittedAt: next.submittedAt,
     threadId: next.threadId,
     turnId: next.turnId,
+    inputTransport: next.inputTransport,
     responsePreview: next.responsePreview,
     stderr: next.stderr,
     stdout: next.stdout,
-    injectFinishedAt: next.deliveredAt,
-    retryAfterAt: null
+    injectFinishedAt,
+    retryAfterAt: null,
+    leaseUntil: null
   };
   markMatchingDeliveryStateInPlace(state, next, injectResultUpdates);
   if (result.ok) {
@@ -3995,7 +4641,14 @@ export async function injectNext(threadId, options = {}) {
     }
   }
   if (useAppServer && result.ok) {
-    if (!shouldTrackPendingReply(config, next)) {
+    const trackPendingReply = shouldTrackPendingReply(config, next);
+    if (!trackPendingReply) {
+      next.status = "delivered";
+      next.deliveredAt = injectFinishedAt;
+      markMatchingQueueEntriesInPlace(state, next, {
+        status: next.status,
+        deliveredAt: next.deliveredAt
+      });
       appendLog(config.paths.activityFile, `REPLY_SKIP_CONTINUE thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}`);
     } else {
       const pendingReply = buildPendingReplyEntry(next, resolvedThreadId, next.turnId, sessionPath, sessionOffset);
@@ -4003,6 +4656,13 @@ export async function injectNext(threadId, options = {}) {
         pendingReply.trustedTeamBotReply = true;
       }
       state.pendingReplies = mergePendingReplyLists(state.pendingReplies || [], [pendingReply]);
+      const storedPendingReply = (state.pendingReplies || []).find((entry) => {
+        return String(entry?.queueItemId || "").trim() === String(pendingReply.queueItemId || "").trim();
+      }) || pendingReply;
+      const supersededInTurn = supersedeOtherPendingRepliesForTurnInPlace(state, storedPendingReply);
+      if (supersededInTurn > 0) {
+        appendLog(config.paths.activityFile, `RUNTIME_TURN_INPUT_SUPERSEDED turn=${storedPendingReply.turnId || "-"} count=${supersededInTurn}`);
+      }
       const noTurnSuffix = next.turnId ? "" : " no_turn=1";
       appendLog(config.paths.activityFile, `REPLY_PENDING thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}${noTurnSuffix}`);
     }
@@ -4023,7 +4683,7 @@ export async function injectNext(threadId, options = {}) {
   appendLog(config.paths.activityFile, `INJECT_${result.ok ? "OK" : "ERROR"} thread=${resolvedThreadId} message=${next.messageId}`);
   return {
     ok: result.ok,
-    status: result.ok ? "delivered" : "error",
+    status: result.ok ? next.status : "error",
     threadId: resolvedThreadId,
     message: next,
     responsePreview: result.responseText.slice(0, 400),
@@ -4033,12 +4693,21 @@ export async function injectNext(threadId, options = {}) {
 
 export async function relayRepliesOnce() {
   const config = loadConfig();
+  if (config.appServerWsUrl) {
+    const state = loadState(config);
+    return {
+      ok: true,
+      status: "app_server_events",
+      delivered: 0,
+      pending: (state.pendingReplies || []).filter((entry) => isNonTerminalPendingReply(entry)).length
+    };
+  }
   scheduleMnemoOutboundRetryDrain(config);
   const state = loadState(config);
   const parkedAmbient = parkExpiredAmbientQueueEntriesInPlace(config, state.queue || []);
   state.pendingReplies = reconcilePendingRepliesInPlace(state.pendingReplies || []);
   const supersededPendingReplies = supersedeOlderPendingRepliesInPlace(state.pendingReplies || []);
-  closeExpiredPendingRepliesInPlace(config, state.pendingReplies || []);
+  reconcileTimedOutPendingRepliesInPlace(config, state.pendingReplies || [], state);
   if (parkedAmbient > 0 || supersededPendingReplies > 0) {
     appendLog(config.paths.activityFile, `AMBIENT_PARKED count=${parkedAmbient}`);
     if (supersededPendingReplies > 0) {
@@ -4347,6 +5016,382 @@ export async function reply(text, options = {}) {
   });
   saveStateForConfig(config, state);
   return result;
+}
+
+export function enqueueRuntimeMessage(text, options = {}) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const value = String(text || "").trim();
+  if (!value) {
+    throw new Error("Runtime queue text is empty.");
+  }
+  if (value.length > 100000) {
+    const error = new Error("Runtime queue text exceeds 100000 characters.");
+    error.statusCode = 413;
+    throw error;
+  }
+  const createdAt = nowIso();
+  const messageId = String(options.messageId || randomUUID()).trim();
+  const chatId = String(options.chatId || `runtime:${config.agentName}`).trim();
+  const item = {
+    id: `runtime:${messageId}`,
+    source: String(options.source || "mcp"),
+    sourceMessageId: messageId,
+    chatId,
+    messageId,
+    replyToMessageId: "",
+    telegramThreadId: "",
+    chatType: "runtime",
+    senderIsBot: false,
+    conversationKey: String(options.conversationKey || `${chatId}:runtime`),
+    groupTitle: "",
+    user: String(options.user || "CodexLink MCP"),
+    userId: "",
+    text: value,
+    ts: createdAt,
+    createdAt,
+    availableAt: createdAt,
+    leaseUntil: null,
+    intent: "message",
+    relevance: "direct",
+    updateType: "runtime",
+    status: "queued",
+    activeTurnSubmit: true,
+    attempts: 0,
+    lastAttemptAt: null,
+    noTelegramReply: options.noTelegramReply !== false
+  };
+  if (hasKnownInboundMessage(state, item)) {
+    return { ok: true, duplicate: true, item: state.queue.find((entry) => queueKey(entry) === queueKey(item)) || item };
+  }
+  state.queue.push(item);
+  state.lastInbound = item;
+  appendJsonl(config.paths.inboxFile, item);
+  appendLog(config.paths.activityFile, `RUNTIME_ENQUEUE id=${item.id} source=${item.source}`);
+  saveStateForConfig(config, state);
+  return { ok: true, duplicate: false, item };
+}
+
+export function cancelRuntimeQueueItem(identifier) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const key = String(identifier || "").trim();
+  if (!key) {
+    throw new Error("Queue item id is required.");
+  }
+  const item = (state.queue || []).find((entry) => {
+    return String(entry.id || "") === key
+      || String(entry.messageId || "") === key
+      || queueKey(entry) === key;
+  });
+  if (!item) {
+    throw new Error(`Queue item not found: ${key}`);
+  }
+  if (!["queued", "parked", "error", "failed"].includes(String(item.status || "").toLowerCase())) {
+    const error = new Error(`Queue item ${key} cannot be cancelled while status is ${item.status}.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  item.status = "cancelled";
+  item.cancelledAt = nowIso();
+  item.leaseUntil = null;
+  item.retryAfterAt = null;
+  saveStateForConfig(config, state);
+  appendLog(config.paths.activityFile, `RUNTIME_CANCEL id=${item.id || item.messageId}`);
+  return { ok: true, item };
+}
+
+export function bindRuntimeTurnFromUserMessage(event) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const queueItemId = String(event?.queueItemId || "").trim();
+  const turnId = String(event?.turnId || "").trim();
+  const threadId = String(event?.threadId || "").trim();
+  if (!queueItemId || !turnId) {
+    return { ok: true, matched: false, queueItemId, turnId };
+  }
+
+  const queueItem = (state.queue || []).find((entry) => String(entry.id || "").trim() === queueItemId);
+  const pending = (state.pendingReplies || []).find((entry) => {
+    return isReplyAwaitingOutcome(entry)
+      && String(entry.queueItemId || "").trim() === queueItemId;
+  });
+  if (!queueItem && !pending) {
+    appendLog(config.paths.activityFile, `RUNTIME_USER_MESSAGE_UNMATCHED queue=${queueItemId} thread=${threadId || "-"} turn=${turnId}`);
+    return { ok: true, matched: false, queueItemId, turnId };
+  }
+
+  if (queueItem) {
+    queueItem.turnId = turnId;
+    queueItem.threadId = threadId || queueItem.threadId;
+    if (String(queueItem.status || "").toLowerCase() === "submitted") {
+      queueItem.status = "running";
+      queueItem.runningAt = event.observedAt || nowIso();
+    }
+  }
+  if (pending) {
+    pending.turnId = turnId;
+    pending.threadId = threadId || pending.threadId;
+    pending.status = "running";
+    pending.lastSignalAt = event.observedAt || nowIso();
+  }
+  const supersededInTurn = pending
+    ? supersedeOtherPendingRepliesForTurnInPlace(state, pending)
+    : 0;
+  saveStateForConfig(config, state);
+  appendLog(config.paths.activityFile, `RUNTIME_TURN_BOUND queue=${queueItemId} thread=${threadId || "-"} turn=${turnId}`);
+  if (supersededInTurn > 0) {
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_INPUT_SUPERSEDED turn=${turnId} count=${supersededInTurn}`);
+  }
+  return { ok: true, matched: true, queueItemId, turnId };
+}
+
+function findRuntimePendingRepliesForEvent(state, event) {
+  const turnId = String(event?.turnId || "").trim();
+  const threadId = String(event?.threadId || "").trim();
+  return (state.pendingReplies || [])
+    .filter((entry) => {
+      if (!isReplyAwaitingOutcome(entry)) {
+        return false;
+      }
+      if (turnId && String(entry.turnId || "").trim() === turnId) {
+        return true;
+      }
+      return !entry.turnId
+        && String(entry.inputTransport || "").trim() !== "tui_composer"
+        && threadId
+        && String(entry.threadId || "").trim() === threadId;
+    })
+    .sort((left, right) => {
+      const leftExact = turnId && String(left.turnId || "").trim() === turnId ? 0 : 1;
+      const rightExact = turnId && String(right.turnId || "").trim() === turnId ? 0 : 1;
+      if (leftExact !== rightExact) {
+        return leftExact - rightExact;
+      }
+      const leftBot = looksLikeBotSender(left) ? 1 : 0;
+      const rightBot = looksLikeBotSender(right) ? 1 : 0;
+      if (leftBot !== rightBot) {
+        return leftBot - rightBot;
+      }
+      return String(right.createdAt || "").localeCompare(String(left.createdAt || ""));
+    });
+}
+
+function selectRuntimePendingReplyForEvent(state, event) {
+  return findRuntimePendingRepliesForEvent(state, event)[0] || null;
+}
+
+function saveRuntimeStateWhileLocked(config, state) {
+  saveJsonWithBackup(
+    config.paths.stateFile,
+    scrubIdleBriefArtifactsInPlace(state),
+    stateBackupPath(config)
+  );
+}
+
+function claimRuntimeReplyForFinal(config, event) {
+  const claimId = randomUUID();
+  let result = { claimed: false, claimId: "", pending: null, state: null };
+  withStateFileLock(config, () => {
+    const state = loadState(config);
+    const candidates = findRuntimePendingRepliesForEvent(state, event);
+    const pending = candidates[0] || null;
+    if (!pending) {
+      return;
+    }
+
+    const claimedAt = nowIso();
+    pending.turnId = pending.turnId || String(event?.turnId || "").trim();
+    pending.status = "sending";
+    pending.lastSignalAt = event?.completedAt || claimedAt;
+    pending.replyDeliveryClaimId = claimId;
+    pending.replyDeliveryClaimedAt = claimedAt;
+
+    for (const entry of candidates.slice(1)) {
+      entry.status = "superseded";
+      entry.sentAt = claimedAt;
+      entry.lastSignalAt = claimedAt;
+      entry.responsePreview = "[same turn answered in another Telegram conversation]";
+      markMatchingQueueEntriesInPlace(state, entry, {
+        status: "delivered",
+        deliveredAt: claimedAt,
+        threadId: entry.threadId,
+        turnId: entry.turnId || pending.turnId,
+        responsePreview: entry.responsePreview
+      });
+    }
+
+    saveRuntimeStateWhileLocked(config, state);
+    result = { claimed: true, claimId, pending, state };
+  });
+  return result;
+}
+
+function finalizeRuntimeReplyClaim(config, claim, updates, queueUpdates = {}, options = {}) {
+  let finalized = false;
+  withStateFileLock(config, () => {
+    const state = loadState(config);
+    const pending = (state.pendingReplies || []).find((entry) => {
+      return pendingReplyKey(entry) === pendingReplyKey(claim.pending);
+    });
+    if (!pending || String(pending.replyDeliveryClaimId || "") !== claim.claimId) {
+      return;
+    }
+
+    Object.assign(pending, updates, {
+      replyDeliveryClaimId: null,
+      replyDeliveryClaimedAt: null
+    });
+    markMatchingQueueEntriesInPlace(state, pending, queueUpdates);
+    if (options.lastOutbound) {
+      state.lastOutbound = pickLatestRecord(state.lastOutbound || null, options.lastOutbound);
+    }
+    if (options.enqueueCatchup) {
+      enqueueCatchupTurnIfNeeded(config, state, pending);
+    }
+    saveRuntimeStateWhileLocked(config, state);
+    finalized = true;
+  });
+  return finalized;
+}
+
+export async function completeRuntimeTurnFromEvent(event) {
+  const config = loadConfig();
+  const state = loadState(config);
+  const turnId = String(event?.turnId || "").trim();
+  const threadId = String(event?.threadId || "").trim();
+  const status = String(event?.status || "completed").trim().toLowerCase();
+  const finalText = String(event?.finalText || "").trim();
+  const pending = selectRuntimePendingReplyForEvent(state, event);
+
+  if (!pending) {
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_EVENT_UNMATCHED thread=${threadId || "-"} turn=${turnId || "-"} status=${status}`);
+    return { ok: true, matched: false, turnId, status };
+  }
+
+  pending.turnId = pending.turnId || turnId;
+  pending.lastSignalAt = event.completedAt || nowIso();
+  if (status !== "completed") {
+    pending.sentAt = pending.lastSignalAt;
+    pending.status = status === "interrupted" ? "aborted" : "error";
+    pending.responsePreview = String(event?.error?.message || `[turn ${status}]`).slice(0, 400);
+    markMatchingQueueEntriesInPlace(state, pending, {
+      status: status === "interrupted" ? "cancelled" : "failed",
+      deliveredAt: pending.sentAt,
+      threadId: pending.threadId,
+      turnId: pending.turnId,
+      responsePreview: pending.responsePreview
+    });
+    saveStateForConfig(config, state);
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_${status.toUpperCase()} thread=${threadId || "-"} turn=${turnId || "-"}`);
+    return { ok: true, matched: true, delivered: false, turnId, status };
+  }
+
+  if (!finalText && event?.finalMissingConfirmed !== true) {
+    pending.status = "completed_waiting_final";
+    pending.responsePreview = "[turn completed; waiting for final answer event]";
+    saveStateForConfig(config, state);
+    appendLog(config.paths.activityFile, `RUNTIME_REPLY_WAITING_FINAL thread=${threadId || "-"} turn=${turnId || "-"}`);
+    return { ok: true, matched: true, delivered: false, awaitingFinal: true, turnId, status };
+  }
+
+  if (!finalText) {
+    pending.sentAt = pending.lastSignalAt;
+    pending.status = "no_reply_completed";
+    pending.responsePreview = "[turn completed without reply]";
+    markMatchingQueueEntriesInPlace(state, pending, {
+      status: "delivered",
+      deliveredAt: pending.sentAt,
+      threadId: pending.threadId,
+      turnId: pending.turnId,
+      responsePreview: pending.responsePreview
+    });
+    enqueueCatchupTurnIfNeeded(config, state, pending);
+    saveStateForConfig(config, state);
+    return { ok: true, matched: true, delivered: false, turnId, status };
+  }
+
+  const claim = claimRuntimeReplyForFinal(config, event);
+  if (!claim.claimed) {
+    appendLog(config.paths.activityFile, `RUNTIME_REPLY_ALREADY_CLAIMED thread=${threadId || "-"} turn=${turnId || "-"}`);
+    return { ok: true, matched: false, delivered: false, duplicate: true, turnId, status };
+  }
+  const deliveryPending = claim.pending;
+
+  if (deliveryPending.intent === "continue_nudge" && (looksLikeAckOnly(finalText) || looksLikeContextRequestOnly(finalText))) {
+    const sentAt = deliveryPending.lastSignalAt || nowIso();
+    finalizeRuntimeReplyClaim(config, claim, {
+      sentAt,
+      status: "suppressed_ack",
+      responsePreview: finalText.slice(0, 400)
+    }, {
+      status: "delivered",
+      deliveredAt: sentAt,
+      threadId: deliveryPending.threadId,
+      turnId: deliveryPending.turnId,
+      responsePreview: finalText.slice(0, 400)
+    });
+    return { ok: true, matched: true, delivered: false, suppressed: true, turnId, status };
+  }
+
+  if (isPrivateChatType(deliveryPending.chatType) && isPrivateReplySuppressed(config)) {
+    const sentAt = deliveryPending.lastSignalAt || nowIso();
+    finalizeRuntimeReplyClaim(config, claim, {
+      sentAt,
+      status: "suppressed_private_reply",
+      responsePreview: finalText.slice(0, 400)
+    }, {
+      status: "delivered",
+      deliveredAt: sentAt,
+      threadId: deliveryPending.threadId,
+      turnId: deliveryPending.turnId,
+      responsePreview: finalText.slice(0, 400)
+    });
+    return { ok: true, matched: true, delivered: false, suppressed: true, turnId, status };
+  }
+
+  let outbound;
+  try {
+    outbound = await sendOutboundChunks(config, claim.state, {
+      chatId: deliveryPending.chatId,
+      text: finalText,
+      replyToMessageId: deliveryPending.replyToMessageId,
+      telegramThreadId: deliveryPending.telegramThreadId,
+      source: "auto",
+      sourceTurnId: deliveryPending.turnId
+    });
+  } catch (error) {
+    const failedAt = nowIso();
+    finalizeRuntimeReplyClaim(config, claim, {
+      sentAt: null,
+      status: "delivery_retry",
+      lastSignalAt: failedAt,
+      replyRetryAfterAt: failedAt,
+      deliveryError: compactError(error),
+      responsePreview: `[Telegram delivery failed: ${compactError(error)}]`.slice(0, 400)
+    });
+    throw error;
+  }
+
+  const sentAt = nowIso();
+  finalizeRuntimeReplyClaim(config, claim, {
+    sentAt,
+    status: "sent",
+    responsePreview: finalText.slice(0, 400),
+    responseMessageIds: outbound.messageIds,
+    deliveryError: null
+  }, {
+    status: "replied",
+    deliveredAt: sentAt,
+    threadId: deliveryPending.threadId,
+    turnId: deliveryPending.turnId,
+    responsePreview: finalText.slice(0, 400)
+  }, {
+    lastOutbound: claim.state.lastOutbound,
+    enqueueCatchup: true
+  });
+  appendLog(config.paths.activityFile, `RUNTIME_REPLY_SENT thread=${threadId || "-"} turn=${turnId || "-"} outbound=${outbound.messageIds.join(",")}`);
+  return { ok: true, matched: true, delivered: true, turnId, status, messageIds: outbound.messageIds };
 }
 
 export function tailActivity(lines = 20) {
