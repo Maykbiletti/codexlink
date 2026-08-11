@@ -11,7 +11,7 @@ import {
 } from "../telegram-plugin/lib/bridge.js";
 import { setRuntimeComposerInjector, setRuntimeTurnStarter } from "../telegram-plugin/lib/codex.js";
 
-test("runtime queue keeps visible-composer delivery strict FIFO until completion and idle", async (t) => {
+test("new visible-composer input steers an active turn ahead of legacy backlog", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "codexlink-runtime-dispatch-"));
   const previous = new Map();
   const values = {
@@ -47,12 +47,12 @@ test("runtime queue keeps visible-composer delivery strict FIFO until completion
     rmSync(root, { recursive: true, force: true });
   });
 
-  enqueueRuntimeMessage("first", { messageId: "1", noTelegramReply: false });
-  enqueueRuntimeMessage("second", { messageId: "2", noTelegramReply: false });
+  enqueueRuntimeMessage("legacy backlog", { messageId: "1", noTelegramReply: false });
   const statePath = join(root, "state.json");
-  const reorderedByOldPriority = JSON.parse(readFileSync(statePath, "utf8"));
-  reorderedByOldPriority.queue[1].relevance = "escalation";
-  writeFileSync(statePath, `${JSON.stringify(reorderedByOldPriority, null, 2)}\n`, "utf8");
+  const legacyState = JSON.parse(readFileSync(statePath, "utf8"));
+  delete legacyState.queue[0].activeTurnSubmit;
+  writeFileSync(statePath, `${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+  enqueueRuntimeMessage("new steering input", { messageId: "2", noTelegramReply: false });
 
   let gate = {
     ready: false,
@@ -60,17 +60,11 @@ test("runtime queue keeps visible-composer delivery strict FIFO until completion
     threadStatus: "active",
     activeTurnId: "cli-turn"
   };
-  let gateCalls = 0;
-  const runtimeDispatchGate = async () => {
-    gateCalls += 1;
-    return gate;
-  };
   let claimCalls = 0;
+  const runtimeDispatchGate = async () => gate;
   const runtimeDispatchClaim = async ({ queueItemId }) => {
     claimCalls += 1;
-    if (!gate.ready) {
-      return gate;
-    }
+    if (!gate.ready) return gate;
     gate = {
       ready: false,
       reason: "turn_completion_pending",
@@ -98,67 +92,47 @@ test("runtime queue keeps visible-composer delivery strict FIFO until completion
     runtimeDispatchSettled
   };
 
-  const blockedByActiveTurn = await injectNext("thread-1", dispatchOptions);
-  assert.equal(blockedByActiveTurn.status, "deferred");
-  assert.equal(blockedByActiveTurn.reason, "runtime_active_turn");
-  assert.deepEqual(composerSubmissions, []);
-
-  gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
-  const blockedWithoutAtomicLock = await injectNext("thread-1", {
-    auto: true,
-    runtimeDispatchGate
-  });
-  assert.equal(blockedWithoutAtomicLock.status, "deferred");
-  assert.equal(blockedWithoutAtomicLock.reason, "runtime_composer_lock_unavailable");
-  assert.deepEqual(composerSubmissions, []);
-
-  const firstResult = await injectNext("thread-1", dispatchOptions);
-  assert.equal(firstResult.status, "submitted");
-  assert.equal(firstResult.message.messageId, "1");
-  const blockedUntilCompletion = await injectNext("thread-1", dispatchOptions);
-  assert.equal(blockedUntilCompletion.status, "deferred");
-  assert.equal(blockedUntilCompletion.reason, "runtime_turn_completion_pending");
-
+  const steered = await injectNext("thread-1", dispatchOptions);
+  assert.equal(steered.status, "submitted");
+  assert.equal(steered.message.messageId, "2");
+  assert.equal(steered.message.steeredActiveTurn, true);
+  assert.equal(steered.message.turnId, "cli-turn");
+  assert.equal(claimCalls, 0, "steering must not claim a new-turn composer lock");
   assert.deepEqual(composerSubmissions, [
-    { id: "runtime:1", threadId: "thread-1" }
+    { id: "runtime:2", threadId: "thread-1" }
   ]);
-  let state = JSON.parse(readFileSync(statePath, "utf8"));
-  assert.deepEqual(state.queue.map((item) => item.status), ["submitted", "queued"]);
-  assert.equal(state.queue[0].inputTransport, "tui_composer");
-  assert.equal(state.queue[1].inputTransport, undefined);
-  assert.equal(state.pendingReplies.length, 1);
-  assert.equal(state.pendingReplies[0].turnId, "");
 
-  const manualCompletion = await completeRuntimeTurnFromEvent({
-    threadId: "thread-1",
-    turnId: "manual-cli-turn",
-    status: "completed",
-    finalText: "This belongs to a manual CLI prompt."
-  });
-  assert.equal(manualCompletion.matched, false);
+  let state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.deepEqual(state.queue.map((item) => item.status), ["queued", "submitted"]);
+  assert.equal(state.pendingReplies.length, 1);
+  assert.equal(state.pendingReplies[0].turnId, "cli-turn");
 
   const bound = bindRuntimeTurnFromUserMessage({
-    queueItemId: "runtime:1",
+    queueItemId: "runtime:2",
     threadId: "thread-1",
-    turnId: "turn-telegram-1"
+    turnId: "cli-turn"
   });
   assert.equal(bound.matched, true);
-  state = JSON.parse(readFileSync(join(root, "state.json"), "utf8"));
-  assert.equal(state.queue[0].status, "running");
-  assert.equal(state.queue[0].turnId, "turn-telegram-1");
-  assert.equal(state.pendingReplies[0].turnId, "turn-telegram-1");
+  state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.queue[1].status, "running");
+
+  const unrelated = await completeRuntimeTurnFromEvent({
+    threadId: "thread-1",
+    turnId: "manual-other-turn",
+    status: "completed",
+    finalText: "Not the Telegram turn."
+  });
+  assert.equal(unrelated.matched, false);
 
   const completed = await completeRuntimeTurnFromEvent({
     threadId: "thread-1",
-    turnId: "turn-telegram-1",
+    turnId: "cli-turn",
     status: "completed",
     finalText: ""
   });
   assert.equal(completed.matched, true);
   assert.equal(completed.awaitingFinal, true);
-  state = JSON.parse(readFileSync(join(root, "state.json"), "utf8"));
-  assert.equal(state.pendingReplies[0].status, "completed_waiting_final");
-  assert.equal(state.pendingReplies[0].sentAt, null);
+
   gate = { ready: false, reason: "status_unknown", threadStatus: "unknown", activeTurnId: "" };
   const blockedUntilIdle = await injectNext("thread-1", dispatchOptions);
   assert.equal(blockedUntilIdle.status, "deferred");
@@ -166,13 +140,12 @@ test("runtime queue keeps visible-composer delivery strict FIFO until completion
   assert.equal(composerSubmissions.length, 1);
 
   gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
-  const secondResult = await injectNext("thread-1", dispatchOptions);
-  assert.equal(secondResult.status, "submitted");
-  assert.equal(secondResult.message.messageId, "2");
+  const backlogResult = await injectNext("thread-1", dispatchOptions);
+  assert.equal(backlogResult.status, "submitted");
+  assert.equal(backlogResult.message.messageId, "1");
+  assert.equal(claimCalls, 1);
   assert.deepEqual(composerSubmissions, [
-    { id: "runtime:1", threadId: "thread-1" },
-    { id: "runtime:2", threadId: "thread-1" }
+    { id: "runtime:2", threadId: "thread-1" },
+    { id: "runtime:1", threadId: "thread-1" }
   ]);
-  assert.equal(gateCalls, 6);
-  assert.equal(claimCalls, 2);
 });

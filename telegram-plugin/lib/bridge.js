@@ -1315,6 +1315,46 @@ function supersedeOlderPendingRepliesInPlace(pendingReplies) {
   return superseded;
 }
 
+function supersedeOtherPendingRepliesForTurnInPlace(state, keepEntry) {
+  const turnId = String(keepEntry?.turnId || "").trim();
+  const keepQueueItemId = String(keepEntry?.queueItemId || "").trim();
+  if (!turnId || !keepQueueItemId) {
+    return 0;
+  }
+
+  const keepCreatedAt = Date.parse(String(keepEntry?.createdAt || ""));
+  let superseded = 0;
+  for (const entry of state.pendingReplies || []) {
+    if (!entry || entry === keepEntry || !isReplyAwaitingOutcome(entry)) {
+      continue;
+    }
+    if (String(entry.turnId || "").trim() !== turnId) {
+      continue;
+    }
+    if (String(entry.queueItemId || "").trim() === keepQueueItemId) {
+      continue;
+    }
+    const entryCreatedAt = Date.parse(String(entry.createdAt || ""));
+    if (Number.isFinite(keepCreatedAt) && Number.isFinite(entryCreatedAt) && entryCreatedAt > keepCreatedAt) {
+      continue;
+    }
+    const supersededAt = nowIso();
+    entry.status = "superseded";
+    entry.sentAt = supersededAt;
+    entry.lastSignalAt = supersededAt;
+    entry.responsePreview = "[superseded by newer input in the same turn]";
+    markMatchingQueueEntriesInPlace(state, entry, {
+      status: "delivered",
+      deliveredAt: supersededAt,
+      threadId: entry.threadId,
+      turnId,
+      responsePreview: entry.responsePreview
+    });
+    superseded += 1;
+  }
+  return superseded;
+}
+
 function isPrivateIdleBriefArtifact(entry) {
   if (!entry) {
     return false;
@@ -2065,6 +2105,7 @@ function normalizeInbound(message, updateType = "message") {
     relevance: "ambient",
     updateType,
     status: "queued",
+    activeTurnSubmit: true,
     attempts: 0,
     lastAttemptAt: null
   };
@@ -3589,6 +3630,7 @@ export async function consumeTeamRelayOnce() {
       ignored += 1;
       continue;
     }
+    inbound.activeTurnSubmit = true;
     if (!isAllowedChat(config, inbound)) {
       ignored += 1;
       appendLog(config.paths.activityFile, `TEAM_RELAY_IGNORED_CHAT id=${eventId} chat=${inbound.chatId} user=${inbound.userId || "-"}`);
@@ -3700,9 +3742,13 @@ function selectNextQueuedEntry(queue, options = {}) {
   const auto = Boolean(options.auto);
   const deferredMode = String(options.dispatchMode || "deferred").toLowerCase() !== "legacy";
   const submitAllQueued = Boolean(options.submitAllQueued);
-  const queued = Array.isArray(queue)
+  const activeTurnOnly = Boolean(options.activeTurnOnly);
+  let queued = Array.isArray(queue)
     ? queue.filter((item) => item?.status === "queued" && isQueueRetryReady(item))
     : [];
+  if (activeTurnOnly) {
+    queued = queued.filter((item) => item.activeTurnSubmit === true);
+  }
   if (!auto || !deferredMode) {
     return queued.sort(compareQueuedDispatchOrder)[0] || null;
   }
@@ -3974,6 +4020,19 @@ export async function injectNext(threadId, options = {}) {
   const useRuntimeTurnQueue = auto && useAppServer && !useTuiComposerQueue;
   const useStrictRuntimeQueue = useTuiComposerQueue || useRuntimeTurnQueue;
   const useManagedRuntimeInput = useStrictRuntimeQueue;
+  const runtimeDispatchGate = typeof options.runtimeDispatchGate === "function"
+    ? options.runtimeDispatchGate
+    : null;
+  const earlyDispatchThreadId = String(threadId || config.currentThreadId || state.currentThreadId || "").trim();
+  const earlyDispatchState = useStrictRuntimeQueue && runtimeDispatchGate && earlyDispatchThreadId
+    ? await resolveRuntimeDispatchState(config, earlyDispatchThreadId, runtimeDispatchGate)
+    : null;
+  const activeTurnInputOnly = Boolean(
+    useTuiComposerQueue
+    && earlyDispatchState
+    && earlyDispatchState.ready !== true
+    && earlyDispatchState.reason === "active_turn"
+  );
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
     return {
@@ -3987,7 +4046,8 @@ export async function injectNext(threadId, options = {}) {
   let next = selectNextQueuedEntry(state.queue || [], {
     auto,
     dispatchMode: config.dispatchMode,
-    submitAllQueued: shouldSubmitEveryAllowedMessage(config)
+    submitAllQueued: shouldSubmitEveryAllowedMessage(config),
+    activeTurnOnly: activeTurnInputOnly
   });
 
   if (!next) {
@@ -4073,9 +4133,6 @@ export async function injectNext(threadId, options = {}) {
     || (useAppServer ? state.currentThreadId : config.currentThreadId)
     || ""
   ).trim();
-  const runtimeDispatchGate = typeof options.runtimeDispatchGate === "function"
-    ? options.runtimeDispatchGate
-    : null;
   const runtimeDispatchClaim = typeof options.runtimeDispatchClaim === "function"
     ? options.runtimeDispatchClaim
     : null;
@@ -4139,10 +4196,19 @@ export async function injectNext(threadId, options = {}) {
       }
     }
   }
+  let steeringActiveTurn = false;
   if (useStrictRuntimeQueue) {
     appendLog(config.paths.activityFile, `RUNTIME_FIFO_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
-    const dispatchState = await resolveRuntimeDispatchState(config, resolvedThreadId, runtimeDispatchGate);
-    if (!dispatchState.ready) {
+    const dispatchState = earlyDispatchState && resolvedThreadId === earlyDispatchThreadId
+      ? earlyDispatchState
+      : await resolveRuntimeDispatchState(config, resolvedThreadId, runtimeDispatchGate);
+    steeringActiveTurn = Boolean(
+      useTuiComposerQueue
+      && dispatchState.ready !== true
+      && dispatchState.reason === "active_turn"
+      && next.activeTurnSubmit === true
+    );
+    if (!dispatchState.ready && !steeringActiveTurn) {
       const checkedAt = nowIso();
       next.status = "queued";
       next.lastAttemptAt = checkedAt;
@@ -4167,6 +4233,14 @@ export async function injectNext(threadId, options = {}) {
         retryAfterAt: null,
         message: next
       };
+    }
+    if (steeringActiveTurn) {
+      next.activeTurnId = String(dispatchState.activeTurnId || "").trim() || null;
+      next.steeredActiveTurn = true;
+      appendLog(
+        config.paths.activityFile,
+        `RUNTIME_TURN_STEER message=${next.messageId} thread=${resolvedThreadId} active_turn=${next.activeTurnId || "-"}`
+      );
     }
   }
   const selectedQueueKey = queueKey(next);
@@ -4195,7 +4269,7 @@ export async function injectNext(threadId, options = {}) {
   }
 
   let composerDispatchClaimed = false;
-  if (useTuiComposerQueue) {
+  if (useTuiComposerQueue && !steeringActiveTurn) {
     let claimState = {
       ready: false,
       reason: "composer_lock_unavailable",
@@ -4310,6 +4384,10 @@ export async function injectNext(threadId, options = {}) {
     await settleComposerDispatch({ ok: false, busy: false, error });
     throw error;
   }
+  if (steeringActiveTurn && result.ok) {
+    result.responseText = String(result.responseText || "").replace(/^composer_submitted\b/, "composer_steered");
+    result.activeTurnId = next.activeTurnId || "";
+  }
   const injectErrorText = `${result.responseText || ""}\n${result.stderr || ""}`;
   if (useAppServer && !useTuiComposerQueue && !result.ok && /thread\s+not\s+found/i.test(injectErrorText)) {
     appendLog(config.paths.activityFile, `INJECT_THREAD_NOT_FOUND_RETRY old_thread=${resolvedThreadId} message=${next.messageId}`);
@@ -4371,7 +4449,10 @@ export async function injectNext(threadId, options = {}) {
   next.retryAfterAt = null;
   next.leaseUntil = null;
   next.threadId = resolvedThreadId;
-  next.turnId = String(result.turnId || "").trim() || null;
+  const steeredTurnId = steeringActiveTurn && String(next.activeTurnId || "").trim() !== "active"
+    ? String(next.activeTurnId || "").trim()
+    : "";
+  next.turnId = String(result.turnId || steeredTurnId).trim() || null;
   next.inputTransport = result.queuedInComposer ? "tui_composer" : "app_server";
   next.responsePreview = result.responseText.slice(0, 400);
   next.stderr = result.stderr.slice(0, 400);
@@ -4413,6 +4494,13 @@ export async function injectNext(threadId, options = {}) {
         pendingReply.trustedTeamBotReply = true;
       }
       state.pendingReplies = mergePendingReplyLists(state.pendingReplies || [], [pendingReply]);
+      const storedPendingReply = (state.pendingReplies || []).find((entry) => {
+        return String(entry?.queueItemId || "").trim() === String(pendingReply.queueItemId || "").trim();
+      }) || pendingReply;
+      const supersededInTurn = supersedeOtherPendingRepliesForTurnInPlace(state, storedPendingReply);
+      if (supersededInTurn > 0) {
+        appendLog(config.paths.activityFile, `RUNTIME_TURN_INPUT_SUPERSEDED turn=${storedPendingReply.turnId || "-"} count=${supersededInTurn}`);
+      }
       const noTurnSuffix = next.turnId ? "" : " no_turn=1";
       appendLog(config.paths.activityFile, `REPLY_PENDING thread=${resolvedThreadId} turn=${next.turnId || "-"} message=${next.messageId} chat=${next.chatId}${noTurnSuffix}`);
     }
@@ -4806,6 +4894,7 @@ export function enqueueRuntimeMessage(text, options = {}) {
     relevance: "direct",
     updateType: "runtime",
     status: "queued",
+    activeTurnSubmit: true,
     attempts: 0,
     lastAttemptAt: null,
     noTelegramReply: options.noTelegramReply !== false
@@ -4884,8 +4973,14 @@ export function bindRuntimeTurnFromUserMessage(event) {
     pending.status = "running";
     pending.lastSignalAt = event.observedAt || nowIso();
   }
+  const supersededInTurn = pending
+    ? supersedeOtherPendingRepliesForTurnInPlace(state, pending)
+    : 0;
   saveStateForConfig(config, state);
   appendLog(config.paths.activityFile, `RUNTIME_TURN_BOUND queue=${queueItemId} thread=${threadId || "-"} turn=${turnId}`);
+  if (supersededInTurn > 0) {
+    appendLog(config.paths.activityFile, `RUNTIME_TURN_INPUT_SUPERSEDED turn=${turnId} count=${supersededInTurn}`);
+  }
   return { ok: true, matched: true, queueItemId, turnId };
 }
 
