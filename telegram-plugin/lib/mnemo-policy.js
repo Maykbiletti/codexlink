@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
+import { repairMojibake } from "./text-encoding.js";
 
 function nowIso() {
   return new Date().toISOString();
@@ -36,6 +37,18 @@ function compactText(value, max = 120) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, max);
+}
+
+function normalizeMnemoMessage(message) {
+  if (!message || typeof message !== "object") return message;
+  return {
+    ...message,
+    text: repairMojibake(message.text),
+    user: repairMojibake(message.user),
+    actor: repairMojibake(message.actor),
+    sourceAgent: repairMojibake(message.sourceAgent),
+    groupTitle: repairMojibake(message.groupTitle)
+  };
 }
 
 const DEFAULT_CONTEXT_RECALL_LIMIT = 30;
@@ -326,7 +339,7 @@ export async function logMnemoOutboundReceipt(config, outbound, contextEntry = n
 
   const chatId = String(outbound?.chatId || "").trim();
   const messageId = String(outbound?.messageId || "").trim();
-  const text = String(outbound?.text || "").trim();
+  const text = repairMojibake(outbound?.text).trim();
   if (!chatId || !messageId || !text) {
     return { ok: false, enabled: true, reason: "incomplete_outbound" };
   }
@@ -489,6 +502,8 @@ function buildTurnBeginArgs(config, message, entry, project, threadId) {
     message_ref: ref,
     ref_kind: "telegram_message",
     ref_id: ref,
+    source_ref: `tg:${ref}`,
+    dedupe_key: `telegram:${ref}`,
     source: "codexlink",
     direction: "inbound",
     actor: message.user || "unknown",
@@ -504,9 +519,9 @@ function buildTurnBeginArgs(config, message, entry, project, threadId) {
     recall_limit: 8,
     brief_limit: 20,
     board_limit: 12,
-    promote_memory: true,
+    promote_memory: false,
     promote_transcript: true,
-    remember: true,
+    remember: false,
     telegram: true,
     meta: {
       group_title: message.groupTitle || "",
@@ -594,10 +609,13 @@ async function captureMessage(config, message, entry, project) {
     project,
     ref_kind: "telegram_message",
     ref_id: `${message.chatId || ""}:${message.messageId || ""}`,
+    source_ref: `tg:${message.chatId || ""}:${message.messageId || ""}`,
+    dedupe_key: `telegram:${message.chatId || ""}:${message.messageId || ""}`,
     thread_id: message.conversationKey || "",
     channel,
-    remember: true,
-    promote_memory: true,
+    remember: false,
+    promote_memory: false,
+    promote_transcript: true,
     meta: {
       agent_name: config.agentName || "agent",
       chat_id: message.chatId || "",
@@ -684,6 +702,8 @@ export async function captureTelegramLive(config, message, options = {}) {
   if (!message) {
     return { ok: false, error: "message required" };
   }
+
+  message = normalizeMnemoMessage(message);
 
   const stamp = String(message.ts || message.occurredAt || nowIso()).trim();
   const chatId = String(message.chatId || "").trim();
@@ -801,10 +821,13 @@ async function runFullSync(config, message, entry, project) {
       project,
       ref_kind: "telegram_message",
       ref_id: `${message.chatId || ""}:${message.messageId || ""}`,
+      source_ref: `tg:${message.chatId || ""}:${message.messageId || ""}`,
+      dedupe_key: `telegram:${message.chatId || ""}:${message.messageId || ""}`,
       thread_id: message.conversationKey || "",
       channel,
-      remember: true,
-      promote_memory: true,
+      remember: false,
+      promote_memory: false,
+      promote_transcript: true,
       meta: {
         agent_name: config.agentName || "agent",
         chat_id: message.chatId || "",
@@ -927,6 +950,7 @@ function buildContextBlock(sync) {
 
 export async function runMnemoRuntimeSync(config, message, threadId) {
   if (!config.mnemoSyncEnabled) return { enabled: false, promptBlock: "" };
+  message = normalizeMnemoMessage(message);
   const state = readJson(config.paths.mnemoSyncStateFile, { conversations: {} });
   state.conversations = state.conversations || {};
   const key = syncKey(config, message, threadId);

@@ -116,6 +116,34 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
   state = JSON.parse(readFileSync(statePath, "utf8"));
   assert.equal(state.queue[1].status, "running");
 
+  enqueueRuntimeMessage("follow-up while completion is pending", { messageId: "3", noTelegramReply: false });
+  gate = {
+    ready: false,
+    reason: "turn_completion_pending",
+    threadStatus: "active",
+    activeTurnId: "cli-turn"
+  };
+  const steeredPending = await injectNext("thread-1", dispatchOptions);
+  assert.equal(steeredPending.status, "submitted");
+  assert.equal(steeredPending.message.messageId, "3");
+  assert.equal(steeredPending.message.steeredActiveTurn, true);
+  assert.equal(steeredPending.message.turnId, null);
+  assert.equal(claimCalls, 0, "follow-up steering must not claim a new-turn composer lock");
+  state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.deepEqual(state.queue.map((item) => item.status), ["queued", "running", "submitted"]);
+  assert.equal(state.pendingReplies.find((item) => item.queueItemId === "runtime:2")?.status, "running");
+  assert.equal(state.pendingReplies.find((item) => item.queueItemId === "runtime:3")?.turnId, "");
+
+  const followUpBound = bindRuntimeTurnFromUserMessage({
+    queueItemId: "runtime:3",
+    threadId: "thread-1",
+    turnId: "next-turn"
+  });
+  assert.equal(followUpBound.matched, true);
+  state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.queue[2].status, "running");
+  assert.equal(state.pendingReplies.find((item) => item.queueItemId === "runtime:3")?.turnId, "next-turn");
+
   const unrelated = await completeRuntimeTurnFromEvent({
     threadId: "thread-1",
     turnId: "manual-other-turn",
@@ -137,7 +165,7 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
   const blockedUntilIdle = await injectNext("thread-1", dispatchOptions);
   assert.equal(blockedUntilIdle.status, "deferred");
   assert.equal(blockedUntilIdle.reason, "runtime_status_unknown");
-  assert.equal(composerSubmissions.length, 1);
+  assert.equal(composerSubmissions.length, 2);
 
   gate = { ready: true, reason: "ready", threadStatus: "idle", activeTurnId: "" };
   const backlogResult = await injectNext("thread-1", dispatchOptions);
@@ -146,6 +174,7 @@ test("new visible-composer input steers an active turn ahead of legacy backlog",
   assert.equal(claimCalls, 1);
   assert.deepEqual(composerSubmissions, [
     { id: "runtime:2", threadId: "thread-1" },
+    { id: "runtime:3", threadId: "thread-1" },
     { id: "runtime:1", threadId: "thread-1" }
   ]);
 });

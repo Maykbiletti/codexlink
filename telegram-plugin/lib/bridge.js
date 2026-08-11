@@ -1246,7 +1246,7 @@ function isReplyAwaitingOutcome(entry) {
     return false;
   }
   const status = String(entry.status || "").trim().toLowerCase();
-  if (["sent", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "timeout", "stale_thread", "aborted", "no_reply_completed", "orphaned"].includes(status)) {
+  if (["sent", "sending", "suppressed_ack", "suppressed_private_reply", "error", "ignored_bot", "superseded", "timeout", "stale_thread", "aborted", "no_reply_completed", "orphaned"].includes(status)) {
     return false;
   }
   if (entry.sentAt && !hasResponseMessageIds(entry)) {
@@ -1320,6 +1320,31 @@ function supersedeOtherPendingRepliesForTurnInPlace(state, keepEntry) {
   const keepQueueItemId = String(keepEntry?.queueItemId || "").trim();
   if (!turnId || !keepQueueItemId) {
     return 0;
+  }
+
+  if (looksLikeBotSender(keepEntry)) {
+    const humanOwner = (state.pendingReplies || []).find((entry) => {
+      return entry
+        && entry !== keepEntry
+        && isReplyAwaitingOutcome(entry)
+        && String(entry.turnId || "").trim() === turnId
+        && !looksLikeBotSender(entry);
+    });
+    if (humanOwner) {
+      const supersededAt = nowIso();
+      keepEntry.status = "superseded";
+      keepEntry.sentAt = supersededAt;
+      keepEntry.lastSignalAt = supersededAt;
+      keepEntry.responsePreview = "[bot input attached without taking reply ownership]";
+      markMatchingQueueEntriesInPlace(state, keepEntry, {
+        status: "delivered",
+        deliveredAt: supersededAt,
+        threadId: keepEntry.threadId,
+        turnId,
+        responsePreview: keepEntry.responsePreview
+      });
+      return 1;
+    }
   }
 
   const keepCreatedAt = Date.parse(String(keepEntry?.createdAt || ""));
@@ -1442,6 +1467,8 @@ function reconcileTimedOutPendingRepliesInPlace(config, pendingReplies, state = 
     }
     entry.status = "timeout_retry";
     entry.sentAt = null;
+    entry.replyDeliveryClaimId = null;
+    entry.replyDeliveryClaimedAt = null;
     entry.timeoutAt = timeoutAt;
     entry.replyRetryAttempts = attempts + 1;
     entry.replyRetryAfterAt = new Date(Date.now() + retryDelayMs).toISOString();
@@ -3733,6 +3760,19 @@ async function resolveRuntimeDispatchState(config, threadId, runtimeDispatchGate
   }
 }
 
+function isSteerableRuntimeTurnState(dispatchState) {
+  if (!dispatchState || dispatchState.ready === true) {
+    return false;
+  }
+  const reason = String(dispatchState.reason || "").trim().toLowerCase();
+  const threadStatus = String(dispatchState.threadStatus || "").trim().toLowerCase();
+  const activeTurnId = String(dispatchState.activeTurnId || "").trim();
+  return ["active_turn", "turn_completion_pending"].includes(reason)
+    && threadStatus === "active"
+    && Boolean(activeTurnId)
+    && activeTurnId !== "pending-turn-id";
+}
+
 function isQueueRetryReady(item) {
   const retryAt = Date.parse(String(item?.retryAfterAt || ""));
   return !Number.isFinite(retryAt) || retryAt <= Date.now();
@@ -4030,8 +4070,7 @@ export async function injectNext(threadId, options = {}) {
   const activeTurnInputOnly = Boolean(
     useTuiComposerQueue
     && earlyDispatchState
-    && earlyDispatchState.ready !== true
-    && earlyDispatchState.reason === "active_turn"
+    && isSteerableRuntimeTurnState(earlyDispatchState)
   );
   if (auto && useAppServer && runtimeOwner && !runtimeOwner.frontendAlive) {
     appendLog(config.paths.activityFile, `OWNER_OFFLINE frontend_pid=${runtimeOwner.frontendHostPid || 0}`);
@@ -4197,6 +4236,7 @@ export async function injectNext(threadId, options = {}) {
     }
   }
   let steeringActiveTurn = false;
+  let steeringDispatchReason = "";
   if (useStrictRuntimeQueue) {
     appendLog(config.paths.activityFile, `RUNTIME_FIFO_QUEUE chat=${next.chatId} message=${next.messageId} intent=${next.intent || "-"} relevance=${next.relevance || "-"}`);
     const dispatchState = earlyDispatchState && resolvedThreadId === earlyDispatchThreadId
@@ -4204,10 +4244,12 @@ export async function injectNext(threadId, options = {}) {
       : await resolveRuntimeDispatchState(config, resolvedThreadId, runtimeDispatchGate);
     steeringActiveTurn = Boolean(
       useTuiComposerQueue
-      && dispatchState.ready !== true
-      && dispatchState.reason === "active_turn"
+      && isSteerableRuntimeTurnState(dispatchState)
       && next.activeTurnSubmit === true
     );
+    steeringDispatchReason = steeringActiveTurn
+      ? String(dispatchState.reason || "").trim().toLowerCase()
+      : "";
     if (!dispatchState.ready && !steeringActiveTurn) {
       const checkedAt = nowIso();
       next.status = "queued";
@@ -4239,7 +4281,7 @@ export async function injectNext(threadId, options = {}) {
       next.steeredActiveTurn = true;
       appendLog(
         config.paths.activityFile,
-        `RUNTIME_TURN_STEER message=${next.messageId} thread=${resolvedThreadId} active_turn=${next.activeTurnId || "-"}`
+        `RUNTIME_TURN_STEER message=${next.messageId} thread=${resolvedThreadId} active_turn=${next.activeTurnId || "-"} reason=${steeringDispatchReason || "-"}`
       );
     }
   }
@@ -4449,7 +4491,9 @@ export async function injectNext(threadId, options = {}) {
   next.retryAfterAt = null;
   next.leaseUntil = null;
   next.threadId = resolvedThreadId;
-  const steeredTurnId = steeringActiveTurn && String(next.activeTurnId || "").trim() !== "active"
+  const steeredTurnId = steeringActiveTurn
+    && steeringDispatchReason === "active_turn"
+    && String(next.activeTurnId || "").trim() !== "active"
     ? String(next.activeTurnId || "").trim()
     : "";
   next.turnId = String(result.turnId || steeredTurnId).trim() || null;
@@ -4984,6 +5028,115 @@ export function bindRuntimeTurnFromUserMessage(event) {
   return { ok: true, matched: true, queueItemId, turnId };
 }
 
+function findRuntimePendingRepliesForEvent(state, event) {
+  const turnId = String(event?.turnId || "").trim();
+  const threadId = String(event?.threadId || "").trim();
+  return (state.pendingReplies || [])
+    .filter((entry) => {
+      if (!isReplyAwaitingOutcome(entry)) {
+        return false;
+      }
+      if (turnId && String(entry.turnId || "").trim() === turnId) {
+        return true;
+      }
+      return !entry.turnId
+        && String(entry.inputTransport || "").trim() !== "tui_composer"
+        && threadId
+        && String(entry.threadId || "").trim() === threadId;
+    })
+    .sort((left, right) => {
+      const leftExact = turnId && String(left.turnId || "").trim() === turnId ? 0 : 1;
+      const rightExact = turnId && String(right.turnId || "").trim() === turnId ? 0 : 1;
+      if (leftExact !== rightExact) {
+        return leftExact - rightExact;
+      }
+      const leftBot = looksLikeBotSender(left) ? 1 : 0;
+      const rightBot = looksLikeBotSender(right) ? 1 : 0;
+      if (leftBot !== rightBot) {
+        return leftBot - rightBot;
+      }
+      return String(right.createdAt || "").localeCompare(String(left.createdAt || ""));
+    });
+}
+
+function selectRuntimePendingReplyForEvent(state, event) {
+  return findRuntimePendingRepliesForEvent(state, event)[0] || null;
+}
+
+function saveRuntimeStateWhileLocked(config, state) {
+  saveJsonWithBackup(
+    config.paths.stateFile,
+    scrubIdleBriefArtifactsInPlace(state),
+    stateBackupPath(config)
+  );
+}
+
+function claimRuntimeReplyForFinal(config, event) {
+  const claimId = randomUUID();
+  let result = { claimed: false, claimId: "", pending: null, state: null };
+  withStateFileLock(config, () => {
+    const state = loadState(config);
+    const candidates = findRuntimePendingRepliesForEvent(state, event);
+    const pending = candidates[0] || null;
+    if (!pending) {
+      return;
+    }
+
+    const claimedAt = nowIso();
+    pending.turnId = pending.turnId || String(event?.turnId || "").trim();
+    pending.status = "sending";
+    pending.lastSignalAt = event?.completedAt || claimedAt;
+    pending.replyDeliveryClaimId = claimId;
+    pending.replyDeliveryClaimedAt = claimedAt;
+
+    for (const entry of candidates.slice(1)) {
+      entry.status = "superseded";
+      entry.sentAt = claimedAt;
+      entry.lastSignalAt = claimedAt;
+      entry.responsePreview = "[same turn answered in another Telegram conversation]";
+      markMatchingQueueEntriesInPlace(state, entry, {
+        status: "delivered",
+        deliveredAt: claimedAt,
+        threadId: entry.threadId,
+        turnId: entry.turnId || pending.turnId,
+        responsePreview: entry.responsePreview
+      });
+    }
+
+    saveRuntimeStateWhileLocked(config, state);
+    result = { claimed: true, claimId, pending, state };
+  });
+  return result;
+}
+
+function finalizeRuntimeReplyClaim(config, claim, updates, queueUpdates = {}, options = {}) {
+  let finalized = false;
+  withStateFileLock(config, () => {
+    const state = loadState(config);
+    const pending = (state.pendingReplies || []).find((entry) => {
+      return pendingReplyKey(entry) === pendingReplyKey(claim.pending);
+    });
+    if (!pending || String(pending.replyDeliveryClaimId || "") !== claim.claimId) {
+      return;
+    }
+
+    Object.assign(pending, updates, {
+      replyDeliveryClaimId: null,
+      replyDeliveryClaimedAt: null
+    });
+    markMatchingQueueEntriesInPlace(state, pending, queueUpdates);
+    if (options.lastOutbound) {
+      state.lastOutbound = pickLatestRecord(state.lastOutbound || null, options.lastOutbound);
+    }
+    if (options.enqueueCatchup) {
+      enqueueCatchupTurnIfNeeded(config, state, pending);
+    }
+    saveRuntimeStateWhileLocked(config, state);
+    finalized = true;
+  });
+  return finalized;
+}
+
 export async function completeRuntimeTurnFromEvent(event) {
   const config = loadConfig();
   const state = loadState(config);
@@ -4991,18 +5144,7 @@ export async function completeRuntimeTurnFromEvent(event) {
   const threadId = String(event?.threadId || "").trim();
   const status = String(event?.status || "completed").trim().toLowerCase();
   const finalText = String(event?.finalText || "").trim();
-  const pending = (state.pendingReplies || []).find((entry) => {
-    if (!isReplyAwaitingOutcome(entry)) {
-      return false;
-    }
-    if (turnId && String(entry.turnId || "").trim() === turnId) {
-      return true;
-    }
-    return !entry.turnId
-      && String(entry.inputTransport || "").trim() !== "tui_composer"
-      && threadId
-      && String(entry.threadId || "").trim() === threadId;
-  });
+  const pending = selectRuntimePendingReplyForEvent(state, event);
 
   if (!pending) {
     appendLog(config.paths.activityFile, `RUNTIME_TURN_EVENT_UNMATCHED thread=${threadId || "-"} turn=${turnId || "-"} status=${status}`);
@@ -5051,57 +5193,85 @@ export async function completeRuntimeTurnFromEvent(event) {
     return { ok: true, matched: true, delivered: false, turnId, status };
   }
 
-  if (pending.intent === "continue_nudge" && (looksLikeAckOnly(finalText) || looksLikeContextRequestOnly(finalText))) {
-    pending.sentAt = pending.lastSignalAt;
-    pending.status = "suppressed_ack";
-    pending.responsePreview = finalText.slice(0, 400);
-    markMatchingQueueEntriesInPlace(state, pending, {
+  const claim = claimRuntimeReplyForFinal(config, event);
+  if (!claim.claimed) {
+    appendLog(config.paths.activityFile, `RUNTIME_REPLY_ALREADY_CLAIMED thread=${threadId || "-"} turn=${turnId || "-"}`);
+    return { ok: true, matched: false, delivered: false, duplicate: true, turnId, status };
+  }
+  const deliveryPending = claim.pending;
+
+  if (deliveryPending.intent === "continue_nudge" && (looksLikeAckOnly(finalText) || looksLikeContextRequestOnly(finalText))) {
+    const sentAt = deliveryPending.lastSignalAt || nowIso();
+    finalizeRuntimeReplyClaim(config, claim, {
+      sentAt,
+      status: "suppressed_ack",
+      responsePreview: finalText.slice(0, 400)
+    }, {
       status: "delivered",
-      deliveredAt: pending.sentAt,
-      threadId: pending.threadId,
-      turnId: pending.turnId,
-      responsePreview: pending.responsePreview
+      deliveredAt: sentAt,
+      threadId: deliveryPending.threadId,
+      turnId: deliveryPending.turnId,
+      responsePreview: finalText.slice(0, 400)
     });
-    saveStateForConfig(config, state);
     return { ok: true, matched: true, delivered: false, suppressed: true, turnId, status };
   }
 
-  if (isPrivateChatType(pending.chatType) && isPrivateReplySuppressed(config)) {
-    pending.sentAt = pending.lastSignalAt;
-    pending.status = "suppressed_private_reply";
-    pending.responsePreview = finalText.slice(0, 400);
-    markMatchingQueueEntriesInPlace(state, pending, {
+  if (isPrivateChatType(deliveryPending.chatType) && isPrivateReplySuppressed(config)) {
+    const sentAt = deliveryPending.lastSignalAt || nowIso();
+    finalizeRuntimeReplyClaim(config, claim, {
+      sentAt,
+      status: "suppressed_private_reply",
+      responsePreview: finalText.slice(0, 400)
+    }, {
       status: "delivered",
-      deliveredAt: pending.sentAt,
-      threadId: pending.threadId,
-      turnId: pending.turnId,
-      responsePreview: pending.responsePreview
+      deliveredAt: sentAt,
+      threadId: deliveryPending.threadId,
+      turnId: deliveryPending.turnId,
+      responsePreview: finalText.slice(0, 400)
     });
-    saveStateForConfig(config, state);
     return { ok: true, matched: true, delivered: false, suppressed: true, turnId, status };
   }
 
-  const outbound = await sendOutboundChunks(config, state, {
-    chatId: pending.chatId,
-    text: finalText,
-    replyToMessageId: pending.replyToMessageId,
-    telegramThreadId: pending.telegramThreadId,
-    source: "auto",
-    sourceTurnId: pending.turnId
-  });
-  pending.sentAt = nowIso();
-  pending.status = "sent";
-  pending.responsePreview = finalText.slice(0, 400);
-  pending.responseMessageIds = outbound.messageIds;
-  markMatchingQueueEntriesInPlace(state, pending, {
+  let outbound;
+  try {
+    outbound = await sendOutboundChunks(config, claim.state, {
+      chatId: deliveryPending.chatId,
+      text: finalText,
+      replyToMessageId: deliveryPending.replyToMessageId,
+      telegramThreadId: deliveryPending.telegramThreadId,
+      source: "auto",
+      sourceTurnId: deliveryPending.turnId
+    });
+  } catch (error) {
+    const failedAt = nowIso();
+    finalizeRuntimeReplyClaim(config, claim, {
+      sentAt: null,
+      status: "delivery_retry",
+      lastSignalAt: failedAt,
+      replyRetryAfterAt: failedAt,
+      deliveryError: compactError(error),
+      responsePreview: `[Telegram delivery failed: ${compactError(error)}]`.slice(0, 400)
+    });
+    throw error;
+  }
+
+  const sentAt = nowIso();
+  finalizeRuntimeReplyClaim(config, claim, {
+    sentAt,
+    status: "sent",
+    responsePreview: finalText.slice(0, 400),
+    responseMessageIds: outbound.messageIds,
+    deliveryError: null
+  }, {
     status: "replied",
-    deliveredAt: pending.sentAt,
-    threadId: pending.threadId,
-    turnId: pending.turnId,
-    responsePreview: pending.responsePreview
+    deliveredAt: sentAt,
+    threadId: deliveryPending.threadId,
+    turnId: deliveryPending.turnId,
+    responsePreview: finalText.slice(0, 400)
+  }, {
+    lastOutbound: claim.state.lastOutbound,
+    enqueueCatchup: true
   });
-  enqueueCatchupTurnIfNeeded(config, state, pending);
-  saveStateForConfig(config, state);
   appendLog(config.paths.activityFile, `RUNTIME_REPLY_SENT thread=${threadId || "-"} turn=${turnId || "-"} outbound=${outbound.messageIds.join(",")}`);
   return { ok: true, matched: true, delivered: true, turnId, status, messageIds: outbound.messageIds };
 }
